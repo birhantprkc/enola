@@ -101,7 +101,8 @@ type queryFactsArgs struct {
 	IncludeRelated bool `json:"include_related,omitempty" jsonschema:"If true, inline the full fact data for each relation target instead of just the target name"`
 
 	// Output format
-	OutputMode string `json:"output_mode,omitempty" jsonschema:"Output format: 'full' (default JSON), 'compact' (markdown table), or 'names' (just names and files)"`
+	OutputMode string `json:"output_mode,omitempty" jsonschema:"Output format: 'full' (DEFAULT, JSON facts), 'compact' (markdown table), 'names' (just names+files), or 'summary' (counts only: total + breakdown by kind and top files — cheapest, use to size a result set before fetching it)."`
+	MaxTokens  int    `json:"max_tokens,omitempty" jsonschema:"Optional hard cap on output size (approx tokens). Output is truncated with a notice. Default: no cap."`
 }
 
 // enrichedFact wraps a Fact with resolved relation targets.
@@ -137,6 +138,43 @@ func renderNamesOnly(results []facts.Fact, total int) string {
 	sb.WriteString(fmt.Sprintf("Found %d results (showing %d):\n\n", total, len(results)))
 	for _, f := range results {
 		sb.WriteString(fmt.Sprintf("%s  %s:%d\n", f.Name, f.File, f.Line))
+	}
+	return sb.String()
+}
+
+// renderQuerySummary returns counts only — total plus a breakdown by kind and the
+// top files — so the caller can size a result set before fetching the facts
+// themselves. The breakdown is computed over the returned sample (results); when
+// total exceeds the sample it is annotated as approximate.
+func renderQuerySummary(results []facts.Fact, total int) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Found **%d** matching facts.\n\n", total)
+
+	byKind := map[string]int{}
+	byFile := map[string]int{}
+	for _, f := range results {
+		byKind[f.Kind]++
+		if f.File != "" {
+			byFile[f.File]++
+		}
+	}
+
+	if len(byKind) > 0 {
+		sb.WriteString("## By kind\n\n")
+		for _, k := range topCounts(byKind, len(byKind)) {
+			fmt.Fprintf(&sb, "- %s: %d\n", k, byKind[k])
+		}
+		sb.WriteString("\n")
+	}
+	if len(byFile) > 0 {
+		sb.WriteString("## Top files\n\n")
+		for _, f := range topCounts(byFile, 10) {
+			fmt.Fprintf(&sb, "- %s: %d\n", f, byFile[f])
+		}
+		sb.WriteString("\n")
+	}
+	if total > len(results) {
+		fmt.Fprintf(&sb, "_Breakdown computed over a sample of %d of %d matches; counts are approximate. Re-run with filters to narrow, or output_mode=compact/names to list facts._\n", len(results), total)
 	}
 	return sb.String()
 }
@@ -250,7 +288,8 @@ func (s *Server) registerTools() {
 			"e.g. all symbols in a file, all external dependencies, all routes. " +
 			"Fact kinds: module, symbol, route, storage, dependency, service. " +
 			"name= is a substring match; names= is exact (batch). files= and kinds= are OR filters; combined with other fields they are AND. " +
-			"output_mode='compact' or 'names' saves tokens for large result sets. " +
+			"output_mode: 'full' (default JSON) → 'compact' (markdown table) → 'names' (names+files) → 'summary' (counts only). " +
+			"Use output_mode='summary' first to size an unfamiliar result set, then 'compact'/'names' to save tokens on large sets, and pass max_tokens to hard-cap output. " +
 			"For dependencies, set prop='source' prop_value='internal'|'external'|'stdlib' to filter noise. " +
 			"Supports pagination via offset/limit (default 100, max 500).",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args queryFactsArgs) (*mcp.CallToolResult, any, error) {
@@ -274,6 +313,15 @@ func (s *Server) registerTools() {
 		// if the user provided a bare relative path (e.g. "src/" instead of "golf-ui/src/").
 		prefixes := s.expandFilePrefix(normPrefix)
 
+		mode := resolveOutputMode(args.OutputMode, modeFull)
+
+		// Summary mode aggregates over as many matches as the store allows (cap 500)
+		// so the by-kind/by-file breakdown reflects the widest available sample.
+		limit := args.Limit
+		if mode == modeSummary {
+			limit = 500
+		}
+
 		// Query with the first (or only) prefix.
 		opts := facts.QueryOpts{
 			Kind:       args.Kind,
@@ -288,7 +336,7 @@ func (s *Server) registerTools() {
 			Prop:       args.Prop,
 			PropValue:  args.PropValue,
 			Offset:     args.Offset,
-			Limit:      args.Limit,
+			Limit:      limit,
 		}
 
 		results, total := store.QueryAdvanced(opts)
@@ -301,20 +349,14 @@ func (s *Server) registerTools() {
 			total += extraTotal
 		}
 
-		// Compact output modes: return text instead of JSON
-		switch args.OutputMode {
-		case "compact":
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{
-					&mcp.TextContent{Text: renderCompact(results, total)},
-				},
-			}, nil, nil
-		case "names":
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{
-					&mcp.TextContent{Text: renderNamesOnly(results, total)},
-				},
-			}, nil, nil
+		// Non-JSON output modes: return text instead of JSON.
+		switch mode {
+		case modeSummary:
+			return textResult(capTokens(renderQuerySummary(results, total), args.MaxTokens, false)), nil, nil
+		case modeCompact:
+			return textResult(capTokens(renderCompact(results, total), args.MaxTokens, false)), nil, nil
+		case modeNames:
+			return textResult(capTokens(renderNamesOnly(results, total), args.MaxTokens, false)), nil, nil
 		}
 
 		// Determine if advanced features are in use (triggers structured response)
@@ -358,15 +400,7 @@ func (s *Server) registerTools() {
 				Limit:   limit,
 				HasMore: total > args.Offset+len(results),
 			}
-			data, err := json.MarshalIndent(resp, "", "  ")
-			if err != nil {
-				return errorResult(fmt.Sprintf("failed to marshal results: %v", err)), nil, nil
-			}
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{
-					&mcp.TextContent{Text: string(data)},
-				},
-			}, nil, nil
+			return jsonResultCapped(resp, args.MaxTokens)
 		}
 
 		// Legacy format: raw JSON array (backwards compatible)
@@ -380,11 +414,7 @@ func (s *Server) registerTools() {
 			text += fmt.Sprintf("\n\n... (showing %d of %d results, refine your query or use offset/limit for pagination)", len(results), total)
 		}
 
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{Text: text},
-			},
-		}, nil, nil
+		return textResult(capTokens(text, args.MaxTokens, true)), nil, nil
 	})
 
 	// Tool: show_symbol
@@ -488,9 +518,10 @@ func (s *Server) registerTools() {
 		Name: "explore",
 		Description: "Primary exploration tool — use this first after generate_snapshot. " +
 			"Given a module name, file path, symbol name, or directory prefix, returns a structured markdown summary: " +
-			"symbols (with kinds and line numbers), direct dependencies, reverse dependents, and at depth=2 symbol-level relations. " +
+			"symbols (with kinds and line numbers), direct dependencies, and reverse dependents. " +
+			"At depth=2 the default output_mode='summary' returns an aggregated Insights section (dependency hotspots, cycle/layer warnings, size metrics) — \"what is architecturally significant\" — instead of a raw symbol-relations dump; set output_mode='compact'/'full' to get the per-symbol relations list instead. " +
 			"'Module' means a package-level grouping (e.g. a Go package or TypeScript file group), not a repo. " +
-			"Accepts absolute filesystem paths — they are normalised automatically. " +
+			"Accepts absolute filesystem paths — they are normalised automatically. Pass max_tokens to hard-cap large directory/module output. " +
 			"Use query_facts for precise filtering, traverse for multi-hop graph walks.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args exploreArgs) (*mcp.CallToolResult, any, error) {
 		if s.toolCallback != nil {
@@ -523,10 +554,14 @@ func (s *Server) registerTools() {
 		// Special case: "." means the repo root (from normalizing an absolute path that
 		// equals the snapshot RepoPath). Route directly to directory exploration to avoid
 		// "." accidentally substring-matching dotted symbol names.
+		// At depth=2 the default 'summary' mode replaces the raw per-symbol relations
+		// dump with an aggregated Insights section. compact/full keep the dump.
+		mode := resolveOutputMode(args.OutputMode, modeSummary)
+
 		switch {
 		case focus == "." && s.exploreDirectory(store, focus, &sb):
-		case focus != "." && s.exploreModule(store, focus, depth, &sb):
-		case focus != "." && s.exploreModuleSubstring(store, focus, depth, &sb):
+		case focus != "." && s.exploreModule(store, focus, depth, mode, &sb):
+		case focus != "." && s.exploreModuleSubstring(store, focus, depth, mode, &sb):
 		case focus != "." && s.exploreFile(store, focus, depth, &sb):
 		case focus != "." && s.exploreSymbol(store, focus, depth, &sb):
 		case s.exploreDirectory(store, focus, &sb):
@@ -534,11 +569,7 @@ func (s *Server) registerTools() {
 			return errorResult(fmt.Sprintf("No facts matching focus %q. Try a module name, file path, symbol name, or directory prefix.", focus)), nil, nil
 		}
 
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				&mcp.TextContent{Text: sb.String()},
-			},
-		}, nil, nil
+		return textResult(capTokens(sb.String(), args.MaxTokens, false)), nil, nil
 	})
 
 	// Tool: traverse
@@ -546,13 +577,15 @@ func (s *Server) registerTools() {
 		Name: "traverse",
 		Description: "Walk the dependency/call graph from a starting node. " +
 			"direction='forward' answers \"what does X depend on?\"; direction='reverse' answers \"what depends on X?\". " +
-			"start= accepts substring match plus scoped prefixes (repo:, kind:, file:) to disambiguate; returns ranked candidates with confidence when ambiguous. " +
+			"start= accepts substring match plus scoped prefixes (repo:, kind:, file:) and package-qualified names (e.g. 'domain/cart.CartService') to disambiguate; returns ranked candidates with confidence when ambiguous. " +
 			"relation_kinds filter: imports, calls, declares, implements, depends_on, has_method. " +
 			"Forward traversal from a struct/interface follows has_method edges to its methods (and then their calls). " +
+			"Reverse traversal from a struct/interface automatically includes its methods and constructor as origins, so it surfaces callers (including cross-repo) that reference the type only through a method — matching impact_analysis. " +
 			"Note: interface method calls cannot be statically bound to a concrete implementation, so such call edges may be absent or appear as unresolved nodes. " +
 			"node_kinds filters output (not traversal itself): module, symbol, dependency, route, storage. " +
-			"Returns a compact markdown summary grouped by depth (output_mode='full' for the raw JSON node/edge graph). " +
-			"Defaults: depth=5, max_nodes=100. Use instead of repeated explore calls for transitive relationships.",
+			"TOKEN COST — output_mode ladder: 'summary' (DEFAULT) aggregates counts by node/relation kind, internal/external split, and hottest modules (small, no node list); 'compact' lists nodes grouped by depth; 'full' returns the raw JSON node/edge graph and can be VERY large. " +
+			"Start with summary; escalate to compact/full only when you need specific nodes. Always keep max_depth/max_nodes bounded, and pass max_tokens to hard-cap the response. " +
+			"Defaults: max_depth=5, max_nodes=100. Use instead of repeated explore calls for transitive relationships.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args traverseArgs) (*mcp.CallToolResult, any, error) {
 		if s.toolCallback != nil {
 			s.toolCallback("traverse")
@@ -575,6 +608,8 @@ func (s *Server) registerTools() {
 		if err != nil {
 			return errorResult(err.Error()), nil, nil
 		}
+		mode := resolveOutputMode(args.OutputMode, modeSummary)
+
 		// Over threshold: refuse to guess; return resolution with empty results.
 		if res != nil && res.Matched == "" {
 			resp := traverseResponse{
@@ -584,10 +619,13 @@ func (s *Server) registerTools() {
 					Edges: []facts.TraversalEdge{},
 				},
 			}
-			if wantsFullOutput(args.OutputMode) {
-				return jsonResult(resp)
+			if wantsFullOutput(mode) {
+				return jsonResultCapped(resp, args.MaxTokens)
 			}
-			return textResult(renderTraverseCompact(resp, args.Start, "")), nil, nil
+			if wantsSummary(mode) {
+				return textResult(capTokens(s.renderTraverseSummary(store, resp, args.Start, ""), args.MaxTokens, false)), nil, nil
+			}
+			return textResult(capTokens(renderTraverseCompact(resp, args.Start, ""), args.MaxTokens, false)), nil, nil
 		}
 
 		direction := args.Direction
@@ -598,13 +636,25 @@ func (s *Server) registerTools() {
 			return errorResult("direction must be 'forward' or 'reverse'"), nil, nil
 		}
 
-		result := graph.Traverse(startName, direction, args.RelationKinds, args.NodeKinds, args.MaxDepth, args.MaxNodes)
+		// Reverse traversal of a type must seed its methods + constructor (callers
+		// reference those, not the bare type), matching impact_analysis — otherwise
+		// cross-repo and same-repo dependents are missed. Forward already follows
+		// has_method edges from the type, so it needs no rollup.
+		var result facts.TraversalResult
+		if direction == "reverse" {
+			result = graph.TraverseFrom(graph.RollupSeeds(startName), direction, args.RelationKinds, args.NodeKinds, args.MaxDepth, args.MaxNodes)
+		} else {
+			result = graph.Traverse(startName, direction, args.RelationKinds, args.NodeKinds, args.MaxDepth, args.MaxNodes)
+		}
 
 		resp := traverseResponse{Resolution: res, TraversalResult: result}
-		if wantsFullOutput(args.OutputMode) {
-			return jsonResult(resp)
+		if wantsFullOutput(mode) {
+			return jsonResultCapped(resp, args.MaxTokens)
 		}
-		return textResult(renderTraverseCompact(resp, startName, direction)), nil, nil
+		if wantsSummary(mode) {
+			return textResult(capTokens(s.renderTraverseSummary(store, resp, startName, direction), args.MaxTokens, false)), nil, nil
+		}
+		return textResult(capTokens(renderTraverseCompact(resp, startName, direction), args.MaxTokens, false)), nil, nil
 	})
 
 	// Tool: find_path
@@ -613,10 +663,13 @@ func (s *Server) registerTools() {
 		Description: "Find the shortest path (BFS, by hop count) between two nodes in the architectural graph. " +
 			"Answers \"how does X reach Y?\" or \"what is the call chain from A to B?\". " +
 			"from= and to= use substring match with smart disambiguation, and accept scoped prefixes " +
-			"(repo:, kind:, file:) to pin down an ambiguous name, e.g. from=\"repo:go-auth Login\". " +
-			"When a name is ambiguous the response carries a resolution object with ranked candidates and a " +
-			"confidence score; one dominant candidate (>80% confidence) is auto-resolved so the path is still returned. " +
-			"Returns an ordered list of nodes and edges, or reports no path found within max_depth hops.",
+			"(repo:, kind:, file:) plus PACKAGE-QUALIFIED names to pin down a common short name — e.g. " +
+			"to=\"ticket.Repository\" or to=\"repo:golf domain/cart.CartService\" resolves where bare " +
+			"\"Repository\"/\"CartService\" would be ambiguous. " +
+			"When an endpoint is ambiguous, find_path TRIES the top candidates (and, for a type, its methods/constructor) " +
+			"and returns the first path it finds; the response carries resolution objects with the ranked candidates. " +
+			"If no path connects any candidate pair, found=false and a 'note' explains whether the endpoints were " +
+			"ambiguous (with the candidates tried) or resolved uniquely but unreachable within max_depth hops.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args findPathArgs) (*mcp.CallToolResult, any, error) {
 		if s.toolCallback != nil {
 			s.toolCallback("find_path")
@@ -642,23 +695,46 @@ func (s *Server) registerTools() {
 		if err != nil {
 			return errorResult(fmt.Sprintf("to: %v", err)), nil, nil
 		}
-		// If either endpoint was too ambiguous to resolve, refuse to guess and
-		// return the resolution(s) with an empty path.
-		if (fromRes != nil && fromRes.Matched == "") || (toRes != nil && toRes.Matched == "") {
+
+		// Build ranked candidate lists for each endpoint (most-likely first) and try
+		// a path across the combinations rather than silently giving up when a name
+		// is ambiguous. This delivers the "give me vague names and I'll find the
+		// connection" behavior.
+		fromCands := s.pathCandidates(store, args.From, fromName, fromRes)
+		toCands := s.pathCandidates(store, args.To, toName, toRes)
+		if len(fromCands) == 0 || len(toCands) == 0 {
 			return jsonResult(findPathResponse{
 				FromResolution: fromRes,
 				ToResolution:   toRes,
 				PathResult:     facts.PathResult{From: fromName, To: toName, Found: false},
+				Note:           "could not resolve both endpoints to a graph node",
+				FromTried:      fromCands,
+				ToTried:        toCands,
 			})
 		}
 
-		result := graph.FindPath(fromName, toName, args.RelationKinds, args.MaxDepth)
+		result := s.bestPath(graph, fromCands, toCands, args.RelationKinds, args.MaxDepth)
 
-		return jsonResult(findPathResponse{
+		resp := findPathResponse{
 			FromResolution: fromRes,
 			ToResolution:   toRes,
 			PathResult:     result,
-		})
+			FromTried:      fromCands,
+			ToTried:        toCands,
+		}
+		if !result.Found {
+			ambiguous := len(fromCands) > 1 || len(toCands) > 1
+			if ambiguous {
+				resp.Note = fmt.Sprintf("no path within %d hops between any candidate pair "+
+					"(from: %d candidate(s), to: %d candidate(s)). Narrow with a package-qualified "+
+					"name (e.g. \"repo:<label> pkg.Type\") — see from_tried/to_tried.",
+					effectiveMaxDepth(args.MaxDepth), len(fromCands), len(toCands))
+			} else {
+				resp.Note = fmt.Sprintf("both endpoints resolved uniquely, but no path connects them within %d hops",
+					effectiveMaxDepth(args.MaxDepth))
+			}
+		}
+		return jsonResult(resp)
 	})
 
 	// Tool: impact_analysis
@@ -669,7 +745,8 @@ func (s *Server) registerTools() {
 			"target= uses substring match with smart disambiguation. " +
 			"Default: reverse direction only (what breaks if target changes). " +
 			"Set include_forward=true to also see what the target itself depends on (useful for understanding what could break the target). " +
-			"Returns a compact markdown summary grouped by hop depth, with an accurate total dependent count (output_mode='full' for the raw JSON). " +
+			"TOKEN COST — output_mode ladder: 'summary' (DEFAULT) gives the accurate total dependent count plus breakdowns by kind/depth, hotspot modules, cross-repo reach, and any cycle/layer insights touching the target (small, no node list); 'compact' lists dependents grouped by hop depth; 'full' returns the raw JSON by_depth/edges graph and can be VERY large. " +
+			"Start with summary; escalate only when you need the specific nodes. Keep max_depth/max_nodes bounded and pass max_tokens to hard-cap the response. " +
 			"Defaults: max_depth=3, max_nodes=200.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args impactAnalysisArgs) (*mcp.CallToolResult, any, error) {
 		if s.toolCallback != nil {
@@ -692,6 +769,8 @@ func (s *Server) registerTools() {
 		if err != nil {
 			return errorResult(err.Error()), nil, nil
 		}
+		mode := resolveOutputMode(args.OutputMode, modeSummary)
+
 		// Over threshold: refuse to guess; return resolution with empty results.
 		if res != nil && res.Matched == "" {
 			resp := impactResponse{
@@ -702,19 +781,25 @@ func (s *Server) registerTools() {
 					Edges:   []facts.TraversalEdge{},
 				},
 			}
-			if wantsFullOutput(args.OutputMode) {
-				return jsonResult(resp)
+			if wantsFullOutput(mode) {
+				return jsonResultCapped(resp, args.MaxTokens)
 			}
-			return textResult(renderImpactCompact(resp)), nil, nil
+			if wantsSummary(mode) {
+				return textResult(capTokens(s.renderImpactSummary(resp), args.MaxTokens, false)), nil, nil
+			}
+			return textResult(capTokens(renderImpactCompact(resp), args.MaxTokens, false)), nil, nil
 		}
 
 		result := graph.ImpactSet(targetName, args.MaxDepth, args.MaxNodes, args.IncludeForward)
 
 		resp := impactResponse{Resolution: res, ImpactResult: result}
-		if wantsFullOutput(args.OutputMode) {
-			return jsonResult(resp)
+		if wantsFullOutput(mode) {
+			return jsonResultCapped(resp, args.MaxTokens)
 		}
-		return textResult(renderImpactCompact(resp)), nil, nil
+		if wantsSummary(mode) {
+			return textResult(capTokens(s.renderImpactSummary(resp), args.MaxTokens, false)), nil, nil
+		}
+		return textResult(capTokens(renderImpactCompact(resp), args.MaxTokens, false)), nil, nil
 	})
 }
 
@@ -735,6 +820,14 @@ const maxCandidates = 3
 // resolution (at or above ambiguousMatchThreshold matches) is resolved
 // automatically to its top-scoring candidate instead of being refused.
 const autoPickConfidence = 0.80
+
+// maxPathCandidates caps how many ranked candidates find_path considers per
+// endpoint when a name is ambiguous.
+const maxPathCandidates = 8
+
+// maxPathAttempts caps the total FindPath probes find_path runs across the
+// candidate/seed combinations, so a doubly-ambiguous query stays bounded.
+const maxPathAttempts = 40
 
 // nameResolution reports how a user-provided name was resolved to a concrete
 // fact name. It is surfaced in tool responses ONLY when the input matched more
@@ -770,6 +863,7 @@ type nameResolution struct {
 // otherwise it returns an empty name with a resolution-only response so the
 // caller can choose from Candidates or re-invoke with a scoped/exact name.
 func (s *Server) resolveNodeName(store *facts.Store, input string) (string, *nameResolution, error) {
+	input = s.maybePrefixRepoLabel(input)
 	query := input
 	sq := parseScopedQuery(input)
 	scoped := sq.Repo != "" || len(sq.Kinds) > 0 || sq.FilePrefix != "" || sq.SymbolKind != ""
@@ -798,6 +892,26 @@ func (s *Server) resolveNodeName(store *facts.Store, input string) (string, *nam
 		if name, ok := s.resolveRepoLabelToServiceNode(store, term); ok {
 			return name, nil, nil
 		}
+		// Fallback 3: the term is a FILE basename (e.g. "auth_routes") with no
+		// fact named after it — resolve to the symbol(s) declared in that file, so
+		// file-shaped targets are pathable. A single owner resolves directly;
+		// several are surfaced as candidates.
+		if fileMatches := s.resolveByFileBasename(store, sq, term); len(fileMatches) > 0 {
+			if len(fileMatches) == 1 {
+				return fileMatches[0].Name, nil, nil
+			}
+			ranked := rankCandidates(fileMatches, sq)
+			return "", &nameResolution{
+				Query:        query,
+				Alternatives: candidateNames(fileMatches, ""),
+				Candidates:   topCandidates(ranked),
+				Ambiguous:    true,
+			}, nil
+		}
+		if sugg := s.suggestNames(store, sq, term); len(sugg) > 0 {
+			return "", nil, fmt.Errorf("no facts matching %q; did you mean: %s "+
+				"(tip: scope with repo:/kind:/file:)", query, strings.Join(sugg, ", "))
+		}
 		return "", nil, fmt.Errorf("no facts matching %q", query)
 	}
 	if len(results) == 1 {
@@ -816,6 +930,19 @@ func (s *Server) resolveNodeName(store *facts.Store, input string) (string, *nam
 	ranked := rankCandidates(results, sq)
 	confidence := pickConfidence(ranked, sq.Term)
 	top := ranked[0].Name
+
+	// In multi-repo mode, if the top-tier matches span 2+ repos and no repo:
+	// scope was given, refuse to silently guess the user's repo — surface the
+	// candidates (which carry their repo) so the caller can pin it down.
+	if s.crossRepoAmbiguous(ranked, sq) {
+		return "", &nameResolution{
+			Query:        query,
+			Alternatives: candidateNames(results, ""),
+			Candidates:   topCandidates(ranked),
+			Confidence:   confidence,
+			Ambiguous:    true,
+		}, nil
+	}
 
 	// One candidate clearly dominates (e.g. a unique suffix-exact name among
 	// substring matches). Auto-resolve to it, but surface the resolution with its
@@ -939,6 +1066,237 @@ func (s *Server) resolveRepoLabelToServiceNode(store *facts.Store, input string)
 	return "", false
 }
 
+// maybePrefixRepoLabel rewrites "<repo> <term>" → "repo:<repo> <term>" when the
+// first whitespace token is exactly a known repo label and a remainder follows.
+// It is a no-op in single-repo mode (RepoPaths is nil), when the input has no
+// remainder, or when the first token is already a scope token. This lets a bare
+// "go-auth AuthHandler" resolve the same as "repo:go-auth AuthHandler".
+func (s *Server) maybePrefixRepoLabel(input string) string {
+	if s.eng == nil {
+		return input
+	}
+	fields := strings.Fields(input)
+	if len(fields) < 2 {
+		return input
+	}
+	if _, _, ok := splitScopeToken(fields[0]); ok {
+		return input // already scoped
+	}
+	if paths := s.eng.RepoPaths(); paths[fields[0]] != "" {
+		return "repo:" + input
+	}
+	return input
+}
+
+// crossRepoAmbiguous reports whether, in multi-repo mode with no repo: scope, the
+// candidates sharing the top match tier span 2+ repos — meaning auto-picking one
+// would silently guess the user's repo. A unique top-tier match (e.g. a single
+// suffix-exact name in one repo) is NOT cross-repo ambiguous and still resolves.
+func (s *Server) crossRepoAmbiguous(ranked []scoredCandidate, sq scopedQuery) bool {
+	if sq.Repo != "" || len(ranked) < 2 || s.eng == nil || len(s.eng.RepoPaths()) < 2 {
+		return false
+	}
+	term := strings.ToLower(sq.Term)
+	topTier := matchTier(ranked[0].Name, term)
+	repos := make(map[string]struct{})
+	for _, c := range ranked {
+		if matchTier(c.Name, term) != topTier {
+			break // ranked is tier-sorted; stop at the first lower tier
+		}
+		repos[c.Repo] = struct{}{}
+	}
+	return len(repos) >= 2
+}
+
+// suggestNames does a relaxed substring search to recover near-misses when an
+// input matched nothing exactly. It searches on the longest alphanumeric run of
+// the term (and its last dotted segment) and returns up to 5 fact names,
+// repo-qualified in multi-repo mode, so a no-match error is never a dead end.
+func (s *Server) suggestNames(store *facts.Store, sq scopedQuery, term string) []string {
+	probe := longestAlnumRun(term)
+	if seg := lastSegment(term); len(seg) > len(probe) {
+		probe = longestAlnumRun(seg)
+	}
+	if len(probe) < 3 {
+		return nil
+	}
+	matches, _ := store.QueryAdvanced(facts.QueryOpts{Name: probe, Repo: sq.Repo, Limit: 50})
+	multiRepo := s.eng != nil && len(s.eng.RepoPaths()) > 1
+	seen := make(map[string]struct{})
+	out := make([]string, 0, 5)
+	for _, m := range matches {
+		name := m.Name
+		if multiRepo && m.Repo != "" {
+			name = "repo:" + m.Repo + " " + m.Name
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+		if len(out) >= 5 {
+			break
+		}
+	}
+	return out
+}
+
+// resolveByFileBasename maps a file-basename term to the symbols declared in the
+// matching file(s). Enola does not name a fact after a source file, so a target
+// like "auth_routes" (the file auth_routes.go) is otherwise unresolvable for
+// graph tools; this returns the pathable symbol nodes that live in that file.
+// Honors a repo: scope when present. Returns distinct symbol facts.
+func (s *Server) resolveByFileBasename(store *facts.Store, sq scopedQuery, term string) []facts.Fact {
+	lt := strings.ToLower(term)
+	seen := make(map[string]struct{})
+	var out []facts.Fact
+	for _, f := range store.ByKind(facts.KindSymbol) {
+		if f.File == "" || !fileBaseMatches(f.File, lt) {
+			continue
+		}
+		if sq.Repo != "" && !strings.EqualFold(f.Repo, sq.Repo) {
+			continue
+		}
+		if _, dup := seen[f.Name]; dup {
+			continue
+		}
+		seen[f.Name] = struct{}{}
+		out = append(out, f)
+	}
+	return out
+}
+
+// fileBaseMatches reports whether lowerTerm equals path's basename, with or
+// without a trailing source extension (case-insensitive). "a/b/auth_routes.go"
+// matches both "auth_routes.go" and "auth_routes"; it never matches a bare
+// extension like "go".
+func fileBaseMatches(path, lowerTerm string) bool {
+	base := strings.ToLower(path)
+	if i := strings.LastIndexByte(base, '/'); i >= 0 {
+		base = base[i+1:]
+	}
+	if base == lowerTerm {
+		return true
+	}
+	if i := strings.LastIndexByte(base, '.'); i > 0 && codeExtensions[base[i+1:]] {
+		return base[:i] == lowerTerm
+	}
+	return false
+}
+
+// rankedCandidatesFor returns the facts matching an input (after repo-prefix
+// auto-detection and scope parsing), ranked most-relevant first. Used by find_path
+// to consider more candidates than the capped set carried in a nameResolution.
+func (s *Server) rankedCandidatesFor(store *facts.Store, input string) []scoredCandidate {
+	input = s.maybePrefixRepoLabel(input)
+	sq := parseScopedQuery(input)
+	term := s.normalizeToRelative(sq.Term)
+	return rankCandidates(s.gatherCandidates(store, sq, term), sq)
+}
+
+// pathCandidates returns the ranked node names find_path should try for one
+// endpoint, most-likely first and capped at maxPathCandidates. It leads with the
+// resolved name (preserving resolveNodeName's exact/service/file-basename
+// fallbacks), then any candidates from the resolution, then broadens with a fresh
+// ranking so a heavily-ambiguous name (10+ matches) is not limited to the few
+// candidates echoed in the resolution object.
+func (s *Server) pathCandidates(store *facts.Store, input, resolved string, res *nameResolution) []string {
+	seen := make(map[string]struct{})
+	out := make([]string, 0, maxPathCandidates)
+	add := func(n string) {
+		if n == "" || len(out) >= maxPathCandidates {
+			return
+		}
+		if _, dup := seen[n]; dup {
+			return
+		}
+		seen[n] = struct{}{}
+		out = append(out, n)
+	}
+	add(resolved)
+	if res != nil {
+		for _, c := range res.Candidates {
+			add(c.Name)
+		}
+	}
+	for _, c := range s.rankedCandidatesFor(store, input) {
+		add(c.Name)
+	}
+	return out
+}
+
+// bestPath tries to connect any from-candidate to any to-candidate, expanding each
+// to-candidate with RollupSeeds (a path to a type usually ends at one of its
+// methods/constructor). It scans in ranked order, keeps the shortest path found,
+// and is bounded by maxPathAttempts (returning early on a ≤2-hop hit). When no
+// path exists it returns a not-found PathResult naming the first from/to tried.
+func (s *Server) bestPath(graph *facts.Graph, fromCands, toCands []string, relKinds []string, maxDepth int) facts.PathResult {
+	var best facts.PathResult
+	attempts := 0
+	for _, from := range fromCands {
+		for _, to := range toCands {
+			for _, target := range graph.RollupSeeds(to) {
+				if attempts >= maxPathAttempts {
+					if best.Found {
+						return best
+					}
+					return facts.PathResult{From: fromCands[0], To: toCands[0], Found: false}
+				}
+				attempts++
+				r := graph.FindPath(from, target, relKinds, maxDepth)
+				if !r.Found {
+					continue
+				}
+				if !best.Found || len(r.Path) < len(best.Path) {
+					best = r
+				}
+				if len(best.Path) <= 2 { // direct or one-hop: good enough
+					return best
+				}
+			}
+		}
+	}
+	if best.Found {
+		return best
+	}
+	return facts.PathResult{From: fromCands[0], To: toCands[0], Found: false}
+}
+
+// effectiveMaxDepth mirrors graph.FindPath's clamping (0 → 10, cap 20) so the
+// not-found note reports the depth actually searched.
+func effectiveMaxDepth(maxDepth int) int {
+	if maxDepth <= 0 {
+		return 10
+	}
+	if maxDepth > 20 {
+		return 20
+	}
+	return maxDepth
+}
+
+// longestAlnumRun returns the longest maximal run of [A-Za-z0-9_] in s. Used to
+// derive a robust substring probe from a dotted/spaced term.
+func longestAlnumRun(s string) string {
+	best, start := "", -1
+	flush := func(end int) {
+		if start >= 0 && end-start > len(best) {
+			best = s[start:end]
+		}
+		start = -1
+	}
+	for i, r := range s {
+		if r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			if start < 0 {
+				start = i
+			}
+		} else {
+			flush(i)
+		}
+	}
+	flush(len(s))
+	return best
+}
+
 // candidateNames collects up to maxAlternatives fact names from results,
 // preserving store order and excluding exclude (the chosen match) when set.
 func candidateNames(results []facts.Fact, exclude string) []string {
@@ -957,8 +1315,10 @@ func candidateNames(results []facts.Fact, exclude string) []string {
 
 // exploreArgs are the arguments for the explore tool.
 type exploreArgs struct {
-	Focus string `json:"focus" jsonschema:"required,Module name, file path, or symbol name to explore"`
-	Depth int    `json:"depth,omitempty" jsonschema:"How deep to follow relations (1=direct only, 2=include relations of relations). Default 1, max 2."`
+	Focus      string `json:"focus" jsonschema:"required,Module name, file path, or symbol name to explore"`
+	Depth      int    `json:"depth,omitempty" jsonschema:"How deep to follow relations (1=direct only, 2=include relations of relations). Default 1, max 2."`
+	OutputMode string `json:"output_mode,omitempty" jsonschema:"At depth=2: 'summary' (default) returns aggregated Insights (dependency hotspots, cycle/layer warnings, size metrics); 'compact'/'full' instead list per-symbol relations. Ignored at depth=1."`
+	MaxTokens  int    `json:"max_tokens,omitempty" jsonschema:"Optional hard cap on output size (approx tokens). Output is truncated on a line boundary with a notice. Default: no cap."`
 }
 
 // traverseArgs are the arguments for the traverse tool.
@@ -969,7 +1329,8 @@ type traverseArgs struct {
 	MaxDepth      int      `json:"max_depth,omitempty" jsonschema:"Maximum traversal depth (1-20). Default: 5."`
 	MaxNodes      int      `json:"max_nodes,omitempty" jsonschema:"Maximum nodes to return (1-500). Traversal stops when this limit is reached. Default: 100."`
 	NodeKinds     []string `json:"node_kinds,omitempty" jsonschema:"Filter results to specific fact kinds: module, symbol, dependency, route, storage. Default: all."`
-	OutputMode    string   `json:"output_mode,omitempty" jsonschema:"'compact' (default) returns a readable markdown summary grouped by depth; 'full' returns the complete JSON node/edge graph (can be large)."`
+	OutputMode    string   `json:"output_mode,omitempty" jsonschema:"Verbosity ladder: 'summary' (DEFAULT — aggregated counts by node/relation kind, internal/external split, hottest modules; smallest) → 'compact' (per-node markdown grouped by depth) → 'full' (raw JSON node/edge graph; can be VERY large). Start with summary; escalate only when you need node-level detail."`
+	MaxTokens     int      `json:"max_tokens,omitempty" jsonschema:"Optional hard cap on output size (approx tokens). Output is truncated on a line boundary with a notice telling you to narrow. Default: no cap."`
 }
 
 // findPathArgs are the arguments for the find_path tool.
@@ -986,11 +1347,12 @@ type impactAnalysisArgs struct {
 	MaxDepth       int    `json:"max_depth,omitempty" jsonschema:"How many hops of impact to compute (1-10). Default: 3."`
 	MaxNodes       int    `json:"max_nodes,omitempty" jsonschema:"Maximum impacted nodes to return (1-500). Default: 200."`
 	IncludeForward bool   `json:"include_forward,omitempty" jsonschema:"Include what the target depends on (what might break the target). Default: false."`
-	OutputMode     string `json:"output_mode,omitempty" jsonschema:"'compact' (default) returns a readable markdown summary grouped by depth; 'full' returns the complete JSON by_depth/edges graph (can be large)."`
+	OutputMode     string `json:"output_mode,omitempty" jsonschema:"Verbosity ladder: 'summary' (DEFAULT — total dependents, breakdown by kind/depth, hotspot modules, cross-repo reach, relevant cycle/layer insights; smallest) → 'compact' (per-depth dependent list) → 'full' (raw JSON by_depth/edges graph; can be VERY large). Start with summary; escalate only when you need node-level detail."`
+	MaxTokens      int    `json:"max_tokens,omitempty" jsonschema:"Optional hard cap on output size (approx tokens). Output is truncated on a line boundary with a notice telling you to narrow. Default: no cap."`
 }
 
 // exploreModule renders a module exploration if the focus matches a module name.
-func (s *Server) exploreModule(store *facts.Store, focus string, depth int, sb *strings.Builder) bool {
+func (s *Server) exploreModule(store *facts.Store, focus string, depth int, mode string, sb *strings.Builder) bool {
 	modules := store.LookupByExactName(focus)
 	// Filter to only module-kind facts
 	var mod *facts.Fact
@@ -1100,29 +1462,109 @@ func (s *Server) exploreModule(store *facts.Store, focus string, depth int, sb *
 	// modules whose symbols would otherwise be hidden by this exact-module match.
 	s.writeNestedModules(store, mod.Name, len(declaredSymbols), sb)
 
-	// If depth=2, show key symbol relations
-	if depth >= 2 && len(declaredSymbols) > 0 {
-		sb.WriteString("## Symbol Relations\n\n")
-		limit := len(declaredSymbols)
-		if limit > 20 {
-			limit = 20
-		}
-		for _, sym := range declaredSymbols[:limit] {
-			if len(sym.Relations) <= 1 {
-				continue // skip symbols with only a "declares" relation
-			}
-			sb.WriteString(fmt.Sprintf("**%s**\n", sym.Name))
-			for _, r := range sym.Relations {
-				if r.Kind == facts.RelDeclares {
-					continue
-				}
-				sb.WriteString(fmt.Sprintf("  - %s → %s\n", r.Kind, r.Target))
-			}
-			sb.WriteString("\n")
+	// At depth=2: the default 'summary' mode emits an aggregated Insights section
+	// (what is architecturally significant); compact/full keep the raw per-symbol
+	// relations dump.
+	if depth >= 2 {
+		if mode == modeCompact || mode == modeFull {
+			s.writeSymbolRelations(declaredSymbols, sb)
+		} else {
+			s.writeModuleInsights(mod.Name, declaredSymbols, depsByKind, allDependents, sb)
 		}
 	}
 
 	return true
+}
+
+// writeSymbolRelations writes the raw per-symbol relation dump (depth=2 detail
+// for explore in compact/full mode).
+func (s *Server) writeSymbolRelations(declaredSymbols []facts.Fact, sb *strings.Builder) {
+	if len(declaredSymbols) == 0 {
+		return
+	}
+	sb.WriteString("## Symbol Relations\n\n")
+	limit := len(declaredSymbols)
+	if limit > 20 {
+		limit = 20
+	}
+	for _, sym := range declaredSymbols[:limit] {
+		if len(sym.Relations) <= 1 {
+			continue // skip symbols with only a "declares" relation
+		}
+		fmt.Fprintf(sb, "**%s**\n", sym.Name)
+		for _, r := range sym.Relations {
+			if r.Kind == facts.RelDeclares {
+				continue
+			}
+			fmt.Fprintf(sb, "  - %s → %s\n", r.Kind, r.Target)
+		}
+		sb.WriteString("\n")
+	}
+}
+
+// writeModuleInsights writes the aggregated depth=2 Insights for a module:
+// cross-module dependency hotspots, architectural warnings (cycles / layer
+// violations from the explainers), and size metrics. This replaces the raw
+// symbol-relations dump in the default summary view.
+func (s *Server) writeModuleInsights(modName string, declaredSymbols []facts.Fact, depsByKind map[string][]string, allDependents []facts.Fact, sb *strings.Builder) {
+	sb.WriteString("## Insights\n\n")
+
+	// Cross-module dependency hotspots: which modules this one depends on most,
+	// and which modules depend on it most.
+	outByModule := map[string]int{}
+	for _, targets := range depsByKind {
+		for _, t := range targets {
+			outByModule[moduleForName(t)]++
+		}
+	}
+	if len(outByModule) > 0 {
+		sb.WriteString("### Depends most on\n\n")
+		for _, m := range topCounts(outByModule, 5) {
+			fmt.Fprintf(sb, "- %s (%d)\n", m, outByModule[m])
+		}
+		sb.WriteString("\n")
+	}
+
+	inByModule := map[string]int{}
+	depSeen := map[string]struct{}{}
+	for _, d := range allDependents {
+		if _, dup := depSeen[d.Name]; dup {
+			continue
+		}
+		depSeen[d.Name] = struct{}{}
+		inByModule[moduleForName(d.Name)]++
+	}
+	if len(inByModule) > 0 {
+		sb.WriteString("### Most depended on by\n\n")
+		for _, m := range topCounts(inByModule, 5) {
+			fmt.Fprintf(sb, "- %s (%d)\n", m, inByModule[m])
+		}
+		sb.WriteString("\n")
+	}
+
+	// Architectural warnings already computed by the explainers (cycles, layers).
+	writeInsightList(sb, "Architectural warnings", s.insightsFor(modName))
+
+	// Size metrics.
+	totalDeps := 0
+	for _, targets := range depsByKind {
+		totalDeps += len(targets)
+	}
+	fmt.Fprintf(sb, "### Size metrics\n\n- Declared symbols: %d\n- Outgoing dependencies: %d\n- Dependents: %d\n\n",
+		len(declaredSymbols), totalDeps, len(depSeen))
+	sb.WriteString("_Use output_mode=compact or full for the per-symbol relation list._\n")
+}
+
+// moduleForName derives a module/package key from a fact's dotted or slashed name
+// for aggregating insights by module.
+func moduleForName(name string) string {
+	if i := strings.LastIndexByte(name, '/'); i > 0 {
+		return name[:i]
+	}
+	if i := strings.LastIndexByte(name, '.'); i > 0 {
+		return name[:i]
+	}
+	return name
 }
 
 // writeNestedModules appends a summary of the modules and symbols nested beneath
@@ -1188,24 +1630,88 @@ func (s *Server) writeNestedModules(store *facts.Store, modName string, directSy
 	sb.WriteString("\nUse explore on a nested module above to drill in.\n\n")
 }
 
+// maxModuleSubstringList caps how many candidate modules a non-delegated substring
+// match lists, so a broad term (e.g. "golf" across several repos) yields a compact,
+// actionable summary instead of dumping hundreds of lines.
+const maxModuleSubstringList = 15
+
 // exploreModuleSubstring tries substring matching on module names when exact
-// module match fails. If exactly one module matches, it delegates to the full
-// exploreModule rendering. If multiple match, it lists them so the user can
-// pick the right one.
-func (s *Server) exploreModuleSubstring(store *facts.Store, focus string, depth int, sb *strings.Builder) bool {
-	matches, _ := store.QueryAdvanced(facts.QueryOpts{Kind: facts.KindModule, Name: focus})
+// module match fails. It ranks matches (exact > suffix-exact > prefix > substring)
+// and, when a single match clearly dominates, delegates to the full exploreModule
+// rendering. Otherwise it renders a bounded, repo-grouped summary so a broad term
+// does not dump 100 raw module lines; the caller is told how to narrow it.
+func (s *Server) exploreModuleSubstring(store *facts.Store, focus string, depth int, mode string, sb *strings.Builder) bool {
+	matches, total := store.QueryAdvanced(facts.QueryOpts{Kind: facts.KindModule, Name: focus, Limit: 500})
 	if len(matches) == 0 {
 		return false
 	}
-	if len(matches) == 1 {
-		return s.exploreModule(store, matches[0].Name, depth, sb)
+
+	term := strings.ToLower(focus)
+	tier := func(name string) int {
+		n := strings.ToLower(name)
+		switch {
+		case n == term:
+			return 3
+		case hasShortName(n, term):
+			return 2
+		case strings.HasPrefix(n, term):
+			return 1
+		default:
+			return 0
+		}
 	}
-	// Multiple matches — list them so the user can refine.
-	sb.WriteString(fmt.Sprintf("# Multiple modules matching %q (%d)\n\n", focus, len(matches)))
+	sort.SliceStable(matches, func(i, j int) bool {
+		ti, tj := tier(matches[i].Name), tier(matches[j].Name)
+		if ti != tj {
+			return ti > tj
+		}
+		return matches[i].Name < matches[j].Name
+	})
+
+	// A single match, or a unique exact/suffix-exact top match, is unambiguous —
+	// drill straight in.
+	if len(matches) == 1 || (tier(matches[0].Name) >= 2 && tier(matches[1].Name) < tier(matches[0].Name)) {
+		return s.exploreModule(store, matches[0].Name, depth, mode, sb)
+	}
+
+	// Multiple plausible matches — summarize, grouped by repo, capped.
+	shown := matches
+	if len(shown) > maxModuleSubstringList {
+		shown = shown[:maxModuleSubstringList]
+	}
+	fmt.Fprintf(sb, "# Modules matching %q (showing %d of %d)\n\n", focus, len(shown), total)
+
+	byRepo := make(map[string]int)
+	repoOrder := make([]string, 0)
 	for _, m := range matches {
-		sb.WriteString(fmt.Sprintf("- `%s` (%s)\n", m.Name, m.File))
+		r := m.Repo
+		if r == "" {
+			r = "(primary)"
+		}
+		if _, ok := byRepo[r]; !ok {
+			repoOrder = append(repoOrder, r)
+		}
+		byRepo[r]++
 	}
-	sb.WriteString("\nUse the full module name for detailed exploration.\n")
+	if len(repoOrder) > 1 {
+		sort.Strings(repoOrder)
+		sb.WriteString("By repo: ")
+		parts := make([]string, 0, len(repoOrder))
+		for _, r := range repoOrder {
+			parts = append(parts, fmt.Sprintf("%s (%d)", r, byRepo[r]))
+		}
+		sb.WriteString(strings.Join(parts, ", "))
+		sb.WriteString("\n\n")
+	}
+
+	for _, m := range shown {
+		if m.Repo != "" {
+			fmt.Fprintf(sb, "- `%s` (repo:%s)\n", m.Name, m.Repo)
+		} else {
+			fmt.Fprintf(sb, "- `%s`\n", m.Name)
+		}
+	}
+	sb.WriteString("\nNarrow with a `repo:<label>` scope, a full module name, or a more specific substring.\n")
 	return true
 }
 
@@ -1618,10 +2124,156 @@ func textResult(s string) *mcp.CallToolResult {
 	}
 }
 
+// jsonResultCapped marshals v as indented JSON and applies a max_tokens cap.
+// Truncating JSON breaks its validity, so the cap notice says so explicitly.
+func jsonResultCapped(v any, maxTokens int) (*mcp.CallToolResult, any, error) {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal results: %v", err)), nil, nil
+	}
+	return textResult(capTokens(string(data), maxTokens, true)), nil, nil
+}
+
+// Output mode names shared across the tools. Every tool that can vary its
+// verbosity accepts a subset of these so the LLM caller has one mental model:
+// summary (smallest) → compact → full (largest). "names" is query_facts-only.
+const (
+	modeSummary = "summary"
+	modeCompact = "compact"
+	modeFull    = "full"
+	modeNames   = "names"
+)
+
+// resolveOutputMode normalises a caller-supplied output_mode, falling back to
+// def when empty. Unknown values are returned lowercased so the per-tool switch
+// can decide how to treat them (generally: fall through to def).
+func resolveOutputMode(mode, def string) string {
+	m := strings.ToLower(strings.TrimSpace(mode))
+	if m == "" {
+		return def
+	}
+	return m
+}
+
 // wantsFullOutput reports whether the caller asked for the raw JSON graph rather
-// than the default compact markdown summary.
+// than a markdown summary.
 func wantsFullOutput(mode string) bool {
-	return strings.EqualFold(mode, "full")
+	return strings.EqualFold(mode, modeFull)
+}
+
+// wantsSummary reports whether the caller asked for the aggregated summary view.
+func wantsSummary(mode string) bool {
+	return strings.EqualFold(mode, modeSummary)
+}
+
+// approxTokensPerChar is the rough characters-per-token ratio used to translate a
+// max_tokens budget into a character budget. English/code text averages ~4 chars
+// per token; this is an estimate, not an exact count.
+const approxTokensPerChar = 4
+
+// capTokens truncates s to roughly maxTokens tokens (~chars/4), cutting on a line
+// boundary and appending a notice that tells the caller how to narrow. A value of
+// maxTokens <= 0 disables the cap. isJSON marks output whose structure would be
+// broken by truncation (full mode), so the notice makes that explicit.
+func capTokens(s string, maxTokens int, isJSON bool) string {
+	if maxTokens <= 0 {
+		return s
+	}
+	limit := maxTokens * approxTokensPerChar
+	if len(s) <= limit {
+		return s
+	}
+	cut := s[:limit]
+	// Prefer cutting on the last newline so we don't truncate mid-line.
+	if nl := strings.LastIndexByte(cut, '\n'); nl > 0 {
+		cut = cut[:nl]
+	}
+	notice := fmt.Sprintf("\n\n[truncated: output exceeded max_tokens=%d. "+
+		"Re-run with output_mode=summary, tighter filters, or a lower max_depth/max_nodes/limit.]", maxTokens)
+	if isJSON {
+		notice = fmt.Sprintf("\n\n[truncated: JSON output exceeded max_tokens=%d and is no longer valid JSON. "+
+			"Re-run with output_mode=summary/compact, or raise max_tokens / narrow the query.]", maxTokens)
+	}
+	return cut + notice
+}
+
+// moduleOf returns a node's owning module: its file directory when a file is
+// known, otherwise the package-ish prefix of its dotted name. Used to aggregate
+// traversal/impact nodes by module in the summary views.
+func moduleOf(n facts.TraversalNode) string {
+	if n.File != "" {
+		if i := strings.LastIndexByte(n.File, '/'); i > 0 {
+			return n.File[:i]
+		}
+		return "."
+	}
+	name := n.Name
+	if i := strings.LastIndexByte(name, '.'); i > 0 {
+		return name[:i]
+	}
+	return name
+}
+
+// topCounts returns the up-to-n highest-count keys from m, sorted by count
+// descending then name ascending for stable output.
+func topCounts(m map[string]int, n int) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if m[keys[i]] != m[keys[j]] {
+			return m[keys[i]] > m[keys[j]]
+		}
+		return keys[i] < keys[j]
+	})
+	if len(keys) > n {
+		keys = keys[:n]
+	}
+	return keys
+}
+
+// insightsFor returns the architectural insights (cycles, layer violations,
+// cross-repo, etc.) computed at snapshot time whose title or evidence references
+// focus. It lets the live tools surface what the explainers already found instead
+// of recomputing it. Returns nil when no snapshot or no matching insights.
+func (s *Server) insightsFor(focus string) []facts.Insight {
+	if s.eng == nil || focus == "" {
+		return nil
+	}
+	snap := s.eng.Snapshot()
+	if snap == nil || len(snap.Insights) == 0 {
+		return nil
+	}
+	var out []facts.Insight
+	for _, in := range snap.Insights {
+		if strings.Contains(in.Title, focus) || strings.Contains(in.Description, focus) {
+			out = append(out, in)
+			continue
+		}
+		for _, ev := range in.Evidence {
+			if (ev.Fact != "" && strings.Contains(ev.Fact, focus)) ||
+				(ev.File != "" && strings.Contains(ev.File, focus)) ||
+				(ev.Symbol != "" && strings.Contains(ev.Symbol, focus)) {
+				out = append(out, in)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// writeInsightList appends a compact bullet list of insights (title + one-line
+// description) under the given heading. No-op when insights is empty.
+func writeInsightList(sb *strings.Builder, heading string, insights []facts.Insight) {
+	if len(insights) == 0 {
+		return
+	}
+	fmt.Fprintf(sb, "## %s (%d)\n\n", heading, len(insights))
+	for _, in := range insights {
+		fmt.Fprintf(sb, "- **%s** — %s\n", in.Title, in.Description)
+	}
+	sb.WriteString("\n")
 }
 
 // compactPerDepthCap bounds how many nodes are listed per depth bucket in the
@@ -1796,6 +2448,184 @@ func renderTraverseCompact(resp traverseResponse, start, direction string) strin
 	return sb.String()
 }
 
+// renderTraverseSummary renders a graph traversal as an aggregated summary:
+// counts by node kind and edge relation kind, internal/external split, and the
+// hottest target modules — no per-node list. This is the default, token-cheapest
+// view; escalate to compact/full for node-level detail.
+func (s *Server) renderTraverseSummary(store *facts.Store, resp traverseResponse, start, direction string) string {
+	var sb strings.Builder
+	if direction == "" {
+		direction = "forward"
+	}
+	fmt.Fprintf(&sb, "# Traverse summary: %s (%s)\n\n", start, direction)
+	writeResolutionNote(&sb, resp.Resolution)
+	if resp.Resolution != nil && resp.Resolution.Matched == "" {
+		return sb.String()
+	}
+
+	byKind := map[string]int{}
+	byModule := map[string]int{}
+	reached := 0
+	for _, n := range resp.Nodes {
+		if n.Depth == 0 {
+			continue // skip origin
+		}
+		reached++
+		byKind[n.Kind]++
+		byModule[moduleOf(n)]++
+	}
+
+	byRel := map[string]int{}
+	for _, e := range resp.Edges {
+		byRel[e.Kind]++
+	}
+
+	verb := "depends on"
+	if direction == "reverse" {
+		verb = "is used by"
+	}
+	fmt.Fprintf(&sb, "%s **%s** %d nodes across %d modules", start, verb, reached, len(byModule))
+	if resp.Stats.Truncated {
+		sb.WriteString(" (truncated — more exist beyond the cap; raise max_nodes or narrow relation_kinds)")
+	}
+	sb.WriteString("\n\n")
+
+	if len(byKind) > 0 {
+		sb.WriteString("## By node kind\n\n")
+		for _, k := range topCounts(byKind, len(byKind)) {
+			fmt.Fprintf(&sb, "- %s: %d\n", k, byKind[k])
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(byRel) > 0 {
+		total := len(resp.Edges)
+		sb.WriteString("## By relation kind\n\n")
+		for _, k := range topCounts(byRel, len(byRel)) {
+			pct := 0
+			if total > 0 {
+				pct = byRel[k] * 100 / total
+			}
+			fmt.Fprintf(&sb, "- %s: %d (%d%%)\n", k, byRel[k], pct)
+		}
+		sb.WriteString("\n")
+	}
+
+	// Internal vs external split for dependency nodes (looked up via the fact store).
+	var internal, external, stdlib int
+	for _, n := range resp.Nodes {
+		if n.Depth == 0 || n.Kind != facts.KindDependency {
+			continue
+		}
+		for _, f := range store.LookupByExactName(n.Name) {
+			src, _ := f.Props["source"].(string)
+			switch src {
+			case "external":
+				external++
+			case "stdlib":
+				stdlib++
+			case "internal":
+				internal++
+			}
+			break
+		}
+	}
+	if internal+external+stdlib > 0 {
+		fmt.Fprintf(&sb, "## Dependency sources\n\n- internal: %d\n- external: %d\n- stdlib: %d\n\n", internal, external, stdlib)
+	}
+
+	if len(byModule) > 0 {
+		sb.WriteString("## Hottest modules\n\n")
+		for _, m := range topCounts(byModule, 5) {
+			fmt.Fprintf(&sb, "- %s (%d nodes)\n", m, byModule[m])
+		}
+		sb.WriteString("\n")
+	}
+
+	fmt.Fprintf(&sb, "_Stats: %d nodes, %d edges, max depth %d. Use output_mode=compact for the per-depth node list, output_mode=full for the raw graph._\n",
+		resp.Stats.NodesVisited, len(resp.Edges), resp.Stats.MaxDepthReached)
+	return sb.String()
+}
+
+// renderImpactSummary renders an impact analysis as an aggregated summary:
+// total dependents, breakdown by kind and depth, hotspot modules, cross-repo
+// reach, and any architectural insights touching the target — no per-node list.
+func (s *Server) renderImpactSummary(resp impactResponse) string {
+	var sb strings.Builder
+	r := resp.ImpactResult
+	fmt.Fprintf(&sb, "# Impact summary: %s\n\n", r.Target)
+	writeResolutionNote(&sb, resp.Resolution)
+	if resp.Resolution != nil && resp.Resolution.Matched == "" {
+		return sb.String()
+	}
+
+	if r.Summary != "" {
+		sb.WriteString(r.Summary + "\n\n")
+	}
+	fmt.Fprintf(&sb, "**%d** total transitive dependents within max_depth %d.\n\n", r.TotalDependents, r.Stats.MaxDepthReached)
+
+	byKind := map[string]int{}
+	byModule := map[string]int{}
+	depths := make([]int, 0, len(r.ByDepth))
+	for d := range r.ByDepth {
+		depths = append(depths, d)
+	}
+	sort.Ints(depths)
+	for _, d := range depths {
+		for _, n := range r.ByDepth[d] {
+			byKind[n.Kind]++
+			byModule[moduleOf(n)]++
+		}
+	}
+
+	if len(byKind) > 0 {
+		sb.WriteString("## Dependents by kind\n\n")
+		for _, k := range topCounts(byKind, len(byKind)) {
+			fmt.Fprintf(&sb, "- %s: %d\n", k, byKind[k])
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(depths) > 0 {
+		sb.WriteString("## By depth\n\n")
+		for _, d := range depths {
+			fmt.Fprintf(&sb, "- depth %d: %d\n", d, len(r.ByDepth[d]))
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(byModule) > 0 {
+		sb.WriteString("## Hotspot modules\n\n")
+		for _, m := range topCounts(byModule, 5) {
+			fmt.Fprintf(&sb, "- %s (%d dependents)\n", m, byModule[m])
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(r.CrossRepoImpact) > 0 {
+		fmt.Fprintf(&sb, "## Cross-repo impact\n\nOther repos with a dependent: %s\n\n", strings.Join(r.CrossRepoImpact, ", "))
+	}
+
+	if r.Forward != nil && len(r.Forward.Nodes) > 0 {
+		fwd := map[string]int{}
+		for _, n := range r.Forward.Nodes {
+			if n.Depth > 0 {
+				fwd[n.Kind]++
+			}
+		}
+		sb.WriteString("## Forward dependencies (what the target depends on)\n\n")
+		for _, k := range topCounts(fwd, len(fwd)) {
+			fmt.Fprintf(&sb, "- %s: %d\n", k, fwd[k])
+		}
+		sb.WriteString("\n")
+	}
+
+	writeInsightList(&sb, "Architectural insights touching this target", s.insightsFor(r.Target))
+
+	sb.WriteString("_Use output_mode=compact for the per-depth dependent list, output_mode=full for the raw graph._\n")
+	return sb.String()
+}
+
 // traverseResponse wraps a graph traversal with the optional name resolution.
 // The embedded TraversalResult inlines nodes/edges/stats alongside resolution.
 type traverseResponse struct {
@@ -1814,5 +2644,12 @@ type impactResponse struct {
 type findPathResponse struct {
 	FromResolution *nameResolution `json:"from_resolution,omitempty"`
 	ToResolution   *nameResolution `json:"to_resolution,omitempty"`
+	// Note explains a found:false result — whether the endpoints were ambiguous
+	// (with the candidates tried) or resolved uniquely but unreachable.
+	Note string `json:"note,omitempty"`
+	// FromTried/ToTried are the ranked endpoint candidates find_path attempted,
+	// most-likely first, so the caller can see what was searched.
+	FromTried []string `json:"from_tried,omitempty"`
+	ToTried   []string `json:"to_tried,omitempty"`
 	facts.PathResult
 }

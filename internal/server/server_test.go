@@ -163,7 +163,7 @@ func TestExploreModule(t *testing.T) {
 	srv := newTestServer(store)
 
 	var sb strings.Builder
-	found := srv.exploreModule(store, "internal/server", 1, &sb)
+	found := srv.exploreModule(store, "internal/server", 1, modeSummary, &sb)
 	if !found {
 		t.Fatal("exploreModule should find 'internal/server'")
 	}
@@ -224,7 +224,7 @@ func TestExploreModule_NestedModules(t *testing.T) {
 	srv := newTestServer(store)
 
 	var sb strings.Builder
-	found := srv.exploreModule(store, "src/app", 1, &sb)
+	found := srv.exploreModule(store, "src/app", 1, modeSummary, &sb)
 	if !found {
 		t.Fatal("exploreModule should find 'src/app'")
 	}
@@ -253,7 +253,7 @@ func TestExploreModule_NotFound(t *testing.T) {
 	srv := newTestServer(store)
 
 	var sb strings.Builder
-	found := srv.exploreModule(store, "nonexistent", 1, &sb)
+	found := srv.exploreModule(store, "nonexistent", 1, modeSummary, &sb)
 	if found {
 		t.Error("exploreModule should return false for nonexistent module")
 	}
@@ -264,13 +264,13 @@ func TestExploreModule_Depth2(t *testing.T) {
 	srv := newTestServer(store)
 
 	var sb strings.Builder
-	found := srv.exploreModule(store, "internal/server", 2, &sb)
+	found := srv.exploreModule(store, "internal/server", 2, modeCompact, &sb)
 	if !found {
 		t.Fatal("exploreModule should find 'internal/server'")
 	}
 
 	output := sb.String()
-	// Depth 2 should include symbol relations section
+	// Depth 2 in compact/full mode keeps the per-symbol relations section.
 	if !strings.Contains(output, "Symbol Relations") {
 		t.Error("depth=2 should include Symbol Relations section")
 	}
@@ -308,7 +308,7 @@ func TestExploreModule_DependsOnAndImplements(t *testing.T) {
 
 	srv := newTestServer(store)
 	var sb strings.Builder
-	found := srv.exploreModule(store, "packages/orders", 1, &sb)
+	found := srv.exploreModule(store, "packages/orders", 1, modeSummary, &sb)
 	if !found {
 		t.Fatal("exploreModule should find 'packages/orders'")
 	}
@@ -827,7 +827,7 @@ func TestExploreModuleSubstring_SingleMatch(t *testing.T) {
 
 	var sb strings.Builder
 	// "server" should substring-match "internal/server" (the only module containing "server")
-	found := srv.exploreModuleSubstring(store, "server", 1, &sb)
+	found := srv.exploreModuleSubstring(store, "server", 1, modeSummary, &sb)
 	if !found {
 		t.Fatal("exploreModuleSubstring should find a module matching 'server'")
 	}
@@ -845,20 +845,23 @@ func TestExploreModuleSubstring_MultipleMatches(t *testing.T) {
 
 	var sb strings.Builder
 	// "internal" should substring-match both "internal/server" and "internal/facts"
-	found := srv.exploreModuleSubstring(store, "internal", 1, &sb)
+	found := srv.exploreModuleSubstring(store, "internal", 1, modeSummary, &sb)
 	if !found {
 		t.Fatal("exploreModuleSubstring should find modules matching 'internal'")
 	}
 
 	output := sb.String()
-	if !strings.Contains(output, "Multiple modules matching") {
-		t.Errorf("expected disambiguation list, got:\n%s", output)
+	if !strings.Contains(output, "Modules matching") {
+		t.Errorf("expected disambiguation summary, got:\n%s", output)
 	}
 	if !strings.Contains(output, "internal/server") {
 		t.Error("should list internal/server")
 	}
 	if !strings.Contains(output, "internal/facts") {
 		t.Error("should list internal/facts")
+	}
+	if !strings.Contains(output, "Narrow with") {
+		t.Error("should tell the caller how to narrow the match")
 	}
 }
 
@@ -867,7 +870,7 @@ func TestExploreModuleSubstring_NoMatch(t *testing.T) {
 	srv := newTestServer(store)
 
 	var sb strings.Builder
-	found := srv.exploreModuleSubstring(store, "nonexistent", 1, &sb)
+	found := srv.exploreModuleSubstring(store, "nonexistent", 1, modeSummary, &sb)
 	if found {
 		t.Error("exploreModuleSubstring should return false for nonexistent")
 	}
@@ -1088,7 +1091,9 @@ func TestShowSymbol_PrefersExactMatch(t *testing.T) {
 
 // populateAmbiguousStore builds a store with several modules that share the
 // "svc-beta" prefix plus a symbol, modeling the real-world ambiguity the
-// resolution object addresses.
+// resolution object addresses. Note "cmd/svc-beta" has the basename "svc-beta",
+// so the term "svc-beta" is a tier-1 (suffix-exact) hit on it and resolves
+// confidently; use a pure-substring term like "beta" to exercise refusal.
 func populateAmbiguousStore() *facts.Store {
 	store := facts.NewStore()
 	store.Add(
@@ -1205,7 +1210,9 @@ func TestResolveNodeName_OverThreshold(t *testing.T) {
 	store := populateAmbiguousStore()
 	srv := newTestServer(store)
 
-	name, res, err := srv.resolveNodeName(store, "svc-beta")
+	// "beta" is a pure substring of every module (no fact's short name IS "beta"),
+	// so all matches stay tier 0 — genuinely ambiguous → refuse.
+	name, res, err := srv.resolveNodeName(store, "beta")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1221,11 +1228,54 @@ func TestResolveNodeName_OverThreshold(t *testing.T) {
 	if !res.Ambiguous {
 		t.Error("resolution should be marked ambiguous")
 	}
-	if res.Query != "svc-beta" {
-		t.Errorf("resolution.Query = %q, want svc-beta", res.Query)
+	if res.Query != "beta" {
+		t.Errorf("resolution.Query = %q, want beta", res.Query)
 	}
 	if len(res.Alternatives) < ambiguousMatchThreshold {
 		t.Errorf("expected at least %d alternatives, got %v", ambiguousMatchThreshold, res.Alternatives)
+	}
+}
+
+// TestResolveNodeName_ModuleBasename verifies a module's PATH basename is a
+// suffix-exact (tier 1) match, so a bare term resolves to the module it names
+// even amid substring siblings. This is the #2 fix (the "courses" module).
+func TestResolveNodeName_ModuleBasename(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindModule, Name: "internal/domain/courses", Props: map[string]any{"language": "go"}},
+		facts.Fact{Kind: facts.KindModule, Name: "internal/domain/coursestats", Props: map[string]any{"language": "go"}},
+	)
+	srv := newTestServer(store)
+	if name, _, err := srv.resolveNodeName(store, "courses"); err != nil || name != "internal/domain/courses" {
+		t.Errorf("resolve(courses) = %q, %v; want internal/domain/courses", name, err)
+	}
+}
+
+// TestResolveNodeName_FileBasenameFallback verifies the #5 fix: a file-shaped
+// term ("auth_routes") with no eponymous fact resolves to the symbol declared in
+// that file (whose own name does NOT contain the term), rather than failing as
+// ambiguous/unmatched. Mirrors the real snapshot: one symbol + several routes and
+// a dependency all carry the file path only in their File attribute.
+func TestResolveNodeName_FileBasenameFallback(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/adapters/http.Handler.RegisterAuthRoutes",
+			File: "golf/internal/adapters/http/auth_routes.go", Line: 8, Repo: "golf",
+			Props: map[string]any{"symbol_kind": "method"}},
+		facts.Fact{Kind: facts.KindRoute, Name: "/users", File: "golf/internal/adapters/http/auth_routes.go", Repo: "golf"},
+		facts.Fact{Kind: facts.KindDependency, Name: "internal/adapters/http -> github.com/gorilla/mux",
+			File: "golf/internal/adapters/http/auth_routes.go", Repo: "golf"},
+	)
+	srv := newTestServer(store)
+
+	// No fact is NAMED auth_routes; the only pathable node is the symbol declared
+	// in auth_routes.go.
+	name, _, err := srv.resolveNodeName(store, "auth_routes")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "internal/adapters/http.Handler.RegisterAuthRoutes" {
+		t.Errorf("resolve(auth_routes) = %q; want the RegisterAuthRoutes symbol", name)
 	}
 }
 
@@ -1618,8 +1668,9 @@ func TestResolveNodeName_OverThresholdReturnsCandidates(t *testing.T) {
 	srv := newTestServer(store)
 
 	// Near-identical modules → no dominant candidate → refuse, but now with
-	// ranked candidates attached.
-	name, res, err := srv.resolveNodeName(store, "svc-beta")
+	// ranked candidates attached. "beta" is a substring of all of them and the
+	// short name of none, so every match stays tier 0 (truly ambiguous).
+	name, res, err := srv.resolveNodeName(store, "beta")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1634,5 +1685,232 @@ func TestResolveNodeName_OverThresholdReturnsCandidates(t *testing.T) {
 	}
 	if res.Confidence > autoPickConfidence {
 		t.Errorf("confidence = %v, should not exceed auto-pick threshold for near-ties", res.Confidence)
+	}
+}
+
+// --- resolution discoverability: auto repo-prefix, cross-repo refusal, suggestions ---
+
+func newMultiRepoServer() *Server {
+	eng := newEngineWithSnapshot("/work")
+	eng.SetRepoPaths(map[string]string{
+		"go-auth": "/Users/me/development/go-auth",
+		"golf":    "/Users/me/development/golf",
+	})
+	return &Server{eng: eng}
+}
+
+func TestMaybePrefixRepoLabel(t *testing.T) {
+	srv := newMultiRepoServer()
+	cases := []struct{ in, want string }{
+		{"go-auth AuthHandler", "repo:go-auth AuthHandler"},
+		{"golf courses report", "repo:golf courses report"},
+		{"AuthHandler", "AuthHandler"},                           // single token, no remainder
+		{"repo:go-auth AuthHandler", "repo:go-auth AuthHandler"}, // already scoped
+		{"unknownrepo Thing", "unknownrepo Thing"},               // first token not a repo label
+	}
+	for _, c := range cases {
+		if got := srv.maybePrefixRepoLabel(c.in); got != c.want {
+			t.Errorf("maybePrefixRepoLabel(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	// Single-repo mode (RepoPaths nil) must never prefix.
+	single := &Server{eng: newEngineWithSnapshot("/work")}
+	if got := single.maybePrefixRepoLabel("go-auth AuthHandler"); got != "go-auth AuthHandler" {
+		t.Errorf("single-repo should not prefix, got %q", got)
+	}
+}
+
+func TestResolveNodeName_AutoRepoPrefix(t *testing.T) {
+	srv := newMultiRepoServer()
+	store := srv.eng.Store()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "adapters.AuthHandler", Repo: "go-auth", File: "go-auth/adapters/auth.go",
+			Props: map[string]any{"symbol_kind": "struct"}, Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: "adapters"}}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "web.AuthHandler", Repo: "golf", File: "golf/web/auth.go",
+			Props: map[string]any{"symbol_kind": "struct"}, Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: "web"}}},
+	)
+	// "go-auth AuthHandler" (no repo: prefix) should resolve like "repo:go-auth AuthHandler".
+	name, _, err := srv.resolveNodeName(store, "go-auth AuthHandler")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "adapters.AuthHandler" {
+		t.Errorf("got %q, want adapters.AuthHandler (repo-scoped pick)", name)
+	}
+}
+
+func TestResolveNodeName_CrossRepoRefusal(t *testing.T) {
+	srv := newMultiRepoServer()
+	store := srv.eng.Store()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "svc.AuthHandlerImpl", Repo: "go-auth", File: "go-auth/svc.go",
+			Props: map[string]any{"symbol_kind": "struct"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "web.HandlerRegistry", Repo: "golf", File: "golf/web.go",
+			Props: map[string]any{"symbol_kind": "struct"}},
+	)
+	// "Handler" is a substring (tier 0) match in both repos and no repo: scope was
+	// given → refuse to guess, surface candidates spanning both repos.
+	name, res, err := srv.resolveNodeName(store, "Handler")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "" {
+		t.Errorf("expected refusal (empty name) for cross-repo ambiguity, got %q", name)
+	}
+	if res == nil || res.Matched != "" || len(res.Candidates) < 2 {
+		t.Fatalf("expected resolution with 2+ candidates, got %+v", res)
+	}
+	repos := map[string]bool{}
+	for _, c := range res.Candidates {
+		repos[c.Repo] = true
+	}
+	if !repos["go-auth"] || !repos["golf"] {
+		t.Errorf("candidates should span both repos, got %+v", res.Candidates)
+	}
+}
+
+// TestResolveNodeName_CoursesCrossRepo reproduces the reported #2 case: a bare
+// "courses" matched both a Go module (by path basename) and an iOS Swift field
+// (by dotted segment) in different repos. Both are now tier 1, so instead of the
+// iOS field silently winning, resolution refuses and surfaces both repos.
+func TestResolveNodeName_CoursesCrossRepo(t *testing.T) {
+	srv := newMultiRepoServer()
+	store := srv.eng.Store()
+	store.Add(
+		facts.Fact{Kind: facts.KindModule, Name: "internal/domain/courses", Repo: "golf",
+			Props: map[string]any{"language": "go"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "Screens/Report.CoursePerformanceSectionState.courses", Repo: "ios",
+			File: "ios/Screens/Report.swift", Props: map[string]any{"symbol_kind": "struct"}},
+	)
+	name, res, err := srv.resolveNodeName(store, "courses")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "" {
+		t.Errorf("expected refusal across repos, got %q", name)
+	}
+	if res == nil || res.Matched != "" {
+		t.Fatalf("expected resolution-only response, got %+v", res)
+	}
+	repos := map[string]bool{}
+	for _, c := range res.Candidates {
+		repos[c.Repo] = true
+	}
+	if !repos["golf"] || !repos["ios"] {
+		t.Errorf("candidates should span golf and ios, got %+v", res.Candidates)
+	}
+}
+
+func TestResolveNodeName_NoMatchSuggests(t *testing.T) {
+	srv := newMultiRepoServer()
+	store := srv.eng.Store()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "adapters.AuthHandler", Repo: "go-auth", File: "go-auth/adapters/auth.go",
+			Props: map[string]any{"symbol_kind": "struct"}},
+	)
+	// The full term matches nothing, but its longest token ("AuthHandler") does —
+	// the error should suggest it instead of being a dead end.
+	_, _, err := srv.resolveNodeName(store, "find AuthHandler")
+	if err == nil {
+		t.Fatal("expected a no-match error")
+	}
+	if !strings.Contains(err.Error(), "did you mean") || !strings.Contains(err.Error(), "AuthHandler") {
+		t.Errorf("error should suggest candidates, got: %v", err)
+	}
+}
+
+// --- #3: package-qualified resolution + find_path try-candidates ---
+
+func TestMatchTier_QualifiedSuffix(t *testing.T) {
+	// matchTier expects an already-lowercased term (callers lowercase sq.Term).
+	if got := matchTier("internal/domain/ticket.Repository", "ticket.repository"); got != 1 {
+		t.Errorf("qualified-suffix tier = %d, want 1", got)
+	}
+	if got := matchTier("internal/adapters/contracts.Repository", "ticket.repository"); got != 0 {
+		t.Errorf("non-suffix tier = %d, want 0", got)
+	}
+	// Suffix must align on a '.'/'/' boundary, not mid-token.
+	if got := matchTier("internal/domain/myticket.Repository", "ticket.repository"); got != 0 {
+		t.Errorf("mid-token suffix tier = %d, want 0", got)
+	}
+}
+
+func TestResolveNodeName_PackageQualified(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/domain/ticket.Repository", Props: map[string]any{"symbol_kind": "interface"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/domain/cart.Repository", Props: map[string]any{"symbol_kind": "interface"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/adapters/http/contracts.Repository", Props: map[string]any{"symbol_kind": "interface"}},
+	)
+	srv := newTestServer(store)
+
+	// Package-qualified term pins exactly one node.
+	if name, _, err := srv.resolveNodeName(store, "ticket.Repository"); err != nil || name != "internal/domain/ticket.Repository" {
+		t.Errorf("resolve(ticket.Repository) = %q, %v; want internal/domain/ticket.Repository", name, err)
+	}
+	// Bare common name stays ambiguous (3 matches over threshold → empty Matched).
+	name, res, err := srv.resolveNodeName(store, "Repository")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "" {
+		t.Errorf("bare Repository should be ambiguous, got %q", name)
+	}
+	if res == nil || res.Matched != "" {
+		t.Fatalf("expected refusal with empty Matched, got %+v", res)
+	}
+}
+
+func TestPathCandidates_LeadsWithResolved(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/domain/cart.CartService", Props: map[string]any{"symbol_kind": "struct"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/adapters/http/contracts.CartService", Props: map[string]any{"symbol_kind": "struct"}},
+	)
+	srv := newTestServer(store)
+	name, res, _ := srv.resolveNodeName(store, "CartService") // 2 candidates < threshold → best guess
+	cands := srv.pathCandidates(store, "CartService", name, res)
+	if len(cands) < 2 {
+		t.Errorf("expected both CartService candidates, got %v", cands)
+	}
+	if cands[0] != name {
+		t.Errorf("pathCandidates should lead with the resolved name %q, got %v", name, cands)
+	}
+}
+
+func TestBestPath_TriesCandidates(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/domain/cart.CartService", Props: map[string]any{"symbol_kind": "struct"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "internal/adapters/http/contracts.CartService", Props: map[string]any{"symbol_kind": "struct"}},
+		// Only the domain CartService is reachable from the handler.
+		facts.Fact{Kind: facts.KindSymbol, Name: "pkg/handler.Handler", Props: map[string]any{"symbol_kind": "struct"},
+			Relations: []facts.Relation{{Kind: facts.RelInstantiates, Target: "internal/domain/cart.CartService"}}},
+	)
+	store.BuildGraph()
+	srv := newTestServer(store)
+
+	from := []string{"pkg/handler.Handler"}
+	to := []string{"internal/adapters/http/contracts.CartService", "internal/domain/cart.CartService"}
+	res := srv.bestPath(store.Graph(), from, to, nil, 0)
+	if !res.Found {
+		t.Fatal("expected a path to the reachable CartService candidate")
+	}
+	if res.To != "internal/domain/cart.CartService" {
+		t.Errorf("bestPath connected to %q, want internal/domain/cart.CartService", res.To)
+	}
+}
+
+func TestBestPath_NoPath(t *testing.T) {
+	store := facts.NewStore()
+	store.Add(
+		facts.Fact{Kind: facts.KindSymbol, Name: "a.Foo", Props: map[string]any{"symbol_kind": "struct"}},
+		facts.Fact{Kind: facts.KindSymbol, Name: "b.Bar", Props: map[string]any{"symbol_kind": "struct"}},
+	)
+	store.BuildGraph()
+	srv := newTestServer(store)
+	res := srv.bestPath(store.Graph(), []string{"a.Foo"}, []string{"b.Bar"}, nil, 0)
+	if res.Found {
+		t.Error("expected no path between disconnected nodes")
 	}
 }
