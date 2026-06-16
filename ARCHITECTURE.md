@@ -336,8 +336,8 @@ Each extractor is detected by characteristic project files and then parses what 
 | Language   | Parser           | Detected by |
 |------------|------------------|-------------|
 | Go         | `go/ast`         | `go.mod` present |
-| Kotlin     | regex scanner    | `build.gradle.kts` / `build.gradle` with Kotlin/Android |
-| Python     | regex scanner    | `pyproject.toml`, `setup.py`, `requirements.txt`, `Pipfile`, `pytest.ini`, `mypy.ini`, or `tox.ini` (root or up to 3 levels deep) |
+| Kotlin     | tree-sitter      | `build.gradle.kts` / `build.gradle` with Kotlin/Android |
+| Python     | tree-sitter      | `pyproject.toml`, `setup.py`, `requirements.txt`, `Pipfile`, `pytest.ini`, `mypy.ini`, `tox.ini`, or `setup.cfg` (root or up to 3 levels deep) |
 | TypeScript | tree-sitter      | `tsconfig.json`, `tsconfig.base.json`, or `package.json` with TypeScript (root or one level deep) |
 | Swift      | tree-sitter      | `Package.swift`, `.xcodeproj`, or `.xcworkspace` present |
 | Ruby       | regex scanner    | `Gemfile` present |
@@ -347,7 +347,7 @@ Each extractor is detected by characteristic project files and then parses what 
 
 **TypeScript** (tree-sitter) includes Next.js route detection (App Router and Pages Router), monorepo detection one level deep, and parsing of `openapi-typescript`-generated client files — each operation is emitted as a `route` fact with `role:"client"`. App Router route groups like `(standard)` are stripped from URLs.
 
-**Python** uses indentation-based scope tracking for nested classes/methods, and understands FastAPI/Starlette route decorators (emitting `route` facts), SQLAlchemy `__tablename__` (emitting `storage` facts), Pydantic/dataclasses/ABCs/enums (as `class` symbols with `implements` edges per base), `async def`, and both `import` forms. Monorepo detection walks up to 3 levels.
+**Python** is parsed with tree-sitter (the concrete syntax tree handles nested classes/methods and docstrings natively, replacing the older indentation scanner). It understands **FastAPI/Starlette** route decorators and **Django** routes — `@api_view([...])` and `urls.py` `path()`/`re_path()` — emitting a `route` fact per endpoint. It emits `storage` facts for **SQLAlchemy** `__tablename__` and **Django models** (table name inferred from the class name), and classifies Django views and serializers via a `django_component` prop. It captures `async def` (`async: true`), decorator props (`@property`, `@staticmethod`, `@classmethod`, `@abstractmethod`, and Celery `@task`/`@shared_task`), and return-type hints. Each class emits an `implements` edge per base class, with generic type parameters stripped (`CRUDBase[Model, Id]` → `CRUDBase`), and both `import` forms become `dependency` facts. Crucially, the Python extractor now walks function and method bodies for call sites, emitting `calls` and `instantiates` edges (filtering out builtins) — so Python code participates in the dependency/call graph and is reachable by `traverse`, `find_path`, and `impact_analysis`. Monorepo detection walks up to 3 levels.
 
 **Kotlin** is Android-aware: it detects Jetpack Compose (`@Composable`), Hilt DI (`@HiltViewModel`, `@Module`, `@AndroidEntryPoint`), Room (`@Entity`, `@Dao`, `@Database`), ViewModels, Repositories, Use Cases, and Workers.
 

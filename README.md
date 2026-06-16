@@ -145,13 +145,15 @@ Working across several repos? Generate the first, then add the rest with append 
 |------------|-------------|
 | Go         | `go.mod` |
 | TypeScript | `tsconfig.json` / `package.json` with TypeScript (Next.js & monorepo aware) |
-| Python     | `pyproject.toml`, `requirements.txt`, `setup.py`, … (FastAPI / SQLAlchemy aware) |
+| Python     | `pyproject.toml`, `requirements.txt`, `setup.py`, … (FastAPI / Django / SQLAlchemy aware) |
 | Kotlin     | `build.gradle(.kts)` with Kotlin/Android (Compose / Hilt / Room aware) |
 | Swift      | `Package.swift`, `.xcodeproj`, `.xcworkspace` (SwiftUI / UIKit aware) |
 | Ruby       | `Gemfile` (Rails / ActiveRecord / Packwerk aware) |
 | OpenAPI    | any spec with an `openapi:` / `swagger:` key |
 
 Framework- and platform-specific detection for each language is described in **[ARCHITECTURE.md → Supported languages](ARCHITECTURE.md#supported-languages)**.
+
+> Python is parsed with tree-sitter and now contributes call and dependency edges to the graph, so `traverse`, `find_path`, and `impact_analysis` reach into Python code — not just modules and routes.
 
 ---
 
