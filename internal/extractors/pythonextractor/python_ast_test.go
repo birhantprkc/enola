@@ -252,6 +252,115 @@ class Repo:
 	}
 }
 
+// TestAST_InitReexports verifies that from-imports in __init__.py record the
+// imported short names in the dependency fact's "reexports" prop, and that
+// non-__init__ files do not.
+func TestAST_InitReexports(t *testing.T) {
+	src := "from .sub import PublicThing, OtherThing\n"
+
+	initFacts := astExtract(t, "pkg/__init__.py", src, false)
+	var dep *facts.Fact
+	for i := range initFacts {
+		if initFacts[i].Kind == facts.KindDependency {
+			dep = &initFacts[i]
+			break
+		}
+	}
+	if dep == nil {
+		t.Fatal("no dependency fact emitted for from-import")
+	}
+	names, ok := dep.Props["reexports"].([]string)
+	if !ok {
+		t.Fatalf("reexports prop missing or wrong type: %#v", dep.Props["reexports"])
+	}
+	want := map[string]bool{"PublicThing": true, "OtherThing": true}
+	if len(names) != 2 || !want[names[0]] || !want[names[1]] {
+		t.Errorf("reexports = %v, want PublicThing & OtherThing", names)
+	}
+
+	// A non-__init__ file must NOT record reexports.
+	modFacts := astExtract(t, "pkg/mod.py", src, false)
+	for _, f := range modFacts {
+		if f.Kind == facts.KindDependency {
+			if _, ok := f.Props["reexports"]; ok {
+				t.Errorf("non-__init__ file should not record reexports, got %v", f.Props["reexports"])
+			}
+		}
+	}
+}
+
+func TestAST_AbstractClassDetection(t *testing.T) {
+	src := `
+from abc import ABC, ABCMeta, abstractmethod
+from typing import Protocol
+
+class FromABC(ABC):
+    pass
+
+class FromProtocol(Protocol):
+    def run(self): ...
+
+class FromMeta(metaclass=ABCMeta):
+    pass
+
+class HasAbstractMethod:
+    @abstractmethod
+    def do(self):
+        ...
+
+class Concrete:
+    def do(self):
+        return 1
+`
+	idx := byName(astExtract(t, "svc.py", src, false))
+
+	for _, name := range []string{"svc.FromABC", "svc.FromProtocol", "svc.FromMeta", "svc.HasAbstractMethod"} {
+		fn, ok := idx[name]
+		if !ok {
+			t.Fatalf("missing %q; keys: %v", name, keys(idx))
+		}
+		if fn.Props["abstract"] != true {
+			t.Errorf("%s: abstract = %v, want true", name, fn.Props["abstract"])
+		}
+	}
+	if c := idx["svc.Concrete"]; c.Props["abstract"] == true {
+		t.Error("svc.Concrete should not be abstract")
+	}
+}
+
+// TestAST_ExportedProp verifies the leading-underscore export convention.
+func TestAST_ExportedProp(t *testing.T) {
+	src := `
+class PublicClass:
+    pass
+
+class _PrivateClass:
+    pass
+
+def public_fn():
+    pass
+
+def _private_fn():
+    pass
+`
+	idx := byName(astExtract(t, "svc.py", src, false))
+	cases := map[string]bool{
+		"svc.PublicClass":   true,
+		"svc._PrivateClass": false,
+		"svc.public_fn":     true,
+		"svc._private_fn":   false,
+	}
+	for name, want := range cases {
+		fn, ok := idx[name]
+		if !ok {
+			t.Fatalf("missing %q; keys: %v", name, keys(idx))
+		}
+		if fn.Props["exported"] != want {
+			t.Errorf("%s: exported = %v, want %v", name, fn.Props["exported"], want)
+		}
+	}
+}
+
 func TestAST_SQLAlchemyTable(t *testing.T) {
 	src := `
 from sqlalchemy import Column, Integer, String
