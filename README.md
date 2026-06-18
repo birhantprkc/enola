@@ -186,6 +186,38 @@ Artifacts are written to the configured `output.dir` (default `.enola/`). Config
 
 ---
 
+## Explain a repository at a glance
+
+`enola --explain [repo_path]` is a one-shot mode that generates a snapshot, computes statistics over the fact graph, and prints a human-readable report to stdout — no MCP server started, no artifacts written to `.enola/`.
+
+**When to use it:**
+- New contributor getting a first orientation — module count, architecture pattern, hottest packages.
+- Pre-refactor sanity check — cycles, layer violations, blast radius of top modules.
+- Quick audit without spinning up an AI agent.
+
+```bash
+# Use the config in the current directory (mcp-arch.yaml)
+enola --explain
+
+# Analyze a specific repository path
+enola --explain /path/to/repo
+```
+
+**The report covers seven sections:**
+- **Overview** — path, analysis time, active languages, total fact count
+- **Architectural kinds** — counts of modules, symbols, routes, storage, dependencies, services
+- **Symbol breakdown** — functions, methods, structs, interfaces, and other kinds
+- **API & data surface** — route count broken down by HTTP method, plus storage count
+- **Dependencies** — external, internal, and stdlib import counts
+- **Architecture** — detected pattern with confidence, cyclic dependencies, layer violations, cross-repo edges
+- **Impact analysis (hotspots)** — top modules ranked by fan-in + fan-out coupling, with criticality tier and blast radius
+
+No artifacts are written; `.enola/` is not touched. For a persistent snapshot with agent-readable output, use `--generate` or the MCP server.
+
+For interactive per-module blast-radius queries with configurable depth, see the `impact_analysis` tool reference in **[ARCHITECTURE.md → The tools](ARCHITECTURE.md#the-tools)**.
+
+---
+
 ## Learn more
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — the concept, the fact model, the pipeline, and the full tool reference.

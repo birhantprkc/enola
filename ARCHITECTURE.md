@@ -137,6 +137,8 @@ Stage by stage:
 
 Three plugin roles drive the middle of the pipeline — **extractors** (source → facts), **explainers** (facts → insights), and **renderers** (snapshot → artifacts). Each is a small Go interface with a registry, so adding a language or an analysis is a self-contained addition rather than a change to the engine.
 
+**One-shot explain mode.** `enola --explain [repo_path]` is an alternative exit path through the pipeline: stages 1–6 run normally, but instead of proceeding to stage 7 (Renderer) and stage 8 (Artifacts), `pkg/explain.Compute()` reads the fact store, produces a `Report` struct, and `report.Render()` prints a human-readable statistical summary to stdout. No artifacts are written; `.enola/` is not touched. See [The explain package (`pkg/explain`)](#the-explain-package-pkgexplain) below.
+
 ---
 
 ## Insights (explainers)
@@ -146,6 +148,36 @@ Explainers turn raw facts into architectural observations. Each insight carries 
 - **Cycles** ([`internal/explainers/cycles`](internal/explainers/cycles/cycles.go)) — finds cyclic module dependencies using **Tarjan's strongly-connected-components algorithm**. A cycle either exists in the import graph or it doesn't, so these land at confidence `1.0`, with every module in the cycle listed as evidence.
 - **Layers** ([`internal/explainers/layers`](internal/explainers/layers/layers.go)) — recognizes common architectural shapes by matching module paths against known patterns: **hexagonal** (application / port / adapter / domain / …), **Next.js** (pages / components / hooks / lib / api / …), and **Go-standard** (cmd / internal / pkg / api). Confidence is computed from how much of the codebase matches. It also flags **layer violations** — an inner layer importing an outer one — as lower-confidence heuristic warnings.
 - **Cross-repo** ([`internal/explainers/crossrepo`](internal/explainers/crossrepo/crossrepo.go)) — summarizes the cross-repo edges found by the linker. Returns nothing for a single-repo snapshot.
+
+---
+
+## The explain package (`pkg/explain`)
+
+`pkg/explain` ([`pkg/explain/explain.go`](pkg/explain/explain.go)) is a **public** package rather than `internal/` for one reason: `enola-enterprise` imports it to append its own license-gated sections (dead code, package metrics) to the base `Report` before rendering. It is the only package in the OSS codebase with that cross-module consumer.
+
+### `Report` and `Compute()`
+
+`Compute(eng *bootstrap.Engine) *Report` reads the engine's current fact store and snapshot — it does not generate a snapshot; callers do that first. The fields it populates map directly to the seven output sections:
+
+| Report field(s) | Output section |
+|---|---|
+| `RepoPath`, `GeneratedAt`, `Duration`, `Extractors`, `TotalFacts` | Overview |
+| `KindCounts` | Architectural kinds |
+| `SymbolKinds` | Symbol breakdown |
+| `Routes`, `RoutesByMethod`, `Storage` | API & data surface |
+| `DepSources` | Dependencies |
+| `Architecture`, `ArchConfidence`, `Cycles`, `LayerViolations`, `CrossRepoEdges` | Architecture |
+| `Modules`, `HighCriticality`, `MediumCriticality`, `Hotspots`, `CouplingUnresolved` | Impact analysis (hotspots) |
+
+`CouplingUnresolved` is a special flag: it is set when dependency facts exist but no import edge resolved to a module, meaning coupling analysis is unavailable rather than genuinely zero. The renderer surfaces this as an explanatory note instead of implying the codebase has no coupling.
+
+### Extensibility via `ExtraSections`
+
+`Report.ExtraSections []Section` is the extension point for enterprise code. After calling `Compute()`, enterprise calls `report.AddSection(title, body)` (or directly appends `explain.Section{...}`) and then calls `report.Render()`. The renderer appends the extra sections after the seven base sections, using the same plain-text format. This design means `enola-enterprise` only depends on the exported `pkg/explain` surface and never needs to import `internal/facts` or `internal/engine` directly.
+
+### Output format
+
+`Render()` produces plain aligned text (not Markdown), designed to read well in a terminal without paging. Sections are separated by `═` rule lines (60 characters). Key-value pairs use `fmt.Fprintf` with a 20-character label width; tables (hotspots) use fixed-width column formats. No color codes — output is safe to pipe or capture in CI.
 
 ---
 
