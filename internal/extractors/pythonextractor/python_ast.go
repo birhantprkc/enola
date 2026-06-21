@@ -71,6 +71,45 @@ type pyWalker struct {
 	// localTypes maps a variable name in the current function scope to its
 	// canonical qualified type. Reset at the entry of every handleFunction call.
 	localTypes map[string]string
+
+	// Per-function complexity state, set up by handleFunction around walkForCalls.
+	// metrics is nil outside a function body walk. loopDepth is the current loop
+	// nesting depth; selfName is the enclosing function's qualified name (for
+	// direct-recursion detection).
+	metrics   *pyBodyMetrics
+	loopDepth int
+	selfName  string
+}
+
+// pyBodyMetrics accumulates per-function complexity signals during the single
+// walkForCalls body traversal — mirrors the Go extractor's bodyMetrics.
+type pyBodyMetrics struct {
+	loopDepth   int             // max loop nesting depth
+	loopCount   int             // number of loop/comprehension constructs
+	decisions   int             // decision points (cyclomatic = 1 + decisions)
+	callsInLoop []string        // distinct call targets invoked at loop depth >= 1
+	inLoopSeen  map[string]bool // dedup set for callsInLoop
+	recursive   bool            // body directly calls the enclosing function
+}
+
+// recordCallMetrics notes a resolved call target against the current function's
+// complexity metrics: flags direct recursion and records calls made inside loops.
+func (w *pyWalker) recordCallMetrics(target string) {
+	if w.metrics == nil || target == "" {
+		return
+	}
+	if target == w.selfName {
+		w.metrics.recursive = true
+	}
+	if w.loopDepth > 0 {
+		if w.metrics.inLoopSeen == nil {
+			w.metrics.inLoopSeen = make(map[string]bool)
+		}
+		if !w.metrics.inLoopSeen[target] {
+			w.metrics.inLoopSeen[target] = true
+			w.metrics.callsInLoop = append(w.metrics.callsInLoop, target)
+		}
+	}
 }
 
 func (w *pyWalker) pushOwner(idx int)       { w.ownerStack = append(w.ownerStack, idx) }
@@ -544,7 +583,28 @@ func (w *pyWalker) handleFunction(node *sitter.Node, decorators []string) {
 		for k, v := range collectLocalTypes(bodyNode, w.src, w.importMap, w.module) {
 			w.localTypes[k] = v
 		}
+		// Set up per-function complexity tracking for this body walk. The props
+		// map is shared by reference with the fact in w.out, so writing to it
+		// after the walk updates the emitted fact.
+		w.metrics = &pyBodyMetrics{}
+		w.loopDepth = 0
+		w.selfName = qualName
 		w.walkForCalls(bodyNode)
+		props["cyclomatic"] = 1 + w.metrics.decisions
+		if w.metrics.loopDepth > 0 {
+			props["loop_depth"] = w.metrics.loopDepth
+		}
+		if w.metrics.loopCount > 0 {
+			props["loop_count"] = w.metrics.loopCount
+		}
+		if len(w.metrics.callsInLoop) > 0 {
+			props["calls_in_loop"] = w.metrics.callsInLoop
+		}
+		if w.metrics.recursive {
+			props["recursive_self"] = true
+		}
+		w.metrics = nil
+		w.selfName = ""
 		w.localTypes = nil
 	}
 	w.popOwner()
@@ -630,19 +690,109 @@ func (w *pyWalker) walkForCalls(node *sitter.Node) {
 	if node == nil {
 		return
 	}
-	if node.Kind() == "call" {
+	kind := node.Kind()
+	if kind == "call" {
 		if fn := node.ChildByFieldName("function"); fn != nil {
 			w.emitCallEdge(fn)
 		}
 	}
+
+	// Complexity metrics: count decision points so the single body walk doubles
+	// as the cyclomatic/loop pass (mirrors the Go extractor).
+	if w.metrics != nil {
+		switch kind {
+		case "if_statement", "elif_clause", "conditional_expression",
+			"except_clause", "case_clause", "boolean_operator":
+			w.metrics.decisions++
+		}
+	}
+
 	// Don't recurse into nested class/function definitions — they get their own owner.
-	switch node.Kind() {
+	switch kind {
 	case "class_definition", "function_definition", "decorated_definition":
 		return
 	}
+
+	// Comprehensions and generator expressions carry an implicit loop, but the
+	// first for-clause's iterable is evaluated once (not per-iteration), so they
+	// need special handling — see walkComprehension.
+	switch kind {
+	case "list_comprehension", "dictionary_comprehension", "set_comprehension", "generator_expression":
+		w.walkComprehension(node)
+		return
+	}
+
+	// Statement loops raise the nesting depth for calls within their body.
+	isLoop := kind == "for_statement" || kind == "while_statement"
+	if isLoop {
+		if w.metrics != nil {
+			w.metrics.loopCount++
+			w.metrics.decisions++
+			if w.loopDepth+1 > w.metrics.loopDepth {
+				w.metrics.loopDepth = w.loopDepth + 1
+			}
+		}
+		w.loopDepth++
+	}
+
 	for i := uint(0); i < uint(node.ChildCount()); i++ {
 		w.walkForCalls(node.Child(i))
 	}
+
+	if isLoop {
+		w.loopDepth--
+	}
+}
+
+// walkComprehension handles list/set/dict comprehensions and generator
+// expressions. They carry an implicit loop (counted as one nesting level), but
+// the iterable of the FIRST for-clause is evaluated exactly once — so a call
+// there (e.g. `[x for x in session.query(...)]`) must NOT be counted as in-loop,
+// otherwise it reads as a false N+1. The element expression, if-conditions, and
+// any subsequent for-clauses do run per-iteration and are walked at inner depth.
+//
+// Simplification: a comprehension counts as a single loop level even when it has
+// multiple for-clauses (which are really nested); this keeps depth attribution
+// conservative rather than over-counting.
+func (w *pyWalker) walkComprehension(node *sitter.Node) {
+	if w.metrics != nil {
+		w.metrics.loopCount++
+		w.metrics.decisions++
+		if w.loopDepth+1 > w.metrics.loopDepth {
+			w.metrics.loopDepth = w.loopDepth + 1
+		}
+	}
+
+	// Identify the first for-clause's iterable (its "right" field).
+	var firstIter *sitter.Node
+	for i := uint(0); i < uint(node.ChildCount()); i++ {
+		if c := node.Child(i); c.Kind() == "for_in_clause" {
+			firstIter = c.ChildByFieldName("right")
+			break
+		}
+	}
+	if firstIter != nil {
+		w.walkForCalls(firstIter) // evaluated once → stays at outer depth
+	}
+
+	w.loopDepth++
+	for i := uint(0); i < uint(node.ChildCount()); i++ {
+		child := node.Child(i)
+		if child.Kind() == "for_in_clause" {
+			// Walk the clause's children at inner depth, skipping the already
+			// handled first iterable (matched by byte range).
+			for j := uint(0); j < uint(child.ChildCount()); j++ {
+				cc := child.Child(j)
+				if firstIter != nil && cc.StartByte() == firstIter.StartByte() && cc.EndByte() == firstIter.EndByte() {
+					continue
+				}
+				w.walkForCalls(cc)
+			}
+			continue
+		}
+		w.walkForCalls(child)
+	}
+	w.loopDepth--
 }
 
 // emitCallEdge resolves the callee node and appends a relation to the current owner.
@@ -670,6 +820,7 @@ func (w *pyWalker) emitCallEdge(fn *sitter.Node) {
 				Kind:   facts.RelCalls,
 				Target: target,
 			})
+			w.recordCallMetrics(target)
 		}
 
 	case "attribute":
@@ -682,10 +833,12 @@ func (w *pyWalker) emitCallEdge(fn *sitter.Node) {
 		attr := pyText(attrNode, w.src)
 		if obj == "self" || obj == "cls" {
 			if methods := w.currentMethods(); methods[attr] {
+				target := w.module + "." + w.enclosingType() + "." + attr
 				owner.Relations = append(owner.Relations, facts.Relation{
 					Kind:   facts.RelCalls,
-					Target: w.module + "." + w.enclosingType() + "." + attr,
+					Target: target,
 				})
+				w.recordCallMetrics(target)
 			}
 			return
 		}
@@ -694,10 +847,12 @@ func (w *pyWalker) emitCallEdge(fn *sitter.Node) {
 		if qualType == "" {
 			return
 		}
+		target := qualType + "." + attr
 		owner.Relations = append(owner.Relations, facts.Relation{
 			Kind:   facts.RelCalls,
-			Target: qualType + "." + attr,
+			Target: target,
 		})
+		w.recordCallMetrics(target)
 		w.emitImplementorCalls(owner, attr, qualType)
 	}
 }
