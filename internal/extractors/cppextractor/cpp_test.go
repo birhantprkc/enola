@@ -523,6 +523,11 @@ func TestIntegrationGetdp(t *testing.T) {
 	if n := countByName(ff, "src/interface.MacroManagerStack"); n != 1 {
 		t.Errorf("expected exactly 1 MacroManagerStack fact, got %d", n)
 	}
+
+	// Complexity metrics populate: getdp is a loop-heavy numeric solver.
+	if n := countLoopDepthAtLeast(ff, 2); n < 10 {
+		t.Errorf("expected >= 10 functions with loop_depth >= 2 in getdp, got %d", n)
+	}
 }
 
 func TestIntegrationGmsh(t *testing.T) {
@@ -564,4 +569,38 @@ func TestIntegrationGmsh(t *testing.T) {
 	if len(ff) < 2000 {
 		t.Errorf("expected a large fact count from gmsh Geo/Numeric/Common, got %d", len(ff))
 	}
+
+	// Complexity metrics populate on a real, loop-heavy numeric codebase: many
+	// functions nest loops (>= 2 deep) and at least some recurse.
+	if n := countLoopDepthAtLeast(ff, 2); n < 50 {
+		t.Errorf("expected >= 50 functions with loop_depth >= 2 in gmsh, got %d", n)
+	}
+	if n := countRecursive(ff); n < 1 {
+		t.Errorf("expected at least one recursive_self function in gmsh, got %d", n)
+	}
+}
+
+// countLoopDepthAtLeast counts symbol facts whose loop_depth prop is >= min.
+func countLoopDepthAtLeast(ff []facts.Fact, min int) int {
+	n := 0
+	for _, f := range ff {
+		if f.Kind != facts.KindSymbol {
+			continue
+		}
+		if d, ok := f.Props["loop_depth"].(int); ok && d >= min {
+			n++
+		}
+	}
+	return n
+}
+
+// countRecursive counts symbol facts flagged with recursive_self.
+func countRecursive(ff []facts.Fact) int {
+	n := 0
+	for _, f := range ff {
+		if r, ok := f.Props["recursive_self"].(bool); ok && r {
+			n++
+		}
+	}
+	return n
 }

@@ -113,6 +113,101 @@ type astWalker struct {
 	// fileMethods maps a simple class name to the set of its method names declared
 	// anywhere in this file, so out-of-line method bodies can resolve sibling calls.
 	fileMethods map[string]map[string]bool
+
+	// Per-function complexity state, set up by handleFunctionDefinition around
+	// walkForCalls and saved/restored across the re-entrant body walk. metrics is
+	// nil outside a function body walk. loopDepth is the current loop nesting depth;
+	// selfName/selfShort are the enclosing function's full and leaf names (for
+	// direct-recursion detection).
+	metrics   *cppBodyMetrics
+	loopDepth int
+	selfName  string
+	selfShort string
+}
+
+// cppBodyMetrics accumulates per-function complexity signals during the single
+// walkForCalls body traversal — mirrors the other extractors.
+type cppBodyMetrics struct {
+	loopDepth   int             // max loop nesting depth
+	loopCount   int             // number of loop constructs (syntactic + STL-algorithm lambdas)
+	decisions   int             // decision points (cyclomatic = 1 + decisions)
+	callsInLoop []string        // distinct call targets invoked at loop depth >= 1
+	inLoopSeen  map[string]bool // dedup set for callsInLoop
+	recursive   bool            // body directly calls the enclosing function
+}
+
+// cppStlIterators are <algorithm>/<numeric> functions whose lambda/functor argument
+// runs once per element — i.e. a loop. A lambda passed to a function NOT in this set
+// is a deferred scope and not treated as a loop.
+var cppStlIterators = map[string]bool{
+	"for_each": true, "transform": true, "accumulate": true, "reduce": true,
+	"count_if": true, "find_if": true, "find_if_not": true, "copy_if": true,
+	"remove_if": true, "remove_copy_if": true, "replace_if": true, "erase_if": true,
+	"sort": true, "stable_sort": true, "partial_sort": true, "nth_element": true,
+	"generate": true, "generate_n": true, "transform_reduce": true, "transform_exclusive_scan": true,
+	"all_of": true, "any_of": true, "none_of": true, "partition": true, "stable_partition": true,
+	"min_element": true, "max_element": true, "sort_heap": true, "inner_product": true,
+}
+
+// recordCallMetrics notes a resolved call target against the current function's
+// complexity metrics: flags direct recursion and records calls made inside loops.
+func (w *astWalker) recordCallMetrics(target string) {
+	if w.metrics == nil || target == "" {
+		return
+	}
+	if target == w.selfName || target == w.selfShort {
+		w.metrics.recursive = true
+	}
+	w.recordInLoop(target)
+}
+
+// recordInLoop adds a target to calls_in_loop (deduped) when inside a loop, without
+// the recursion check — used for raw instance-method names.
+func (w *astWalker) recordInLoop(target string) {
+	if w.metrics == nil || target == "" || w.loopDepth == 0 {
+		return
+	}
+	if w.metrics.inLoopSeen == nil {
+		w.metrics.inLoopSeen = make(map[string]bool)
+	}
+	if !w.metrics.inLoopSeen[target] {
+		w.metrics.inLoopSeen[target] = true
+		w.metrics.callsInLoop = append(w.metrics.callsInLoop, target)
+	}
+}
+
+// cppCheapMethods are obviously-cheap STL container / iterator / accessor methods.
+// A call to one of these on an unknown receiver inside a loop is NOT recorded in
+// calls_in_loop, keeping the metric focused on potential per-iteration work (the
+// enterprise keyword gate is the real precision filter, but suppressing these at the
+// source avoids false positives like a JSON `db.begin()`/`db.end()` matching the
+// generic `db.` I/O prefix).
+var cppCheapMethods = map[string]bool{
+	"begin": true, "end": true, "cbegin": true, "cend": true,
+	"rbegin": true, "rend": true, "size": true, "length": true,
+	"empty": true, "clear": true, "data": true, "c_str": true,
+	"at": true, "front": true, "back": true, "top": true,
+	"push_back": true, "emplace_back": true, "pop_back": true,
+	"push": true, "pop": true, "emplace": true, "reserve": true,
+	"first": true, "second": true, "count": true, "capacity": true,
+	"str": true, "get": true, "set": true, "key": true, "value": true,
+}
+
+// cppBooleanOp reports whether a binary_expression's operator is a short-circuit
+// boolean operator (&& / ||), which adds a cyclomatic decision point.
+func cppBooleanOp(node *sitter.Node) bool {
+	for i := uint(0); i < node.ChildCount(); i++ {
+		switch node.Child(i).Kind() {
+		case "&&", "||":
+			return true
+		}
+	}
+	return false
+}
+
+// cppByteContains reports whether inner's byte span is nested within outer's.
+func cppByteContains(outer, inner *sitter.Node) bool {
+	return inner.StartByte() >= outer.StartByte() && inner.EndByte() <= outer.EndByte()
 }
 
 func (w *astWalker) pushType(name string, methods map[string]bool) {
@@ -384,7 +479,7 @@ func (w *astWalker) handleFunctionDefinition(node *sitter.Node) {
 		return
 	}
 
-	var symbolName, receiver string
+	var symbolName, receiver, shortName string
 	var outOfLineScopes []string // scope chain to push for an out-of-line def
 	switch nameNode.Kind() {
 	case "qualified_identifier":
@@ -399,6 +494,7 @@ func (w *astWalker) handleFunctionDefinition(node *sitter.Node) {
 		comps = append(comps, scopes...)
 		comps = append(comps, leaf)
 		symbolName = w.dir + "." + strings.Join(comps, "::")
+		shortName = leaf
 		if len(scopes) > 0 {
 			receiver = scopes[len(scopes)-1] // immediate scope owning the definition
 			outOfLineScopes = scopes
@@ -409,6 +505,7 @@ func (w *astWalker) handleFunctionDefinition(node *sitter.Node) {
 			return
 		}
 		symbolName = w.factName(leaf)
+		shortName = leaf
 		receiver = w.enclosingTypeReceiver()
 	}
 
@@ -448,9 +545,35 @@ func (w *astWalker) handleFunctionDefinition(node *sitter.Node) {
 		}
 		w.pushType(comp, methods)
 	}
+	// Set up per-function complexity tracking. walkForCalls can recurse into nested
+	// scopes (lambdas), so save and restore the outer state. Props are written via
+	// the stable index (the pointer may be invalidated if the body walk grows w.out).
+	savedMetrics, savedDepth := w.metrics, w.loopDepth
+	savedName, savedShort := w.selfName, w.selfShort
+	w.metrics = &cppBodyMetrics{}
+	w.loopDepth = 0
+	w.selfName = symbolName
+	w.selfShort = shortName
 	if body := node.ChildByFieldName("body"); body != nil {
 		w.walkForCalls(body)
 	}
+	m := w.metrics
+	props := w.out[idx].Props
+	props["cyclomatic"] = 1 + m.decisions
+	if m.loopDepth > 0 {
+		props["loop_depth"] = m.loopDepth
+	}
+	if m.loopCount > 0 {
+		props["loop_count"] = m.loopCount
+	}
+	if len(m.callsInLoop) > 0 {
+		props["calls_in_loop"] = m.callsInLoop
+	}
+	if m.recursive {
+		props["recursive_self"] = true
+	}
+	w.metrics, w.loopDepth = savedMetrics, savedDepth
+	w.selfName, w.selfShort = savedName, savedShort
 	for range outOfLineScopes {
 		w.popType()
 	}
@@ -717,32 +840,163 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 	if node == nil {
 		return
 	}
-	if node.Kind() == "call_expression" {
-		callee := node.ChildByFieldName("function")
-		name, kind, root := calleeInfo(callee, w.src)
-		switch {
-		case name == "":
-			// unresolved (call through pointer, etc.)
-		case kind == calleeQualified:
-			if !systemNamespaces[root] {
-				w.addOwnerEdge(facts.RelCalls, root+"::"+name)
-			}
-		case kind == calleePlain:
-			if isTypeName(name) {
-				if !cppBuiltinTypes[name] {
-					w.addOwnerEdge(facts.RelInstantiates, name)
-				}
-			} else if target := w.resolveCall(name); target != "" {
-				w.addOwnerEdge(facts.RelCalls, target)
-			}
-		case kind == calleeField && root == "this":
-			if w.currentMethods()[name] {
-				w.addOwnerEdge(facts.RelCalls, w.factName(name))
+	kind := node.Kind()
+
+	// A lambda is a deferred scope: its body runs when invoked, NOT per-iteration of
+	// the enclosing loops — so reset the loop depth for its subtree (e.g. a callback
+	// defined inside a loop). An STL iterator's OWN lambda is handled in the
+	// call_expression branch (its body walks at +1).
+	if w.metrics != nil && kind == "lambda_expression" {
+		saved := w.loopDepth
+		w.loopDepth = 0
+		for i := uint(0); i < node.ChildCount(); i++ {
+			w.walkForCalls(node.Child(i))
+		}
+		w.loopDepth = saved
+		return
+	}
+
+	// Complexity decision points: the single body walk doubles as the cyclomatic pass.
+	if w.metrics != nil {
+		switch kind {
+		case "if_statement", "conditional_expression", "case_statement", "catch_clause":
+			w.metrics.decisions++
+		case "binary_expression":
+			if cppBooleanOp(node) {
+				w.metrics.decisions++
 			}
 		}
 	}
+
+	switch kind {
+	case "for_statement", "while_statement", "do_statement", "for_range_loop":
+		// Syntactic loops: everything in the body runs per iteration.
+		if w.metrics != nil {
+			w.metrics.loopCount++
+			w.metrics.decisions++
+			if w.loopDepth+1 > w.metrics.loopDepth {
+				w.metrics.loopDepth = w.loopDepth + 1
+			}
+		}
+		w.loopDepth++
+		for i := uint(0); i < node.ChildCount(); i++ {
+			w.walkForCalls(node.Child(i))
+		}
+		w.loopDepth--
+		return
+	case "call_expression":
+		w.handleCall(node)
+		// An STL algorithm with a lambda (std::for_each(b, e, [&]{ … })) is a loop:
+		// its lambda body runs per element, but the receiver/other args run once.
+		if w.metrics != nil {
+			if lambda := w.cppStlLambda(node); lambda != nil {
+				w.metrics.loopCount++
+				w.metrics.decisions++
+				if w.loopDepth+1 > w.metrics.loopDepth {
+					w.metrics.loopDepth = w.loopDepth + 1
+				}
+				for i := uint(0); i < node.ChildCount(); i++ {
+					if c := node.Child(i); cppByteContains(c, lambda) {
+						w.walkCppLambdaSubtree(c, lambda)
+					} else {
+						w.walkForCalls(c)
+					}
+				}
+				return
+			}
+		}
+	}
+
 	for i := uint(0); i < node.ChildCount(); i++ {
 		w.walkForCalls(node.Child(i))
+	}
+}
+
+// handleCall emits the call-graph edge for a call_expression and feeds the current
+// function's complexity metrics (recursion + calls_in_loop).
+func (w *astWalker) handleCall(node *sitter.Node) {
+	callee := node.ChildByFieldName("function")
+	name, kind, root := calleeInfo(callee, w.src)
+	switch {
+	case name == "":
+		// unresolved (call through pointer, etc.)
+	case kind == calleeQualified:
+		if !systemNamespaces[root] {
+			target := root + "::" + name
+			w.addOwnerEdge(facts.RelCalls, target)
+			w.recordCallMetrics(target)
+		}
+	case kind == calleePlain:
+		if isTypeName(name) {
+			if !cppBuiltinTypes[name] {
+				w.addOwnerEdge(facts.RelInstantiates, name)
+			}
+		} else if target := w.resolveCall(name); target != "" {
+			w.addOwnerEdge(facts.RelCalls, target)
+			w.recordCallMetrics(target)
+		}
+	case kind == calleeField && root == "this":
+		if w.currentMethods()[name] {
+			target := w.factName(name)
+			w.addOwnerEdge(facts.RelCalls, target)
+			w.recordCallMetrics(target)
+		}
+	case kind == calleeField:
+		// obj->method() / obj.method() on a non-this receiver: no graph edge (the
+		// receiver's type is not tracked), but its name feeds the in-loop metric so
+		// the enterprise analyzer can reason about per-iteration work. Skip obviously
+		// cheap container/iterator methods to keep calls_in_loop focused.
+		if !cppCheapMethods[name] {
+			tgt := name
+			if root != "" {
+				tgt = root + "." + name
+			}
+			w.recordInLoop(tgt)
+		}
+	}
+}
+
+// cppStlLambda returns the lambda argument of an STL-iterator call
+// (std::for_each(b, e, [&]{…})), or nil if the call is not an iterator with a lambda.
+func (w *astWalker) cppStlLambda(call *sitter.Node) *sitter.Node {
+	name, _, _ := calleeInfo(call.ChildByFieldName("function"), w.src)
+	if name == "" || !cppStlIterators[name] {
+		return nil
+	}
+	args := call.ChildByFieldName("arguments")
+	if args == nil {
+		return nil
+	}
+	for i := uint(0); i < args.ChildCount(); i++ {
+		if c := args.Child(i); c.Kind() == "lambda_expression" {
+			return c
+		}
+	}
+	return nil
+}
+
+// walkCppLambdaSubtree descends to an STL iterator's lambda and walks its BODY at +1
+// (it runs per element), while walking everything else (other args) at the current
+// depth. Kind-checked so an ancestor with the same byte span isn't mistaken for the
+// lambda.
+func (w *astWalker) walkCppLambdaSubtree(node, lambda *sitter.Node) {
+	if node == nil {
+		return
+	}
+	if node.Kind() == "lambda_expression" && node.StartByte() == lambda.StartByte() && node.EndByte() == lambda.EndByte() {
+		w.loopDepth++
+		for i := uint(0); i < node.ChildCount(); i++ {
+			w.walkForCalls(node.Child(i))
+		}
+		w.loopDepth--
+		return
+	}
+	for i := uint(0); i < node.ChildCount(); i++ {
+		if c := node.Child(i); cppByteContains(c, lambda) {
+			w.walkCppLambdaSubtree(c, lambda)
+		} else {
+			w.walkForCalls(c)
+		}
 	}
 }
 
