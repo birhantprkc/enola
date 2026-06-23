@@ -90,3 +90,68 @@ func TestExplain_CycleTerminates(t *testing.T) {
 		t.Errorf("expected 0 insights for short cycle, got %d", len(insights))
 	}
 }
+
+// cyclicGraph: a 3-module cycle x->y->z->x with a tail z->t1->t2->t3. The
+// longest simple chain from x visits 6 distinct modules. A correct, cycle-safe
+// longest-path must not double-count the cycle entry.
+func cyclicGraph() ([]string, map[string][]string) {
+	return []string{"a/x", "a/y", "a/z", "a/t1", "a/t2", "a/t3"},
+		map[string][]string{
+			"a/x":  {"a/y"},
+			"a/y":  {"a/z"},
+			"a/z":  {"a/x", "a/t1"},
+			"a/t1": {"a/t2"},
+			"a/t2": {"a/t3"},
+		}
+}
+
+func TestExplain_CycleDoesNotInflateDepth(t *testing.T) {
+	mods, deps := cyclicGraph()
+	insights, err := New().Explain(context.Background(), makeStore(mods, deps))
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	if len(insights) == 0 {
+		t.Fatal("expected at least one deep-chain insight")
+	}
+	deepest := insights[0]
+	// The deepest chain is x->y->z->t1->t2->t3: 6 distinct modules, none repeated.
+	if got := len(deepest.Evidence); got != 6 {
+		t.Errorf("deepest chain should span 6 distinct modules, got %d: %q", got, deepest.Title)
+	}
+	seen := map[string]bool{}
+	for _, ev := range deepest.Evidence {
+		if seen[ev.Fact] {
+			t.Errorf("chain double-counts module %q (cycle inflation): %q", ev.Fact, deepest.Title)
+		}
+		seen[ev.Fact] = true
+	}
+}
+
+// TestExplain_Deterministic guards against the regression where cycle handling
+// depended on Go's randomized map iteration order. Each Explain call re-ranges
+// the graph map, so repeated calls exercise different iteration orders; the
+// rendered titles must be identical every time.
+func TestExplain_Deterministic(t *testing.T) {
+	mods, deps := cyclicGraph()
+	store := makeStore(mods, deps)
+
+	titles := func() []string {
+		insights, err := New().Explain(context.Background(), store)
+		if err != nil {
+			t.Fatalf("Explain: %v", err)
+		}
+		out := make([]string, len(insights))
+		for i, in := range insights {
+			out[i] = in.Title
+		}
+		return out
+	}
+
+	want := strings.Join(titles(), "\n")
+	for i := 0; i < 50; i++ {
+		if got := strings.Join(titles(), "\n"); got != want {
+			t.Fatalf("non-deterministic output on iteration %d:\nwant:\n%s\ngot:\n%s", i, want, got)
+		}
+	}
+}

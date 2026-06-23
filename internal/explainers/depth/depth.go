@@ -42,9 +42,19 @@ func (e *DepthExplainer) Explain(ctx context.Context, store *facts.Store) ([]fac
 		return nil, nil
 	}
 
+	// Determinism: sort each neighbor list and the root iteration order so the
+	// memoized longest-path results don't depend on Go's randomized map
+	// iteration. Without this, cycles make the computed depths vary run to run.
+	roots := make([]string, 0, len(graph))
+	for mod := range graph {
+		roots = append(roots, mod)
+		sort.Strings(graph[mod])
+	}
+	sort.Strings(roots)
+
 	memo := make(map[string][]string) // module -> deepest chain starting at module
 	visiting := make(map[string]bool)
-	for mod := range graph {
+	for _, mod := range roots {
 		longestChain(mod, graph, memo, visiting)
 	}
 
@@ -109,8 +119,10 @@ func longestChain(module string, graph map[string][]string, memo map[string][]st
 		return chain
 	}
 	if visiting[module] {
-		// Cycle back-edge: stop here without recursing.
-		return []string{module}
+		// Cycle back-edge: the target is already on the current path, so
+		// following it would revisit a module. Contribute no further depth
+		// (returning the module here would double-count it up the chain).
+		return nil
 	}
 	visiting[module] = true
 
