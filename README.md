@@ -1,8 +1,8 @@
 # enola
 
-**A deterministic map of your codebase for AI coding agents — the real architecture, extracted from your source, not guessed.**
+**A deterministic structural model of your codebase for AI coding agents — your real architecture, extracted from source, not guessed.**
 
-enola is a local [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server. Point it at one or more repositories and it builds a precise graph of your code's architecture — modules, types, routes, dependencies, and how they all connect — then exposes tools your AI agent can use to read, traverse, and reason about that structure. So before your agent writes a line of code, it already knows the shape of the thing it's editing.
+enola is a local [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server. Point it at one or more repositories and it builds a precise graph of your code's architecture — modules, types, routes, dependencies, and how they all connect — straight from your source. It then exposes tools your AI agent can use to read, traverse, query, and reason over that structure. So before your agent writes a line of code, it already knows the shape of the thing it's editing.
 
 ---
 
@@ -12,7 +12,7 @@ AI coding agents are powerful, but they're non-deterministic. On every task they
 
 enola removes the guessing from the part that should never be guessed: the structure.
 
-It gives your agent a **deterministic architectural ground truth** — a graph of your code's real types and relationships, built by parsers and graph algorithms, not by a language model. Run it twice on the same commit and you get the same answer, every time. The agent starts from facts instead of assumptions.
+It gives your agent a **deterministic structural model** — a structural architecture graph of your code's real types and relationships, built by parsers and graph algorithms, not by a language model. The structure is *extracted* from your source, not *summarized* from it; these are facts, not notes. Run it twice on the same commit and you get the same answer, every run. The agent starts from facts instead of assumptions.
 
 The result is the difference between *vibe coding* — prompt, hope, fix — and **AI-augmented engineering**: fewer wrong turns, fewer tokens burned, and work you can reproduce. enola adds determinism where AI lacks it, and your agent spends its intelligence on the actual problem instead of re-learning your repo.
 
@@ -22,7 +22,7 @@ The result is the difference between *vibe coding* — prompt, hope, fix — and
 
 ## What it is
 
-Under the hood, enola models your codebase as a **graph of architectural types — which we call _kinds_ — and the relations between them.** That's the whole concept: not a magic "knowledge graph," just a deeply technical, structural map of what your code actually contains.
+Under the hood, enola models your codebase as a **graph of architectural types — which we call _kinds_ — and the relations between them.** That's the whole concept: not a magic "knowledge graph," just a deeply technical, structural model of what your code actually contains.
 
 The **kinds** (the nodes):
 
@@ -33,7 +33,7 @@ The **kinds** (the nodes):
 - **dependency** — an import relationship
 - **service** — a whole repository (used when you analyze several at once)
 
-The **relations** (the edges) connect them: *declares*, *imports*, *calls*, *implements*, *depends_on*, and more. On top of this graph, enola builds a small set of tools your agent can call to answer real structural questions with exact answers.
+The **relations** (the edges) connect them: *declares*, *imports*, *calls*, *implements*, *depends_on*, and more. Because the edges are typed and directed, the graph is *queryable*, not merely searchable — you compute over it. On top of it, enola builds a small set of tools your agent can call to answer real structural questions with exact answers.
 
 For the full mental model and internals, see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
@@ -49,11 +49,11 @@ For the full mental model and internals, see **[ARCHITECTURE.md](ARCHITECTURE.md
 
 ## The tools (and how they work together)
 
-The workflow is simple: **generate the map once, then ask.** After that, your agent has seven tools on top of the graph:
+The workflow is simple: **generate the snapshot once, then ask.** These aren't text lookups — each tool *computes over the graph*: `traverse` walks reachability, `find_path` finds the shortest chain between two points, `impact_analysis` takes the transitive reverse closure. After the snapshot, your agent has seven tools on top of the graph:
 
 | Tool | The question it answers |
 |------|-------------------------|
-| `generate_snapshot` | "Map this repo." Build or refresh the graph. Run it first; use `append` to add more repos. |
+| `generate_snapshot` | "Snapshot this repo." Build or refresh the graph. Run it first; use `append` to add more repos. |
 | `explore` | "What's in this module/file/symbol, and what touches it?" A guided tour. |
 | `query_facts` | "List exactly these." Every route, every interface, every external dependency. |
 | `show_symbol` | "Show me the code." Jump straight to a symbol's source. |
@@ -146,7 +146,7 @@ Working across several repos? Generate the first, then add the rest with append 
 
 > "If I change the auth service, which other services are impacted?"
 
-**Regenerate after major changes** so the map stays current. enola only re-parses files whose contents changed, so refreshes are fast.
+**Regenerate after major changes** so the snapshot stays current. enola only re-parses files whose contents changed, so refreshes are fast.
 
 ---
 
@@ -215,6 +215,106 @@ enola --explain /path/to/repo
 - **Architecture** — detected pattern with confidence, cyclic dependencies, layer violations, cross-repo edges
 - **Impact analysis (hotspots)** — top modules ranked by fan-in + fan-out coupling, with criticality tier and blast radius
 - **Code health** — per-explainer findings with their top offenders: god classes (high fan-in symbols), call-graph hotspots, deep dependency chains, large public surfaces, and complexity outliers
+
+Every finding carries a confidence score, and it means something exact: `1.0` is a structural fact (a cycle exists; an export ratio measured), while anything below is a flagged heuristic for you to review (a god class is a statistical fan-in outlier, not a rule). The analyses are computed by graph algorithms — Tarjan's SCC for cycles, longest-path for dependency depth, mean+2σ outlier tests for the rest — so the same commit yields the same report.
+
+Here's the actual report for [Apache Airflow](https://github.com/apache/airflow) — a large polyglot codebase (Python, Java, TypeScript, and OpenAPI specs) analyzed in a single pass, 112,792 facts in ~15s:
+
+```
+════════════════════════════════════════════════════════════
+ Repository explanation: apache/airflow
+════════════════════════════════════════════════════════════
+
+Overview
+  Generated:           2026-06-23T20:37:10Z
+  Analysis time:       14.968177458s
+  Languages:           java, openapi, python, typescript
+  Total facts:         112792
+
+Architectural kinds
+  module                   2492
+  symbol                  64192
+  route                    6359
+  storage                    64
+  dependency              39685
+
+Symbol breakdown
+  method                  41127
+  function                12371
+  class                    8621
+  type                     1393
+  variable                  636
+  interface                  36
+  enum                        6
+  constant                    2
+
+API & data surface
+  routes                   6359
+    (unspecified)          6182
+    GET                     105
+    POST                     28
+    PATCH                    22
+    DELETE                   16
+    PUT                       6
+  storage                    64
+
+Dependencies
+  internal                17810
+  stdlib                  12430
+  external                 9445
+
+Architecture
+  Pattern:             (none detected)
+  cyclic dependencies        26
+  layer violations            0
+
+Impact analysis (hotspots)
+  coupled modules           840
+    high criticality        486
+    medium criticality      354
+  Top hotspots (by coupling):
+    module                            fan-in  fan-out crit     blast radius
+    airflow-core/src/airflow/models     1396      315 high     56732
+    devel-common/src/tests_common/t…    1450       85 high     35780
+    providers/common/compat/src/air…    1214        1 high     51068
+    airflow-core/src/airflow/utils      1029       69 high     62870
+    airflow-core/src/airflow             871       39 high     67265
+    providers/common/compat/tests/u…     690        0 high     61945
+    providers/google/src/airflow/pr…     323      284 high     14305
+    providers/amazon/tests/system/a…       1      510 high     177
+
+Code health
+  god classes (high fan-in)    298
+    airflow-core/src/airflow/ui/openapi-gen/req… 153 dependents
+    airflow-ctl/tests/airflow_ctl/api/test_oper… 79 dependents
+    providers/cncf/kubernetes/tests/unit/cncf/k… 71 dependents
+    airflow-core/tests/unit/ti_deps/deps/test_t… 49 dependents
+    providers/hashicorp/tests/unit/hashicorp/ho… 45 dependents
+  call-graph hotspots       133
+    airflow-core/src/airflow/ui/openapi-gen/req… fan-in 153 / out 12
+    providers/cncf/kubernetes/tests/unit/cncf/k… fan-in 71 / out 6
+    providers/openlineage/tests/unit/openlineag… fan-in 3 / out 21
+    providers/edge3/src/airflow/providers/edge3… fan-in 3 / out 3
+    providers/google/src/airflow/providers/goog… fan-in 10 / out 18
+  deep dependency chains     10
+    airflow-core/tests/unit/api_fastapi/core_ap… depth 57
+    airflow-core/tests/unit/api_fastapi/core_ap… depth 56
+    airflow-core/tests/unit/assets               depth 56
+    airflow-core/tests/unit/jobs                 depth 56
+    providers/fab/tests/unit/fab/plugins         depth 56
+  large public surfaces      20
+    airflow-core/src/airflow/ui/openapi-gen/req… 911/911 (100%)
+    airflow-core/src/airflow/ui/openapi-gen/que… 864/864 (100%)
+    task-sdk/src/airflow/sdk/execution_time/com… 119/129 (92%)
+    providers/edge3/src/airflow/providers/edge3… 3/3 (100%)
+    task-sdk/src/airflow/sdk/definitions/mapped… 100/111 (90%)
+  complexity outliers        15
+    airflow-core/src/airflow/jobs/scheduler_job… complexity 69
+    task-sdk/src/airflow/sdk/execution_time/sup… complexity 61
+    airflow-core/src/airflow/ui/src/pages/DagsL… complexity 54
+    airflow-core/src/airflow/ui/src/hooks.useDa… complexity 53
+    dev/breeze/src/airflow_breeze/commands/ci_c… complexity 52
+```
 
 No artifacts are written; `.enola/` is not touched. For a persistent snapshot with agent-readable output, use `--generate` or the MCP server.
 
