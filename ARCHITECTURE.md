@@ -148,6 +148,13 @@ Explainers turn raw facts into architectural observations. Each insight carries 
 - **Cycles** ([`internal/explainers/cycles`](internal/explainers/cycles/cycles.go)) — finds cyclic module dependencies using **Tarjan's strongly-connected-components algorithm**. A cycle either exists in the import graph or it doesn't, so these land at confidence `1.0`, with every module in the cycle listed as evidence.
 - **Layers** ([`internal/explainers/layers`](internal/explainers/layers/layers.go)) — recognizes common architectural shapes by matching module paths against known patterns: **hexagonal** (application / port / adapter / domain / …), **Next.js** (pages / components / hooks / lib / api / …), and **Go-standard** (cmd / internal / pkg / api). Confidence is computed from how much of the codebase matches. It also flags **layer violations** — an inner layer importing an outer one — as lower-confidence heuristic warnings.
 - **Cross-repo** ([`internal/explainers/crossrepo`](internal/explainers/crossrepo/crossrepo.go)) — summarizes the cross-repo edges found by the linker. Returns nothing for a single-repo snapshot.
+- **God-class** ([`internal/explainers/godclass`](internal/explainers/godclass/godclass.go)) — flags symbols with an outlier **fan-in** (depended upon by far more symbols than average), computed from the graph's reverse adjacency list. High fan-in concentrates change risk.
+- **Hotspots** ([`internal/explainers/hotspots`](internal/explainers/hotspots/hotspots.go)) — flags call-graph **pinch points** (symbols with both high fan-in and high fan-out, scored `fanIn × fanOut`). A cheap degree-centrality proxy for betweenness — chokepoints most call chains pass through.
+- **Dependency-depth** ([`internal/explainers/depth`](internal/explainers/depth/depth.go)) — flags modules whose **longest transitive import chain** is unusually long (cycle-safe longest-path over the module graph). Deep modules are slow to grasp and widen rebuild/retest impact.
+- **Exported-surface** ([`internal/explainers/surface`](internal/explainers/surface/surface.go)) — flags **large public surfaces**: sizeable modules that export almost all their symbols, so they encapsulate little. Because "public is the default" in Go and Ruby (so a raw ratio test floods), it skips mock/test/generated packages, requires a meaningful size and a near-total export ratio, and reports only the **top N worst offenders** (largest public surface first) rather than every match — a digestible shortlist for a visibility review, not a list of definite defects.
+- **Complexity-outliers** ([`internal/explainers/complexity`](internal/explainers/complexity/complexity.go)) — flags functions/methods whose **cyclomatic complexity** is a statistical outlier, using the language-agnostic `cyclomatic` prop every extractor records.
+
+The shared module-graph construction and statistical-outlier helpers used by several of these live in [`internal/explainers/common`](internal/explainers/common/common.go).
 
 ---
 
@@ -157,7 +164,7 @@ Explainers turn raw facts into architectural observations. Each insight carries 
 
 ### `Report` and `Compute()`
 
-`Compute(eng *bootstrap.Engine) *Report` reads the engine's current fact store and snapshot — it does not generate a snapshot; callers do that first. The fields it populates map directly to the seven output sections:
+`Compute(eng *bootstrap.Engine) *Report` reads the engine's current fact store and snapshot — it does not generate a snapshot; callers do that first. The fields it populates map directly to the eight output sections:
 
 | Report field(s) | Output section |
 |---|---|
@@ -168,8 +175,11 @@ Explainers turn raw facts into architectural observations. Each insight carries 
 | `DepSources` | Dependencies |
 | `Architecture`, `ArchConfidence`, `Cycles`, `LayerViolations`, `CrossRepoEdges` | Architecture |
 | `Modules`, `HighCriticality`, `MediumCriticality`, `Hotspots`, `CouplingUnresolved` | Impact analysis (hotspots) |
+| `CodeHealth` | Code health |
 
 `CouplingUnresolved` is a special flag: it is set when dependency facts exist but no import edge resolved to a module, meaning coupling analysis is unavailable rather than genuinely zero. The renderer surfaces this as an explanatory note instead of implying the codebase has no coupling.
+
+`CodeHealth` is a slice of `FindingGroup` (label + count + top offenders), one per symbol/module-level explainer (god-class, hotspots, dependency-depth, exported-surface, complexity-outliers). `Compute` builds it by parsing those explainers' insight titles — the title formats are the contract, noted at each explainer's `Title:` site. Groups with a zero count are omitted, so the section disappears for snapshots without symbols (e.g. OpenAPI-only). Because enola-enterprise renders this same base `Report`, the Code health section appears in the enterprise `--explain` too, before its license-gated sections.
 
 ### Extensibility via `ExtraSections`
 
@@ -342,6 +352,11 @@ explainers:
   - cycles
   - layers
   - crossrepo
+  - god-class
+  - hotspots
+  - dependency-depth
+  - exported-surface
+  - complexity-outliers
 renderers:
   - llm_context
 output:
@@ -356,7 +371,7 @@ The bundled [`mcp-arch.yaml`](mcp-arch.yaml) ships a much fuller `ignore` list (
 | `repo` | Repository root path | `"."` |
 | `ignore` | Glob patterns for files/dirs to skip | vendor, node_modules, .git, tests, build dirs, docs, config data, … |
 | `extractors` | Enabled extractors | `["cpp", "go", "java", "kotlin", "openapi", "python", "typescript", "swift", "ruby"]` |
-| `explainers` | Enabled explainers | `["cycles", "layers", "crossrepo"]` |
+| `explainers` | Enabled explainers | `["cycles", "layers", "crossrepo", "god-class", "hotspots", "dependency-depth", "exported-surface", "complexity-outliers"]` |
 | `renderers` | Enabled renderers | `["llm_context"]` |
 | `output.dir` | Output directory for artifacts | `".enola"` |
 | `output.max_context_tokens` | Token budget for `llm_context.md` | `16000` |
