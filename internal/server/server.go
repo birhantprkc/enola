@@ -39,7 +39,9 @@ func New(eng *engine.Engine, cfg *config.Config) (*Server, error) {
 	mcpServer := mcp.NewServer(&mcp.Implementation{
 		Name:    "enola",
 		Version: Version,
-	}, nil)
+	}, &mcp.ServerOptions{
+		Instructions: "Use this server to explore a repository's architecture as queryable facts. Run generate_snapshot first to index a codebase, then use explore, query_facts, show_symbol, traverse, find_path, and impact_analysis to understand code structure, dependencies, and change impact. Supports Go, TypeScript, Kotlin, Ruby, Python, Swift, Java, C++, and OpenAPI.",
+	})
 
 	s.mcp = mcpServer
 	s.registerTools()
@@ -185,7 +187,7 @@ func (s *Server) registerTools() {
 	mcp.AddTool(s.mcp, &mcp.Tool{
 		Name: "generate_snapshot",
 		Description: "Index a repository and extract its architecture as queryable facts. " +
-			"Supports Go, TypeScript, Kotlin, Ruby, Python, Swift, and OpenAPI. " +
+			"Supports Go, TypeScript, Kotlin, Ruby, Python, Swift, Java, C++, and OpenAPI. " +
 			"Produces facts of kind: module, symbol, route, storage, dependency, service. " +
 			"Run this first before any other tool. Re-run after code changes. " +
 			"In multi-repo mode, call with append=true for each additional repo after the first; " +
