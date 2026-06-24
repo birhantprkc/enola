@@ -89,3 +89,4 @@ renderers:
 output:
   dir: ".enola"
   max_context_tokens: 4000
+# incremental: true   # reuse each extractor's cached facts when its files are unchanged (default: true)

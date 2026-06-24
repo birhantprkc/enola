@@ -99,17 +99,35 @@ export PATH="$HOME/.local/bin:$PATH"
 
 Binaries are published for Linux, macOS (amd64/arm64), and Windows (amd64). You can also download a specific build from the [Releases page](https://github.com/enola-labs/enola/releases), or [build from source](#build-from-source).
 
+### Configuration (optional)
+
+**enola needs no config file.** Every setting has a built-in default, so out of the box it indexes the current repo with all extractors enabled and writes to `.enola/`. A config file (`mcp-arch.yaml`) only *overrides* those defaults — it never adds capability you'd otherwise lack. When enola can't find one it simply prints `warning: …, using defaults` and carries on.
+
+The install script installs **only the binary**, by design — it does not place a config file. Grab the bundled one from the repo whenever you want to customize (tune the `ignore` globs, pick a subset of extractors, change the output dir, …):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/enola-labs/enola/main/mcp-arch.yaml -o mcp-arch.yaml
+```
+
+The [`examples/`](examples/) directory has ready-made per-language and multi-repo starting points, and [`examples/full.yaml`](examples/full.yaml) documents every option. For the full field reference and defaults, see **[ARCHITECTURE.md → Configuration](ARCHITECTURE.md#configuration)**.
+
 ### Connect it to your agent
 
 **Claude Code** — register enola as an MCP server with one command. This assumes the `enola` binary is on your `PATH` (the install script above puts it in `~/.local/bin`):
 
 ```bash
+claude mcp add enola enola
+```
+
+The shape is `claude mcp add <name> <command> [args…]`: the first `enola` names the server, the second is the binary. The trailing config path is **optional** — omit it (as above) to run on built-in defaults, or pass one to override them:
+
+```bash
 claude mcp add enola enola /path/to/enola/mcp-arch.yaml
 ```
 
-The shape is `claude mcp add <name> <command> [args…]`: the first `enola` names the server, the second is the binary, and the trailing path is the config it reads. That config's `repo:` is only the *default* repository — you can still snapshot any repo by passing `repo_path` to `generate_snapshot`. Verify it registered with `claude mcp list`, then start Claude Code and ask it to generate a snapshot.
+When you do pass a config, its `repo:` is only the *default* repository — you can still snapshot any repo by passing `repo_path` to `generate_snapshot`. Verify it registered with `claude mcp list`, then start Claude Code and ask it to generate a snapshot.
 
-**Cursor / other MCP clients** — add enola to your client's MCP configuration. For example, in Cursor's `mcp.json`:
+**Cursor / other MCP clients** — add enola to your client's MCP configuration. For example, in Cursor's `mcp.json` (the config path in `args` is optional — drop it to use defaults):
 
 ```json
 {
@@ -182,10 +200,10 @@ go build -o enola ./cmd/enola   # or: go install ./cmd/enola
 To run a one-shot snapshot without starting the MCP server:
 
 ```bash
-enola --generate [config_path]   # config_path defaults to mcp-arch.yaml
+enola --generate [config_path]   # config_path is optional; defaults to mcp-arch.yaml, falling back to built-in defaults if absent
 ```
 
-Artifacts are written to the configured `output.dir` (default `.enola/`). Configuration is documented in **[ARCHITECTURE.md → Configuration](ARCHITECTURE.md#configuration)**.
+Artifacts are written to the configured `output.dir` (default `.enola/`). The config file is optional — see **[ARCHITECTURE.md → Configuration](ARCHITECTURE.md#configuration)** for the full field reference and defaults.
 
 ---
 

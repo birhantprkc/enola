@@ -323,7 +323,7 @@ Because they're ordinary graph nodes and edges, the traversal tools become cross
 
 ## Configuration
 
-Create an `mcp-arch.yaml` (or pass a custom path as the first CLI argument):
+The config file is **optional**. Every field has a built-in default (see `config.Default()` in [`internal/config/config.go`](internal/config/config.go)), so with no `mcp-arch.yaml` enola runs entirely on those defaults — the file only *overrides* the keys you set. Create one (or pass a custom path as the first CLI argument) when you want to depart from the defaults below:
 
 ```yaml
 repo: "."
@@ -340,6 +340,7 @@ ignore:
   - "**/*.md"
   - "**/*.yaml"
 extractors:
+  - cpp
   - go
   - java
   - kotlin
@@ -375,6 +376,7 @@ The bundled [`mcp-arch.yaml`](mcp-arch.yaml) ships a much fuller `ignore` list (
 | `renderers` | Enabled renderers | `["llm_context"]` |
 | `output.dir` | Output directory for artifacts | `".enola"` |
 | `output.max_context_tokens` | Token budget for `llm_context.md` | `16000` |
+| `incremental` | Reuse each extractor's cached facts across snapshots when its files are unchanged; set `false` to force full re-extraction every run | `true` |
 
 ---
 
