@@ -6,6 +6,41 @@ enola is a local [Model Context Protocol (MCP)](https://modelcontextprotocol.io/
 
 ---
 
+## TL;DR — try it in 30 seconds
+
+**1. Install**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/enola-labs/enola/main/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"   # if not already on PATH
+```
+
+**2. Connect to your agent**
+
+Claude Code:
+```bash
+claude mcp add enola enola
+```
+
+Cursor (add to `mcp.json`):
+```json
+{
+  "mcpServers": {
+    "enola": { "command": "enola" }
+  }
+}
+```
+
+**3. Ask it to map your project**
+
+> "Generate an architectural snapshot of /path/to/my/project"
+
+Done. Your agent now has a precise structural map of your code. For configuration options, multi-repo setup, and what to ask next, see [Quick start](#quick-start) below.
+
+**Supported languages:** Go · TypeScript · Python · Java · Kotlin · Swift · Ruby · C++ · Vue · OpenAPI — with framework awareness (Next.js, FastAPI, Django, Spring, Rails, SwiftUI, Jetpack Compose, …)
+
+---
+
 ## Why enola
 
 AI coding agents are powerful, but they're non-deterministic. On every task they re-discover your codebase from scratch — grepping, opening files, inferring how things fit together — and they get it subtly wrong often enough to matter. That guessing costs you **time** (wrong turns, re-prompts) and **tokens** (re-reading the same files, every session).
