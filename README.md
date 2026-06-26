@@ -77,7 +77,7 @@ For the full mental model and internals, see **[ARCHITECTURE.md](ARCHITECTURE.md
 ## Who it's for
 
 - **Anyone pairing with an AI coding agent** — Claude Code, Cursor, Copilot, Opencode, or any MCP-compatible tool.
-- **Teams working across multiple repos** — a backend, a web frontend, a mobile app. enola links them into one cross-repo graph so an agent can follow a call from the web client all the way into the service that answers it.
+- **Teams working across multiple repos** — a backend, a web frontend, a mobile app. enola links them into one cross-repo graph so an agent can follow a call from the web client all the way into the service that answers it. And because that's a real graph rather than a fixed set of features, questions you'd otherwise reach for a dedicated tool to answer become plain queries over it — *which of the backend's endpoints does no client app call?* among them, a cleanup shortlist derived from the same client→server links (verify against callers outside the snapshot — cron jobs, webhooks, third-party consumers — before deleting).
 - **Anyone about to refactor** — and wanting to know the blast radius *before* touching code.
 
 ---
@@ -198,6 +198,8 @@ Working across several repos? Generate the first, then add the rest with append 
 > "Generate a snapshot of /path/to/go-service with append mode"
 
 > "If I change the auth service, which other services are impacted?"
+
+> "Which of my backend's endpoints aren't called by any of the client apps? (Cleanup candidates — but check for callers outside these repos first.)"
 
 **Regenerate after major changes** so the snapshot stays current. Refreshes are fast: enola caches each language's facts and re-parses a language only when one of its files (or a shared config like `package.json`) actually changed, reusing the rest.
 
