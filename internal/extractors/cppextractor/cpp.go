@@ -98,10 +98,11 @@ func (e *CppExtractor) Extract(ctx context.Context, repoPath string, files []str
 	hdrLang := buildHeaderLangIndex(files)
 
 	modules := make(map[string]bool)
-	dirLang := make(map[string]string)     // dir -> module language ("c"/"cpp")
-	typeIndex := make(map[string]string)   // simple type name -> dir
-	headerIndex := make(map[string]string) // header/source basename -> dir
-	funcNames := make(map[string]bool)     // short names of all functions/methods
+	dirLang := make(map[string]string)              // dir -> module language ("c"/"cpp")
+	typeIndex := make(map[string]string)            // simple type name -> dir
+	headerIndex := make(map[string]string)          // header/source basename -> dir
+	funcNames := make(map[string]bool)              // short names of all functions/methods
+	moduleRefs := make(map[string][]facts.Relation) // dir -> file-scope macro-call refs
 
 	// Pass 1: AST extraction (parallel) + indices (rebuilt in file order).
 	var cppFiles []string
@@ -110,6 +111,26 @@ func (e *CppExtractor) Extract(ctx context.Context, repoPath string, files []str
 		if lang := parsedLanguage(relFile, hdrLang); lang != "" {
 			cppFiles = append(cppFiles, relFile)
 			langByFile[relFile] = lang
+		}
+	}
+
+	// Pre-pass: build a project-wide #define table (parallel scan), so a file-scope
+	// macro invocation (CONFIGFS_ATTR, DEVICE_ATTR_RO, …) can be expanded using the
+	// definition that lives in a header, recovering the token-pasted callbacks it
+	// references. Merged in file order for deterministic last-write-wins.
+	perFileMacros := parallel.MapFiles(ctx, cppFiles, func(relFile string) macroTable {
+		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
+		if err != nil {
+			return nil
+		}
+		t := macroTable{}
+		collectMacros(src, t)
+		return t
+	})
+	macros := macroTable{}
+	for _, t := range perFileMacros {
+		for name, def := range t {
+			macros[name] = def
 		}
 	}
 
@@ -122,14 +143,24 @@ func (e *CppExtractor) Extract(ctx context.Context, repoPath string, files []str
 			log.Printf("[cpp-extractor] error reading %s: %v", relFile, err)
 			return nil
 		}
-		return extractFileAST(src, relFile, langByFile[relFile])
+		return extractFileAST(src, relFile, langByFile[relFile], macros)
 	})
 
 	for i, fileFacts := range perFileFacts {
 		relFile := cppFiles[i]
-		allFacts = append(allFacts, fileFacts...)
-
 		dir := filepath.Dir(relFile)
+
+		for _, f := range fileFacts {
+			// The walker emits a KindModule fact only to host file-scope macro-call
+			// references; fold those into the per-dir set and emit one canonical
+			// module fact per directory below.
+			if f.Kind == facts.KindModule {
+				moduleRefs[dir] = append(moduleRefs[dir], f.Relations...)
+				continue
+			}
+			allFacts = append(allFacts, f)
+		}
+
 		modules[dir] = true
 		headerIndex[filepath.Base(relFile)] = dir
 		// A directory mixing C and C++ sources is treated as a C++ module; a
@@ -159,9 +190,27 @@ func (e *CppExtractor) Extract(ctx context.Context, repoPath string, files []str
 		}
 	}
 
-	// Resolve provisional func-pointer references (initializer values and call
-	// arguments): keep only those that name a real function, rewriting them to
-	// call edges; drop the rest so ordinary data identifiers create no edge.
+	// Emit module facts per directory, before func-pointer resolution so the
+	// file-scope registration-macro references collected on them (module_init(foo),
+	// EXPORT_SYMBOL(foo)) resolve and canonicalise alongside ordinary edges.
+	for dir := range modules {
+		lang := dirLang[dir]
+		if lang == "" {
+			lang = langC
+		}
+		allFacts = append(allFacts, facts.Fact{
+			Kind:      facts.KindModule,
+			Name:      dir,
+			File:      dir,
+			Props:     map[string]any{"language": lang},
+			Relations: moduleRefs[dir],
+		})
+	}
+
+	// Resolve provisional func-pointer references (initializer values, call
+	// arguments, and file-scope macro-call arguments): keep only those that name a
+	// real function, rewriting them to call edges; drop the rest so ordinary data
+	// identifiers create no edge.
 	resolveFuncPtrRefs(allFacts, funcNames)
 
 	// Merge header method declarations with source definitions.
@@ -172,22 +221,6 @@ func (e *CppExtractor) Extract(ctx context.Context, repoPath string, files []str
 
 	// Resolve quoted #include targets to module dirs.
 	resolveIncludeDependencies(allFacts, headerIndex)
-
-	// Emit module facts per directory.
-	for dir := range modules {
-		lang := dirLang[dir]
-		if lang == "" {
-			lang = langC
-		}
-		allFacts = append(allFacts, facts.Fact{
-			Kind: facts.KindModule,
-			Name: dir,
-			File: dir,
-			Props: map[string]any{
-				"language": lang,
-			},
-		})
-	}
 
 	return allFacts, nil
 }

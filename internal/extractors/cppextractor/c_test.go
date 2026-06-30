@@ -223,6 +223,388 @@ static int setup(void) { return request_irq(1, &handler, 0); }
 	}
 }
 
+// TestCRegistrationMacro covers the dominant kernel false-positive source: a
+// function registered only through a file-scope macro invocation (module_init,
+// *_initcall, EXPORT_SYMBOL, *_driver). Macros are not expanded, so the
+// function-name argument must instead surface as a call edge on the module fact,
+// otherwise the entry point is mis-reported as dead.
+func TestCRegistrationMacro(t *testing.T) {
+	ff := extractProject(t, map[string]string{
+		"src/mem.c": `
+static int chr_dev_init(void) { return 0; }
+static int read_mem(void) { return 0; }
+fs_initcall(chr_dev_init);
+EXPORT_SYMBOL(read_mem);
+`,
+	})
+	mod := mustFact(t, ff, "src") // the directory's module fact
+	if mod.Kind != facts.KindModule {
+		t.Fatalf("expected module fact for dir src, got kind %q", mod.Kind)
+	}
+	if !hasRelation(mod, facts.RelCalls, "src.chr_dev_init") {
+		t.Errorf("module should reference chr_dev_init via fs_initcall, got %+v", mod.Relations)
+	}
+	if !hasRelation(mod, facts.RelCalls, "src.read_mem") {
+		t.Errorf("module should reference read_mem via EXPORT_SYMBOL, got %+v", mod.Relations)
+	}
+	// The macro name itself must not be emitted as a junk function symbol.
+	if _, ok := findFact(ff, "src.fs_initcall"); ok {
+		t.Errorf("macro name fs_initcall must not become a function symbol")
+	}
+	if _, ok := findFact(ff, "src.EXPORT_SYMBOL"); ok {
+		t.Errorf("macro name EXPORT_SYMBOL must not become a function symbol")
+	}
+}
+
+// TestCRegistrationMacroMultiArg covers DEVICE_ATTR-style macros that mix
+// non-function args (a name, a mode literal) with function-name args (show/store):
+// only the real functions become edges.
+func TestCRegistrationMacroMultiArg(t *testing.T) {
+	ff := extractProject(t, map[string]string{
+		"src/attr.c": `
+static int show_fn(void) { return 0; }
+static int store_fn(void) { return 0; }
+DEVICE_ATTR(name, 0644, show_fn, store_fn);
+`,
+	})
+	mod := mustFact(t, ff, "src")
+	if !hasRelation(mod, facts.RelCalls, "src.show_fn") || !hasRelation(mod, facts.RelCalls, "src.store_fn") {
+		t.Errorf("module should reference show_fn and store_fn, got %+v", mod.Relations)
+	}
+	if hasRelation(mod, facts.RelCalls, "src.name") {
+		t.Errorf("non-function arg `name` must not become a call edge, got %+v", mod.Relations)
+	}
+}
+
+// TestCFileScopeMacroNoFalseModuleEdges guards the funcNames filter at module
+// scope: a macro argument that does not name a real function adds no edge, and a
+// file with no registration macros gets no spurious module call edges.
+func TestCFileScopeMacroNoFalseModuleEdges(t *testing.T) {
+	ff := extractProject(t, map[string]string{
+		"src/p.c": `
+static int real(void) { return 0; }
+SOME_MACRO(not_a_function);
+module_init(real);
+`,
+	})
+	mod := mustFact(t, ff, "src")
+	if !hasRelation(mod, facts.RelCalls, "src.real") {
+		t.Errorf("module should reference real via module_init, got %+v", mod.Relations)
+	}
+	if hasRelation(mod, facts.RelCalls, "src.not_a_function") {
+		t.Errorf("non-function macro arg must not become a module call edge, got %+v", mod.Relations)
+	}
+}
+
+// TestCFuncPtrFieldAssignment is the dominant kernel false-positive source:
+// callbacks wired into a struct field at runtime inside a probe/init function
+// (gpio_chip/irq_chip/pmu_ops). The assigned function must get an inbound edge
+// from the enclosing function so it is not reported as dead.
+func TestCFuncPtrFieldAssignment(t *testing.T) {
+	ff := extractProject(t, map[string]string{
+		"src/gpio.c": `
+static int xlp_gpio_set(void) { return 0; }
+static int xlp_gpio_get(void) { return 0; }
+static int mvebu_mask(void) { return 0; }
+static int probe(struct gpio_chip *gc) {
+	gc->set = xlp_gpio_set;
+	gc->get = &xlp_gpio_get;
+	ct->chip.irq_mask = mvebu_mask;
+	gc->ngpio = 32;
+	return 0;
+}
+`,
+	})
+	p := mustFact(t, ff, "src.probe")
+	for _, fn := range []string{"src.xlp_gpio_set", "src.xlp_gpio_get", "src.mvebu_mask"} {
+		if !hasRelation(p, facts.RelCalls, fn) {
+			t.Errorf("probe should reference %s via field assignment, got %+v", fn, p.Relations)
+		}
+	}
+	// A plain data assignment (gc->ngpio = 32) must not invent an edge, and `ngpio`
+	// is not a function anyway.
+	if hasRelation(p, facts.RelCalls, "src.ngpio") {
+		t.Errorf("data assignment must not produce a call edge, got %+v", p.Relations)
+	}
+}
+
+// TestCStaticRegistrationMacro covers a registration macro that a leading
+// `static` qualifier turns into a declaration (parsed as a macro_type_specifier),
+// e.g. DEFINE_SIMPLE_DEV_PM_OPS. The function-name args (suspend/resume) must be
+// recorded as uses; the ops-table name (not a function) must not.
+func TestCStaticRegistrationMacro(t *testing.T) {
+	ff := extractProject(t, map[string]string{
+		"src/pm.c": `
+static int davinci_suspend(void) { return 0; }
+static int davinci_resume(void) { return 0; }
+static DEFINE_SIMPLE_DEV_PM_OPS(davinci_pm_ops, davinci_suspend, davinci_resume);
+`,
+	})
+	mod := mustFact(t, ff, "src")
+	if !hasRelation(mod, facts.RelCalls, "src.davinci_suspend") || !hasRelation(mod, facts.RelCalls, "src.davinci_resume") {
+		t.Errorf("module should reference suspend+resume via DEFINE_SIMPLE_DEV_PM_OPS, got %+v", mod.Relations)
+	}
+	if hasRelation(mod, facts.RelCalls, "src.davinci_pm_ops") {
+		t.Errorf("the ops-table name (not a function) must not become a call edge, got %+v", mod.Relations)
+	}
+}
+
+// TestCFuncPtrAssignmentNonFunctionDropped: assigning a non-function global to a
+// field must not create an edge (funcNames filter), even though it is syntactically
+// identical to a callback assignment.
+func TestCFuncPtrAssignmentNonFunctionDropped(t *testing.T) {
+	ff := extractProject(t, map[string]string{
+		"src/a.c": `
+static int real_cb(void) { return 0; }
+static int probe(void) {
+	obj->cb = real_cb;
+	obj->data = some_global;
+	return 0;
+}
+`,
+	})
+	p := mustFact(t, ff, "src.probe")
+	if !hasRelation(p, facts.RelCalls, "src.real_cb") {
+		t.Errorf("probe should reference real_cb, got %+v", p.Relations)
+	}
+	if hasRelation(p, facts.RelCalls, "src.some_global") {
+		t.Errorf("non-function assignment value some_global must not become an edge, got %+v", p.Relations)
+	}
+}
+
+// TestCCompoundLiteralAssignment covers callbacks wired via an in-body compound
+// literal — `cfg = (struct regmap_config){ .lock = fn };` — which is how some
+// drivers (e.g. gpio-104-dio-48e regmap config) set up ops at runtime. The
+// pointed-to functions must get an edge from the enclosing function.
+func TestCCompoundLiteralAssignment(t *testing.T) {
+	ff := extractProject(t, map[string]string{
+		"src/r.c": `
+static int dio48e_regmap_lock(void) { return 0; }
+static int dio48e_regmap_unlock(void) { return 0; }
+static int probe(void) {
+	cfg = (struct regmap_config) {
+		.reg_bits = 8,
+		.lock = dio48e_regmap_lock,
+		.unlock = dio48e_regmap_unlock,
+	};
+	return 0;
+}
+`,
+	})
+	p := mustFact(t, ff, "src.probe")
+	if !hasRelation(p, facts.RelCalls, "src.dio48e_regmap_lock") || !hasRelation(p, facts.RelCalls, "src.dio48e_regmap_unlock") {
+		t.Errorf("probe should reference the regmap lock/unlock callbacks, got %+v", p.Relations)
+	}
+	if hasRelation(p, facts.RelCalls, "src.reg_bits") {
+		t.Errorf("a non-function initializer field must not become an edge, got %+v", p.Relations)
+	}
+}
+
+// TestCMacroBodyCall covers the header-inline case: a function invoked only inside
+// a #define replacement list (e.g. an arch size-dispatched cmpxchg helper) is
+// invisible to the AST, so we scan the macro body for call-position identifiers.
+// The reference lands on the module fact.
+func TestCMacroBodyCall(t *testing.T) {
+	ff := extractProject(t, map[string]string{
+		"src/cmpxchg.c": `
+static int ____cmpxchg_u16(void) { return 0; }
+static int ____cmpxchg_u32(void) { return 0; }
+static int helper(void) { return 0; }
+#define DISPATCH(x) helper(x)
+#define CMPX(p, size) (size == 2 ? ____cmpxchg_u16(p) : ____cmpxchg_u32(p))
+#define CONST_ONLY 42
+`,
+	})
+	mod := mustFact(t, ff, "src")
+	for _, fn := range []string{"src.helper", "src.____cmpxchg_u16", "src.____cmpxchg_u32"} {
+		if !hasRelation(mod, facts.RelCalls, fn) {
+			t.Errorf("module should reference %s via macro body, got %+v", fn, mod.Relations)
+		}
+	}
+}
+
+// TestCMacroBodyValuePosition covers an ops table defined inside a #define body via
+// designated initializers (kernel F7188X_GPIO_BANK style): the function pointers in
+// `.field = fn` / `= &fn` value position must be recorded, while comparisons and
+// field names must not.
+func TestCMacroBodyValuePosition(t *testing.T) {
+	ff := extractProject(t, map[string]string{
+		"src/bank.c": `
+static int bank_set(void) { return 0; }
+static int bank_get(void) { return 0; }
+static int bank_irq(void) { return 0; }
+#define GPIO_BANK(_n) {            \
+		.label = _n,      \
+		.set   = bank_set,        \
+		.get   = bank_get,        \
+		.to_irq = &bank_irq,      \
+	}
+#define IS_TWO(x) ((x) == bank_set)
+`,
+	})
+	mod := mustFact(t, ff, "src")
+	for _, fn := range []string{"src.bank_set", "src.bank_get", "src.bank_irq"} {
+		if !hasRelation(mod, facts.RelCalls, fn) {
+			t.Errorf("module should reference %s via macro-body designated init, got %+v", fn, mod.Relations)
+		}
+	}
+}
+
+// TestCMacroBodyNoFalseEdges: a macro body with only constants / UPPER_SNAKE names
+// must not produce edges.
+func TestCMacroBodyNoFalseEdges(t *testing.T) {
+	ff := extractProject(t, map[string]string{
+		"src/m.c": `
+static int real(void) { return 0; }
+#define SIZE 4096
+#define FLAGS (GFP_KERNEL | __GFP_ZERO)
+#define WRAP(x) real(x)
+`,
+	})
+	mod := mustFact(t, ff, "src")
+	if !hasRelation(mod, facts.RelCalls, "src.real") {
+		t.Errorf("module should reference real via WRAP macro, got %+v", mod.Relations)
+	}
+	for _, bad := range []string{"src.SIZE", "src.FLAGS", "src.GFP_KERNEL"} {
+		if hasRelation(mod, facts.RelCalls, bad) {
+			t.Errorf("constant/macro %s must not become a call edge, got %+v", bad, mod.Relations)
+		}
+	}
+}
+
+// TestCMacroExpansionTokenPaste is the end-to-end token-paste rescue: a configfs-
+// style attribute macro defined in one file and invoked in another must have its
+// preprocessor-synthesized .show/.store callbacks recorded as used, so they are
+// not reported as dead. Exercises the project-wide #define pre-pass + expansion.
+func TestCMacroExpansionTokenPaste(t *testing.T) {
+	ff := extractProject(t, map[string]string{
+		"inc/attr.h": `
+#define ATTR_PERM(_pfx, _name, _perm) static struct configfs_attribute _pfx##attr_##_name = { .ca_name = __stringify(_name), .ca_mode = _perm, .show = _pfx##_name##_show, .store = _pfx##_name##_store, }
+#define ATTR(_pfx, _name) ATTR_PERM(_pfx, _name, 0644)
+`,
+		"src/d.c": `
+static int cfg_label_show(void) { return 0; }
+static int cfg_label_store(void) { return 0; }
+ATTR(cfg_, label);
+`,
+	})
+	mod := mustFact(t, ff, "src")
+	if !hasRelation(mod, facts.RelCalls, "src.cfg_label_show") || !hasRelation(mod, facts.RelCalls, "src.cfg_label_store") {
+		t.Errorf("macro expansion should reference cfg_label_show/store, got %+v", mod.Relations)
+	}
+}
+
+// TestCMacroExpansionRO covers the single-callback DEVICE_ATTR_RO shape and the
+// funcNames guard: the pasted struct-variable name must not become an edge.
+func TestCMacroExpansionRO(t *testing.T) {
+	ff := extractProject(t, map[string]string{
+		"src/s.c": `
+static int temp_show(void) { return 0; }
+#define DEV_ATTR_RO(_name) static struct da dev_attr_##_name = { .show = _name##_show }
+DEV_ATTR_RO(temp);
+`,
+	})
+	mod := mustFact(t, ff, "src")
+	if !hasRelation(mod, facts.RelCalls, "src.temp_show") {
+		t.Errorf("DEV_ATTR_RO should reference temp_show, got %+v", mod.Relations)
+	}
+	if hasRelation(mod, facts.RelCalls, "src.dev_attr_temp") {
+		t.Errorf("pasted struct name dev_attr_temp must not be a call edge, got %+v", mod.Relations)
+	}
+}
+
+// TestCStaticSingleArgAttr covers the `static DEVICE_ATTR_RO(name);` single-arg
+// form (parses as a plain declaration, not a macro_type_specifier): the pasted
+// _show/_store callbacks must still be recovered via expansion.
+func TestCStaticSingleArgAttr(t *testing.T) {
+	ff := extractProject(t, map[string]string{
+		"inc/sysfs.h": `
+#define __ATTR_RO(_name) { .attr = { .name = #_name }, .show = _name##_show }
+#define DEVICE_ATTR_RO(_name) static struct device_attribute dev_attr_##_name = __ATTR_RO(_name)
+`,
+		"src/d.c": `
+static int cfam_id_show(void) { return 0; }
+static DEVICE_ATTR_RO(cfam_id);
+`,
+	})
+	mod := mustFact(t, ff, "src")
+	if !hasRelation(mod, facts.RelCalls, "src.cfam_id_show") {
+		t.Errorf("static DEVICE_ATTR_RO(cfam_id) should reference cfam_id_show, got %+v", mod.Relations)
+	}
+}
+
+// TestCDefineShowAttribute covers a function-defining macro whose referenced
+// callback is passed as a CALL ARGUMENT (single_open(file, name_show, ...)); the
+// all-identifier scan of the expansion must capture it.
+func TestCDefineShowAttribute(t *testing.T) {
+	ff := extractProject(t, map[string]string{
+		"src/dbg.c": `
+static int component_list_show(void) { return 0; }
+#define DEFINE_SHOW_ATTRIBUTE(__name) \
+static int __name##_open(void) { return single_open(__name##_show); } \
+static const struct file_operations __name##_fops = { .open = __name##_open }
+DEFINE_SHOW_ATTRIBUTE(component_list);
+`,
+	})
+	mod := mustFact(t, ff, "src")
+	if !hasRelation(mod, facts.RelCalls, "src.component_list_show") {
+		t.Errorf("DEFINE_SHOW_ATTRIBUTE should reference component_list_show (call arg), got %+v", mod.Relations)
+	}
+}
+
+// TestCCapitalizedStaticInlineCall: a real ALL-CAPS/Camel `static inline` function
+// called normally in C must be tracked (not mis-routed as a type instantiation and
+// dropped). A capitalized value-macro that is not a function must add no edge.
+func TestCCapitalizedStaticInlineCall(t *testing.T) {
+	ff := extractProject(t, map[string]string{
+		"src/n.c": `
+static inline int NE_PTR(int x) { return x; }
+static int use(void) { return NE_PTR(3) + ARRAY_SIZE(buf); }
+`,
+	})
+	use := mustFact(t, ff, "src.use")
+	if !hasRelation(use, facts.RelCalls, "src.NE_PTR") {
+		t.Errorf("use should reference the capitalized static inline NE_PTR, got %+v", use.Relations)
+	}
+	if hasRelation(use, facts.RelCalls, "src.ARRAY_SIZE") || hasRelation(use, facts.RelInstantiates, "ARRAY_SIZE") {
+		t.Errorf("a capitalized value-macro (ARRAY_SIZE) must not become an edge, got %+v", use.Relations)
+	}
+}
+
+// TestCMachineDescErrorRegion covers the ARM machine_desc pattern: a struct opened
+// by a macro (DT_MACHINE_START) and closed by another (MACHINE_END), whose
+// `.field = fn` lines tree-sitter renders as a file-scope ERROR node. The callbacks
+// must be recovered.
+func TestCMachineDescErrorRegion(t *testing.T) {
+	// Two blocks after a declaration + a call-valued `.smp` field — the shape that
+	// makes tree-sitter recover the blocks as bare assignment_expression /
+	// field_expression fragments rather than one clean ERROR node.
+	ff := extractProject(t, map[string]string{
+		"src/board.c": `
+static void omap_reserve(void) {}
+static void omap_generic_init(void) {}
+static void omap2xxx_restart(void) {}
+static void mvebu_dt_init(void) {}
+static const char *const compat[] = { "x", 0 };
+DT_MACHINE_START(OMAP242X_DT, "Generic OMAP2420")
+	.smp		= smp_ops(omap_smp_ops),
+	.reserve	= omap_reserve,
+	.init_machine	= omap_generic_init,
+	.restart	= omap2xxx_restart,
+MACHINE_END
+DT_MACHINE_START(OMAP243X_DT, "Generic OMAP2430")
+	.init_machine	= mvebu_dt_init,
+MACHINE_END
+`,
+	})
+	mod := mustFact(t, ff, "src")
+	for _, fn := range []string{"src.omap_reserve", "src.omap_generic_init", "src.omap2xxx_restart", "src.mvebu_dt_init"} {
+		if !hasRelation(mod, facts.RelCalls, fn) {
+			t.Errorf("machine_desc callback %s should be referenced, got %+v", fn, mod.Relations)
+		}
+	}
+}
+
 // TestCArgRefNonFunctionDropped guards the funcNames filter: an argument identifier
 // that does not name a real function must NOT produce a RelCalls edge (otherwise a
 // data argument could spuriously mark a same-named function as used).

@@ -21,7 +21,17 @@ import (
 // v5: PHP HTTP client detection + Laravel/Symfony route DSLs (attributes, YAML/XML config).
 // v6: Ruby bare-constant references emitted as RelCalls edges (dead-code precision).
 // v7: Ruby skips builtin-constant edges (god-class noise) + serializer attribute/include_ folding.
-const cacheVersion = "v7"
+// v8: C/C++ file-scope registration-macro args (module_init/EXPORT_SYMBOL/DEVICE_ATTR) emitted as module-fact call edges.
+// v9: C/C++ function-pointer field assignments (obj->cb = fn) + macro-body call references (IDENT( inside #define) emitted as call edges.
+// v10: C/C++ qualifier-prefixed registration macros (static DEFINE_*_PM_OPS(name, suspend, resume)) record their function-name args as call edges.
+// v11: C/C++ in-body compound-literal designated initializers (cfg = (struct X){ .cb = fn }) record their function-pointer fields as call edges.
+// v12: C/C++ macro-body scan also captures value-position function pointers (.field = fn / = &fn inside #define), e.g. ops tables defined via a macro.
+// v13: C/C++ in-extractor macro expansion of file-scope invocations recovers token-pasted callbacks (CONFIGFS_ATTR/DEVICE_ATTR_RO -> name##_show).
+// v14: C/C++ static single-arg DEVICE_ATTR/BUS_ATTR expansion, all-ident scan of expanded macros (DEFINE_SHOW_ATTRIBUTE), capitalized C callee resolution.
+// v15: C/C++ salvage function-pointer refs from file-scope ERROR regions (macro-opened structs like MACHINE_START/DT_MACHINE_START ... MACHINE_END).
+// v16: extend that salvage to file-scope assignment_expression/field_expression fragments (machine_desc blocks parse that way when surrounded by other code).
+// v17: full-tree salvage of `.field = fn` macro-struct debris (machine_desc) regardless of where tree-sitter scatters it (skips function bodies).
+const cacheVersion = "v17"
 
 // extractorCache holds per-extractor facts keyed by a content hash of the files
 // the extractor depends on. It is loaded from disk at the start of a snapshot and
