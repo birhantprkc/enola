@@ -1059,10 +1059,8 @@ func (s *Server) registerTools() {
 		}
 
 		repos := map[string]struct{}{}
-		for _, f := range snap.Facts {
-			if f.Repo != "" {
-				repos[strings.ToLower(f.Repo)] = struct{}{}
-			}
+		for _, repo := range s.eng.Store().RepoLabels() {
+			repos[strings.ToLower(repo)] = struct{}{}
 		}
 		matched := filterInsights(snap.Insights, args.Explainer, args.Repo, args.MinConfidence, len(repos) > 1)
 		if len(matched) == 0 {

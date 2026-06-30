@@ -4,6 +4,7 @@ go 1.25.11
 
 require (
 	github.com/modelcontextprotocol/go-sdk v1.4.1
+	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58
 	github.com/tree-sitter-grammars/tree-sitter-kotlin v1.1.0
 	github.com/tree-sitter/go-tree-sitter v0.24.0
 	github.com/tree-sitter/tree-sitter-c v0.21.5-0.20240818205408-927da1f210eb

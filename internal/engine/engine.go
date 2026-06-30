@@ -11,6 +11,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -279,7 +281,12 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 			FactCount:    e.store.Count(),
 			InsightCount: len(allInsights),
 		},
-		Facts:    e.store.All(),
+		// FactsRef aliases the store's slice rather than copying it: this snapshot
+		// is the live one (e.snapshot) and its Facts are only ever read (renderers,
+		// diff, query_insights), so a second full copy of every fact would just
+		// double steady-state RSS for a large repo. Baselines, which must stay
+		// immutable as the store regenerates, still use the copying All().
+		Facts:    e.store.FactsRef(),
 		Insights: allInsights,
 	}
 
@@ -299,6 +306,19 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 		tWalk.Round(time.Millisecond), tHash.Round(time.Millisecond), tExtract.Round(time.Millisecond),
 		tLink.Round(time.Millisecond), tGraph.Round(time.Millisecond), tExplain.Round(time.Millisecond),
 		tRender.Round(time.Millisecond))
+
+	// Generation allocates large transient buffers (per-file fact slices, the
+	// pre-dedup fact list, parser scratch) that the GC frees but Go's scavenger
+	// returns to the OS only lazily. For a long-running server that loads a big
+	// repo and then idles, hand that memory back now so idle RSS settles at the
+	// live set instead of the extraction peak. Once per load, so the cost is
+	// negligible. The MemStats line reports the retained footprint for visibility.
+	debug.FreeOSMemory()
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	log.Printf("[engine] memory after snapshot: heap=%d MiB sys=%d MiB (%d facts)",
+		ms.HeapAlloc>>20, ms.Sys>>20, snapshot.Meta.FactCount)
+
 	return snapshot, nil
 }
 

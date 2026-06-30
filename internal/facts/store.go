@@ -65,6 +65,33 @@ func (s *Store) All() []Fact {
 	return result
 }
 
+// FactsRef returns the store's underlying fact slice WITHOUT copying it. Unlike
+// All, the caller must treat the result as read-only and must not retain it past
+// the next mutation (Add/Clear/RemoveWhere may replace or grow the backing
+// array). It exists so the engine can attach facts to the live snapshot it owns
+// without doubling memory; callers that need an independent, stable copy (e.g.
+// pinned baselines) must use All instead.
+func (s *Store) FactsRef() []Fact {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.facts
+}
+
+// RepoLabels returns the distinct, non-empty repo labels present in the store,
+// derived in O(repos) from the byRepo index rather than by scanning every fact.
+// Order is unspecified.
+func (s *Store) RepoLabels() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	labels := make([]string, 0, len(s.byRepo))
+	for repo := range s.byRepo {
+		if repo != "" {
+			labels = append(labels, repo)
+		}
+	}
+	return labels
+}
+
 // Count returns the number of facts in the store.
 func (s *Store) Count() int {
 	s.mu.RLock()

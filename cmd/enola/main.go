@@ -14,6 +14,7 @@ import (
 
 func main() {
 	log.SetOutput(os.Stderr)
+	bootstrap.ConfigureRuntime()
 
 	ctx := context.Background()
 
