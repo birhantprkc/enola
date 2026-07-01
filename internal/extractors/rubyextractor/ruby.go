@@ -112,6 +112,35 @@ func (e *RubyExtractor) Extract(ctx context.Context, repoPath string, files []st
 	return allFacts, nil
 }
 
+// ExtractTestRefs implements plugin.TestRefExtractor. It parses test/spec files
+// for the SOLE purpose of capturing their outbound references into production
+// code, emitting one facts.KindTestRef fact per file that carries only RelCalls
+// edges — no symbols. Test methods therefore never become dead-code candidates
+// (which the orphans package explicitly excludes), and no symbol/module/route
+// explainer is affected, while the dead-code detector can still see that a
+// production symbol is exercised by a test and not mis-report it as dead.
+func (e *RubyExtractor) ExtractTestRefs(ctx context.Context, repoPath string, files []string) ([]facts.Fact, error) {
+	var rbFiles []string
+	for _, relFile := range files {
+		if isRubyFile(relFile) {
+			rbFiles = append(rbFiles, relFile)
+		}
+	}
+	perFile := parallel.MapFiles(ctx, rbFiles, func(relFile string) []facts.Fact {
+		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
+		if err != nil {
+			log.Printf("[ruby-extractor] error reading test file %s: %v", relFile, err)
+			return nil
+		}
+		return extractTestRefsAST(src, relFile)
+	})
+	var out []facts.Fact
+	for _, ff := range perFile {
+		out = append(out, ff...)
+	}
+	return out, nil
+}
+
 // --- Rails detection ---
 
 func detectRailsProject(repoPath string) bool {
@@ -127,9 +156,15 @@ func detectRailsProject(repoPath string) bool {
 	return false
 }
 
-// isRubyFile returns true if the file has a .rb extension.
+// isRubyFile returns true if the file is Ruby source: a .rb/.rake file or a
+// Rakefile. Rake tasks are Ruby and call into app code (e.g. from lib/tasks/),
+// so indexing them lets those calls resolve (dead-code precision).
 func isRubyFile(path string) bool {
-	return strings.HasSuffix(strings.ToLower(path), ".rb")
+	lower := strings.ToLower(path)
+	if strings.HasSuffix(lower, ".rb") || strings.HasSuffix(lower, ".rake") {
+		return true
+	}
+	return filepath.Base(path) == "Rakefile"
 }
 
 // OwnsFile implements plugin.FileOwner for incremental caching.

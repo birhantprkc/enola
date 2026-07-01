@@ -824,3 +824,584 @@ dependencies:
 		t.Fatal("missing root module fact (should be named 'root', not '.')")
 	}
 }
+
+// testRefFact returns the single KindTestRef fact from extractTestRefsAST output.
+func testRefFact(result []facts.Fact) (facts.Fact, bool) {
+	for _, f := range result {
+		if f.Kind == facts.KindTestRef {
+			return f, true
+		}
+	}
+	return facts.Fact{}, false
+}
+
+// TestExtractFile_CustomClassMacroRecorded checks that a bare-receiver class-body
+// call (a custom Rails DSL macro like `requires_login` / `cluster_concurrency`)
+// records the MACRO NAME as a use on the enclosing class, so the base-class method
+// backing the macro is not mis-reported as dead. The target must be bare (no "."),
+// so it never pollutes the packwerk coupling graph.
+func TestExtractFile_CustomClassMacroRecorded(t *testing.T) {
+	src := `class ReportsController < ApplicationController
+  requires_login except: [:index]
+  cluster_concurrency 1
+end
+`
+	result := extractFileAST([]byte(src), "app/controllers/reports_controller.rb", true, true)
+	cls, ok := symbolsByName(result)["ReportsController"]
+	if !ok {
+		t.Fatal("missing class ReportsController")
+	}
+	for _, want := range []string{"requires_login", "cluster_concurrency"} {
+		if !hasCall(cls, want) {
+			t.Errorf("missing custom macro RelCalls -> %s; relations = %v", want, cls.Relations)
+		}
+	}
+	if hasCall(cls, "ReportsController.requires_login") {
+		t.Errorf("macro name must be bare, not a coupling form; relations = %v", cls.Relations)
+	}
+}
+
+// TestExtractFile_StructuralMacrosNotRecordedAsCalls guards that structural
+// keywords (require/private) are NOT recorded as macro call edges.
+func TestExtractFile_StructuralMacrosNotRecordedAsCalls(t *testing.T) {
+	src := `class Thing
+  require "set"
+  private
+end
+`
+	result := extractFileAST([]byte(src), "app/models/thing.rb", false, true)
+	cls := symbolsByName(result)["Thing"]
+	for _, skip := range []string{"require", "private"} {
+		if hasCall(cls, skip) {
+			t.Errorf("structural keyword %s must not be a macro edge; relations = %v", skip, cls.Relations)
+		}
+	}
+}
+
+// TestExtractFile_TopLevelMacroNoSymbolEdge checks a body call outside any class
+// attaches to no symbol fact (there is no enclosing class to hang it on).
+func TestExtractFile_TopLevelMacroNoSymbolEdge(t *testing.T) {
+	src := `configure_app foo: 1
+`
+	result := extractFileAST([]byte(src), "config/init.rb", false, true)
+	for _, f := range result {
+		if f.Kind == facts.KindSymbol && hasCall(f, "configure_app") {
+			t.Errorf("top-level macro must not attach to any symbol fact; fact = %v", f)
+		}
+	}
+}
+
+// TestExtractFile_SelfAndSelfClassReceivers checks that `self.foo` and
+// `self.class.bar` dispatch is resolved to the bare method name, while a bare
+// `self.class` receiver does not emit a spurious `class` edge.
+func TestExtractFile_SelfAndSelfClassReceivers(t *testing.T) {
+	src := `class Job
+  def run
+    do_it if self.class.perform_when_readonly?
+    self.reset
+  end
+end
+`
+	result := extractFileAST([]byte(src), "app/jobs/job.rb", false, true)
+	meth := symbolsByName(result)["Job#run"]
+	for _, want := range []string{"perform_when_readonly?", "reset"} {
+		if !hasCall(meth, want) {
+			t.Errorf("missing self-receiver RelCalls -> %s; relations = %v", want, meth.Relations)
+		}
+	}
+	if hasCall(meth, "class") {
+		t.Errorf("self.class receiver must not emit a bare 'class' edge; relations = %v", meth.Relations)
+	}
+	if hasCall(meth, "class.perform_when_readonly?") {
+		t.Errorf("self.class.X must resolve to a bare method, not class.X; relations = %v", meth.Relations)
+	}
+}
+
+// TestExtractFile_SelfBangAndPredicatePreserved checks predicate/bang suffixes
+// survive self-receiver resolution.
+func TestExtractFile_SelfBangAndPredicatePreserved(t *testing.T) {
+	src := `class Model
+  def process
+    self.save!
+    return unless self.valid?
+  end
+end
+`
+	result := extractFileAST([]byte(src), "app/models/model.rb", false, true)
+	meth := symbolsByName(result)["Model#process"]
+	for _, want := range []string{"save!", "valid?"} {
+		if !hasCall(meth, want) {
+			t.Errorf("missing self predicate/bang RelCalls -> %s; relations = %v", want, meth.Relations)
+		}
+	}
+}
+
+// TestExtractTestRefsAST checks the reference-only spec pass emits a single
+// KindTestRef fact carrying the production symbols the spec exercises (qualified
+// receivers fold to bare method via the collector's lastSeg), and NO symbol facts.
+func TestExtractTestRefsAST(t *testing.T) {
+	src := `# frozen_string_literal: true
+describe Badge do
+  it "computes ids" do
+    expect(Badge.trust_level_badge_ids).to eq([1, 2])
+    GlobalSetting.reset_redis_config!
+  end
+end
+`
+	result := extractTestRefsAST([]byte(src), "spec/services/badge_granter_spec.rb")
+	for _, f := range result {
+		if f.Kind == facts.KindSymbol {
+			t.Fatalf("test-ref pass must not emit symbol facts; got %v", f)
+		}
+	}
+	ref, ok := testRefFact(result)
+	if !ok {
+		t.Fatal("missing KindTestRef fact")
+	}
+	for _, want := range []string{"Badge.trust_level_badge_ids", "GlobalSetting.reset_redis_config!"} {
+		if !hasCall(ref, want) {
+			t.Errorf("missing test ref RelCalls -> %s; relations = %v", want, ref.Relations)
+		}
+	}
+}
+
+// fileRefFact returns the single KindFileRef fact from extractFileAST output, if any.
+func fileRefFact(result []facts.Fact) (facts.Fact, bool) {
+	for _, f := range result {
+		if f.Kind == facts.KindFileRef {
+			return f, true
+		}
+	}
+	return facts.Fact{}, false
+}
+
+// countCalls returns how many RelCalls relations on a fact target the given name.
+func countCalls(f facts.Fact, target string) int {
+	n := 0
+	for _, r := range f.Relations {
+		if r.Kind == facts.RelCalls && r.Target == target {
+			n++
+		}
+	}
+	return n
+}
+
+// TestExtractFile_ClassBodySplatArgMethodCall checks that a method call in the
+// ARGUMENT of a class-body macro (`requires_login *show_methods`) is captured on
+// the class fact — not just the macro name — so the arg method is not flagged dead.
+func TestExtractFile_ClassBodySplatArgMethodCall(t *testing.T) {
+	src := `class TagsController < ApplicationController
+  requires_login *show_methods
+end
+`
+	result := extractFileAST([]byte(src), "app/controllers/tags_controller.rb", true, true)
+	cls := symbolsByName(result)["TagsController"]
+	for _, want := range []string{"requires_login", "show_methods"} {
+		if !hasCall(cls, want) {
+			t.Errorf("missing class-body RelCalls -> %s; relations = %v", want, cls.Relations)
+		}
+	}
+	if hasCall(cls, "TagsController.show_methods") {
+		t.Errorf("arg method must be bare, not a coupling form; relations = %v", cls.Relations)
+	}
+}
+
+// TestExtractFile_ClassBodyQualifiedCall checks a qualified Const.method call in a
+// class body attaches to the class fact (previously dropped by handleBodyCall).
+func TestExtractFile_ClassBodyQualifiedCall(t *testing.T) {
+	src := `class Report
+  Badge.register(self)
+end
+`
+	result := extractFileAST([]byte(src), "app/models/report.rb", false, true)
+	cls := symbolsByName(result)["Report"]
+	if !hasCall(cls, "Badge.register") {
+		t.Errorf("missing class-body qualified RelCalls -> Badge.register; relations = %v", cls.Relations)
+	}
+}
+
+// TestExtractFile_ClassBodyMacroNoDuplicate guards the Fix A / walkForCalls dedup:
+// a class-body macro name is recorded exactly once on the class fact.
+func TestExtractFile_ClassBodyMacroNoDuplicate(t *testing.T) {
+	src := `class Thing
+  requires_login except: [:index]
+end
+`
+	result := extractFileAST([]byte(src), "app/controllers/thing_controller.rb", true, true)
+	cls := symbolsByName(result)["Thing"]
+	if got := countCalls(cls, "requires_login"); got != 1 {
+		t.Errorf("requires_login recorded %d times, want exactly 1; relations = %v", got, cls.Relations)
+	}
+}
+
+// TestExtractFile_TopLevelQualifiedCallOnFileRef checks a top-level (fixture-style)
+// call is captured on a KindFileRef fact, leaks no symbol fact, and that a file with
+// only ignorable top-level calls produces no file-ref fact.
+func TestExtractFile_TopLevelQualifiedCallOnFileRef(t *testing.T) {
+	result := extractFileAST([]byte("Badge.like_badge_counts(1, 2)\n"), "db/fixtures/006_badges.rb", false, true)
+	fr, ok := fileRefFact(result)
+	if !ok {
+		t.Fatal("missing KindFileRef fact for a top-level call")
+	}
+	if !hasCall(fr, "Badge.like_badge_counts") {
+		t.Errorf("missing file-ref RelCalls -> Badge.like_badge_counts; relations = %v", fr.Relations)
+	}
+	for _, f := range result {
+		if f.Kind == facts.KindSymbol && hasCall(f, "Badge.like_badge_counts") {
+			t.Errorf("top-level call must not attach to a symbol fact; fact = %v", f)
+		}
+	}
+	// A file whose only top-level call is a suppressed keyword produces no file-ref.
+	empty := extractFileAST([]byte("require \"set\"\n"), "config/init.rb", false, true)
+	if _, ok := fileRefFact(empty); ok {
+		t.Error("file with no real top-level refs should not emit a KindFileRef fact")
+	}
+}
+
+// TestExtractFile_TopLevelAfterInitializeBlock checks a call inside a top-level
+// plugin block (after_initialize do ... end) is captured on the file-ref fact.
+func TestExtractFile_TopLevelAfterInitializeBlock(t *testing.T) {
+	src := `after_initialize do
+  CategoryList.register_included_association(:foo)
+end
+`
+	result := extractFileAST([]byte(src), "plugins/foo/plugin.rb", true, true)
+	fr, ok := fileRefFact(result)
+	if !ok {
+		t.Fatal("missing KindFileRef fact for a top-level block call")
+	}
+	if !hasCall(fr, "CategoryList.register_included_association") {
+		t.Errorf("missing file-ref RelCalls -> CategoryList.register_included_association; relations = %v", fr.Relations)
+	}
+}
+
+// TestExtractFile_TopLevelAssignmentRHS checks that a call on the RHS of a
+// top-level assignment (a Rails initializer pattern) is captured on the file-ref
+// fact — previously dropped because handleAssignment never walked the value.
+func TestExtractFile_TopLevelAssignmentRHS(t *testing.T) {
+	src := `if Rails.configuration.multisite
+  assets_hostnames = GlobalSetting.cdn_hostnames
+end
+`
+	result := extractFileAST([]byte(src), "config/initializers/200-first_middlewares.rb", true, true)
+	fr, ok := fileRefFact(result)
+	if !ok {
+		t.Fatal("missing KindFileRef fact for a top-level assignment RHS call")
+	}
+	if !hasCall(fr, "GlobalSetting.cdn_hostnames") {
+		t.Errorf("missing file-ref RelCalls -> GlobalSetting.cdn_hostnames; relations = %v", fr.Relations)
+	}
+	for _, f := range result {
+		if f.Kind == facts.KindSymbol && hasCall(f, "GlobalSetting.cdn_hostnames") {
+			t.Errorf("top-level assignment RHS call must not attach to a symbol fact; fact = %v", f)
+		}
+	}
+}
+
+// TestExtractFile_TopLevelSetterAssignmentRHS checks a call on the RHS of a
+// top-level setter-assignment inside an if/else is captured.
+func TestExtractFile_TopLevelSetterAssignmentRHS(t *testing.T) {
+	src := `if Rails.env.test?
+  MessageBus.configure(backend: :memory)
+else
+  MessageBus.redis_config = GlobalSetting.message_bus_redis_config
+end
+`
+	result := extractFileAST([]byte(src), "config/initializers/004-message_bus.rb", true, true)
+	fr, ok := fileRefFact(result)
+	if !ok {
+		t.Fatal("missing KindFileRef fact")
+	}
+	if !hasCall(fr, "GlobalSetting.message_bus_redis_config") {
+		t.Errorf("missing file-ref RelCalls -> GlobalSetting.message_bus_redis_config; relations = %v", fr.Relations)
+	}
+}
+
+// TestExtractFile_ClassBodyConstAssignmentProc checks that calls inside a Proc in
+// a class-body constant assignment (Discourse's TYPE_FILTERS pattern) are captured
+// on the class fact.
+func TestExtractFile_ClassBodyConstAssignmentProc(t *testing.T) {
+	src := `class GroupsController < ApplicationController
+  TYPE_FILTERS = {
+    my: Proc.new { |groups, user| Group.member_of(groups, user) },
+    owner: Proc.new { |groups, user| Group.owner_of(groups, user) },
+  }
+end
+`
+	result := extractFileAST([]byte(src), "app/controllers/groups_controller.rb", true, true)
+	cls := symbolsByName(result)["GroupsController"]
+	for _, want := range []string{"Group.owner_of", "Group.member_of"} {
+		if !hasCall(cls, want) {
+			t.Errorf("missing class-body const-assignment Proc RelCalls -> %s; relations = %v", want, cls.Relations)
+		}
+	}
+}
+
+// fileRefPrefixes returns the dynamic_send_prefixes prop of the KindFileRef fact.
+func fileRefPrefixes(result []facts.Fact) []string {
+	for _, f := range result {
+		if f.Kind == facts.KindFileRef {
+			if raw, ok := f.Props["dynamic_send_prefixes"].([]string); ok {
+				return raw
+			}
+		}
+	}
+	return nil
+}
+
+// TestExtractFile_InterpolatedSymbolPrefix checks that an interpolated symbol
+// (`:"report_#{type}"`) — the mark of dynamic dispatch by computed name — records
+// its static prefix on the file-scope fact.
+func TestExtractFile_InterpolatedSymbolPrefix(t *testing.T) {
+	src := `class IncomingLinksReport
+  def self.find(type)
+    report_method = :"report_#{type}"
+    public_send(report_method, type)
+  end
+end
+`
+	result := extractFileAST([]byte(src), "app/models/incoming_links_report.rb", true, true)
+	got := fileRefPrefixes(result)
+	found := false
+	for _, p := range got {
+		if p == "report_" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected dynamic_send_prefixes to contain %q; got %v", "report_", got)
+	}
+}
+
+// TestExtractFile_NoPrefixFromStaticSymbolOrString checks the heuristic does NOT
+// fire for static symbols, too-short prefixes, or interpolated STRINGS (i18n keys).
+func TestExtractFile_NoPrefixFromStaticSymbolOrString(t *testing.T) {
+	src := `class Thing
+  def go(type)
+    a = :report_foo                 # static symbol, no interpolation
+    b = :"m#{type}"                 # prefix too short / no underscore
+    c = I18n.t("reports.#{type}.x") # interpolated STRING, not a symbol
+    [a, b, c]
+  end
+end
+`
+	result := extractFileAST([]byte(src), "app/models/thing.rb", true, true)
+	if got := fileRefPrefixes(result); len(got) != 0 {
+		t.Errorf("expected no dynamic_send_prefixes, got %v", got)
+	}
+}
+
+// TestExtractFile_SuperReferencesAncestor checks that a `super` call records a
+// reference to the same-named ancestor method (the base an override delegates to).
+func TestExtractFile_SuperReferencesAncestor(t *testing.T) {
+	src := `module EE
+  module IssuesFinder
+    def negatable_params
+      @negatable_params ||= super + [:weight]
+    end
+  end
+end
+`
+	result := extractFileAST([]byte(src), "ee/app/finders/ee/issues_finder.rb", true, true)
+	meth := symbolsByName(result)["EE::IssuesFinder#negatable_params"]
+	if !hasCall(meth, "negatable_params") {
+		t.Errorf("super should record a call to the same-named ancestor method; relations = %v", meth.Relations)
+	}
+}
+
+// TestExtractFile_LiteralSymbolDispatch checks that a literal-symbol argument to a
+// dispatcher (try/send/respond_to?) records a call to the named method, while a
+// non-dispatcher method with a symbol arg (e.g. validates :name) does not.
+func TestExtractFile_LiteralSymbolDispatch(t *testing.T) {
+	src := `class BaseField
+  def complexity(resolver)
+    ext = resolver&.try(:calculate_ext_conn_complexity)
+    v = @resolver_class.send(:requires_argument?)
+    validates :name
+    [ext, v]
+  end
+end
+`
+	result := extractFileAST([]byte(src), "app/graphql/types/base_field.rb", true, true)
+	meth := symbolsByName(result)["BaseField#complexity"]
+	for _, want := range []string{"calculate_ext_conn_complexity", "requires_argument?"} {
+		if !hasCall(meth, want) {
+			t.Errorf("dispatcher literal-symbol arg should record RelCalls -> %s; relations = %v", want, meth.Relations)
+		}
+	}
+	// `validates :name` is a DSL, not a dispatcher — `name` must not be a call here.
+	if hasCall(meth, "name") {
+		t.Errorf("non-dispatcher symbol arg must not be recorded as a call; relations = %v", meth.Relations)
+	}
+}
+
+// TestExtractFile_ChainedNoArgCall checks that a no-arg method call at the end of
+// a chain (ActiveRecord scope / class-method chains) is captured, while common
+// attribute/enumerable reads and single-level reads are not.
+func TestExtractFile_ChainedNoArgCall(t *testing.T) {
+	src := `class Worker
+  def run
+    DeployToken.active.with_owners.ordered_for_keyset_pagination
+    merge_request.merge_request_closing_issues.preload_issue
+    group_link.class.access_options
+    user.name
+    list.map.first
+    a.b.count
+  end
+end
+`
+	result := extractFileAST([]byte(src), "app/workers/worker.rb", true, true)
+	meth := symbolsByName(result)["Worker#run"]
+	for _, want := range []string{"ordered_for_keyset_pagination", "preload_issue", "access_options"} {
+		if !hasCall(meth, want) {
+			t.Errorf("chained no-arg call should record RelCalls -> %s; relations = %v", want, meth.Relations)
+		}
+	}
+	// Cheap chained reads (name/first/class are in rubyCheapMethods) and the
+	// single-level read (user.name — var receiver) must NOT be recorded.
+	for _, skip := range []string{"name", "first", "class"} {
+		if hasCall(meth, skip) {
+			t.Errorf("attribute/enumerable/single-level read %q must not be recorded as a chained call; relations = %v", skip, meth.Relations)
+		}
+	}
+}
+
+// TestIsRubyFile_Rake checks that .rake files and Rakefile are treated as Ruby.
+func TestIsRubyFile_Rake(t *testing.T) {
+	for _, p := range []string{"lib/tasks/gitlab/graphql_introspection.rake", "Rakefile"} {
+		if !isRubyFile(p) {
+			t.Errorf("isRubyFile(%q) = false, want true", p)
+		}
+	}
+	if isRubyFile("app/models/foo.py") {
+		t.Error("isRubyFile should be false for non-Ruby files")
+	}
+}
+
+// TestExtractFile_RakeTaskCallCaptured checks a top-level call in a .rake file is
+// recorded on the file-scope fact (so its target is not mis-reported as dead).
+func TestExtractFile_RakeTaskCallCaptured(t *testing.T) {
+	src := `namespace :gitlab do
+  task introspection: :environment do
+    puts CachedIntrospectionQuery.query_string_no_deprecated
+  end
+end
+`
+	result := extractFileAST([]byte(src), "lib/tasks/gitlab/graphql_introspection.rake", true, true)
+	fr, ok := fileRefFact(result)
+	if !ok || !hasCall(fr, "CachedIntrospectionQuery.query_string_no_deprecated") {
+		t.Errorf("rake task call should be captured on the file-ref fact; result = %v", result)
+	}
+}
+
+// TestExtractFile_DefaultParamCall checks a call in a method's default parameter
+// value is recorded (previously only the body was walked).
+func TestExtractFile_DefaultParamCall(t *testing.T) {
+	src := `class BuildTraceChunk
+  def unsafe_persist_data!(new_store = self.class.persistable_store)
+    new_store.to_s
+  end
+end
+`
+	result := extractFileAST([]byte(src), "app/models/ci/build_trace_chunk.rb", true, true)
+	meth := symbolsByName(result)["BuildTraceChunk#unsafe_persist_data!"]
+	if !hasCall(meth, "persistable_store") {
+		t.Errorf("default-parameter call should be recorded; relations = %v", meth.Relations)
+	}
+}
+
+// TestExtractFile_PredicateBangSingleLevelCall checks that predicate/bang calls on
+// a plain variable receiver are recorded (they are unambiguous method calls), while
+// plain attribute reads and cheap predicates are not.
+func TestExtractFile_PredicateBangSingleLevelCall(t *testing.T) {
+	src := `class BlobHelper
+  def show(viewer, record)
+    x = viewer.rich?
+    record.save!
+    y = viewer.present?
+    z = viewer.blob
+    [x, y, z]
+  end
+end
+`
+	result := extractFileAST([]byte(src), "app/helpers/blob_helper.rb", true, true)
+	meth := symbolsByName(result)["BlobHelper#show"]
+	for _, want := range []string{"rich?", "save!"} {
+		if !hasCall(meth, want) {
+			t.Errorf("single-level predicate/bang call should be recorded -> %s; relations = %v", want, meth.Relations)
+		}
+	}
+	for _, skip := range []string{"present?", "blob"} {
+		if hasCall(meth, skip) {
+			t.Errorf("cheap predicate / plain attribute read %q must not be recorded; relations = %v", skip, meth.Relations)
+		}
+	}
+}
+
+// TestExtractFile_DelegateFold checks that `delegate :a, :b, ..., to: :class`
+// records the delegated method names as calls on the enclosing class, while the
+// `to:` keyword value is not recorded.
+func TestExtractFile_DelegateFold(t *testing.T) {
+	src := `class BlobViewer
+  delegate :rich?, :simple?, :loading_partial_path, to: :class
+end
+`
+	result := extractFileAST([]byte(src), "app/models/blob_viewer/base.rb", true, true)
+	cls := symbolsByName(result)["BlobViewer"]
+	for _, want := range []string{"rich?", "simple?", "loading_partial_path"} {
+		if !hasCall(cls, want) {
+			t.Errorf("delegate should record RelCalls -> %s; relations = %v", want, cls.Relations)
+		}
+	}
+	for _, skip := range []string{"to", "class"} {
+		if hasCall(cls, skip) {
+			t.Errorf("delegate keyword %q must not be recorded; relations = %v", skip, cls.Relations)
+		}
+	}
+}
+
+// TestExtractFile_BareMethodChainCall checks that a scope/class-method call on a
+// bare-method (non-local identifier) receiver is captured when the name is
+// scope-like (has `_`), while single-word attribute reads and local receivers are not.
+func TestExtractFile_BareMethodChainCall(t *testing.T) {
+	src := `class Service
+  def run
+    ordered_relation_scope.pluck_job_id.uniq
+    current_user.email
+    rel = base_scope
+    rel.pluck_something
+  end
+end
+`
+	result := extractFileAST([]byte(src), "app/services/service.rb", true, true)
+	meth := symbolsByName(result)["Service#run"]
+	// Non-local bare method receiver AND local relation-variable receiver both record
+	// their underscored scope-like calls.
+	for _, want := range []string{"pluck_job_id", "pluck_something"} {
+		if !hasCall(meth, want) {
+			t.Errorf("scope-like call should record %s; relations = %v", want, meth.Relations)
+		}
+	}
+	// current_user.email: single-word (no underscore) -> not recorded.
+	if hasCall(meth, "email") {
+		t.Errorf("single-word attribute read email must not be recorded; relations = %v", meth.Relations)
+	}
+}
+
+// TestExtractFile_LocalRelationScopeCall checks the exact GitLab shape: a scope
+// method invoked on a local variable holding an AR relation.
+func TestExtractFile_LocalRelationScopeCall(t *testing.T) {
+	src := `class FeatureFlagsFinder
+  def execute(preload: true)
+    items = feature_flags
+    items = items.preload_relations if preload
+    items.ordered
+  end
+end
+`
+	result := extractFileAST([]byte(src), "app/finders/feature_flags_finder.rb", true, true)
+	meth := symbolsByName(result)["FeatureFlagsFinder#execute"]
+	if !hasCall(meth, "preload_relations") {
+		t.Errorf("scope call on a local relation var should record preload_relations; relations = %v", meth.Relations)
+	}
+}

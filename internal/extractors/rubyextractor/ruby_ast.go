@@ -2,12 +2,24 @@ package rubyextractor
 
 import (
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/enola-labs/enola/internal/facts"
 	sitter "github.com/tree-sitter/go-tree-sitter"
 	ruby "github.com/tree-sitter/tree-sitter-ruby/bindings/go"
 )
+
+// sortedKeys returns the keys of a set in deterministic (sorted) order — used to
+// emit stable prop values into facts.
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // extractFileAST parses a Ruby file with tree-sitter and emits architectural
 // facts. It replaces the former line-based regex scanner: every symbol, import,
@@ -29,9 +41,56 @@ func extractFileAST(src []byte, relFile string, isRails, exportedByPackwerk bool
 		dir:                filepath.Dir(relFile),
 		isRails:            isRails,
 		exportedByPackwerk: exportedByPackwerk,
+		fileRefIdx:         -1,
 	}
-	w.walkBody(tree.RootNode())
+	root := tree.RootNode()
+	w.walkBody(root)
+	// Capture executable calls made at file scope (top-level assignment RHS,
+	// conditionals, fixture `Badge.foo(...)`, plugin `after_initialize` blocks) on
+	// the file-scope ref fact. walkForCalls returns at nested defs/classes, which
+	// get their own pass.
+	if owner := w.bodyCallOwner(); owner >= 0 {
+		w.walkForCalls(root, owner, map[string]bool{}, nil)
+	}
+	// Attach any dynamic-dispatch prefixes discovered anywhere in the file to the
+	// file-scope fact so the collector can mark same-prefix methods as used.
+	if len(w.dynamicPrefixes) > 0 {
+		idx := w.ensureFileRefFact()
+		w.out[idx].Props["dynamic_send_prefixes"] = sortedKeys(w.dynamicPrefixes)
+	}
+	// Drop the file-scope reference fact if it carries neither call edges nor
+	// dynamic-dispatch prefixes, so empty facts never reach the store.
+	if w.fileRefIdx >= 0 && len(w.out[w.fileRefIdx].Relations) == 0 &&
+		w.out[w.fileRefIdx].Props["dynamic_send_prefixes"] == nil {
+		w.out = append(w.out[:w.fileRefIdx], w.out[w.fileRefIdx+1:]...)
+	}
 	return w.out
+}
+
+// ensureFileRefFact returns the index of this file's lazily-created file-scope
+// reference fact (facts.KindFileRef), creating it on first use.
+func (w *rubyWalker) ensureFileRefFact() int {
+	if w.fileRefIdx < 0 {
+		w.out = append(w.out, facts.Fact{
+			Kind:  facts.KindFileRef,
+			Name:  w.relFile,
+			File:  w.relFile,
+			Props: map[string]any{"language": "ruby"},
+		})
+		w.fileRefIdx = len(w.out) - 1
+	}
+	return w.fileRefIdx
+}
+
+// bodyCallOwner returns the index of the fact that class/module-body and
+// top-level call edges should attach to: the enclosing class/module symbol fact
+// when inside a type scope, otherwise (top level, or an eigenclass body whose
+// symFactIdx is -1) the lazily-created file-scope reference fact.
+func (w *rubyWalker) bodyCallOwner() int {
+	if s := w.cur(); s != nil && s.symFactIdx >= 0 {
+		return s.symFactIdx
+	}
+	return w.ensureFileRefFact()
 }
 
 // rubyScope tracks a class/module/eigenclass nesting level.
@@ -54,6 +113,16 @@ type rubyWalker struct {
 
 	out        []facts.Fact
 	scopeStack []rubyScope
+
+	// fileRefIdx is the index into out of the lazily-created file-scope reference
+	// fact (facts.KindFileRef) that holds top-level call edges; -1 until first used.
+	fileRefIdx int
+
+	// dynamicPrefixes accumulates the static prefixes of interpolated symbols
+	// (`:"report_#{type}"` -> "report_") seen anywhere in the file. They mark
+	// dynamic dispatch (public_send/send by computed name), letting the dead-code
+	// detector treat same-prefix methods as used. File-global; nil until first hit.
+	dynamicPrefixes map[string]bool
 
 	// Per-method complexity state, set up by handleMethod around walkForCalls.
 	// metrics is nil outside a method body walk. loopDepth is the current loop
@@ -216,9 +285,12 @@ func (w *rubyWalker) walkStatement(node *sitter.Node) {
 		w.handleAssignment(node)
 	case "call":
 		w.handleBodyCall(node)
-		// Descend into a trailing do/brace block so declarations inside
-		// included/class_methods/concerning/configure blocks are captured (the
-		// former line-based scanner was block-agnostic).
+		// Executable call EDGES in this statement (macro args, qualified
+		// `Const.method` calls, calls inside blocks) are captured by the per-scope
+		// walkForCalls pass run in handleClass/handleModule/extractFileAST — not here
+		// — so assignments and every other statement kind are covered uniformly.
+		// This case still descends into a trailing do/brace block to capture nested
+		// DECLARATIONS (def/class/const inside included/class_methods/concerning blocks).
 		if body := blockBody(node); body != nil {
 			w.walkBody(body)
 		}
@@ -288,8 +360,11 @@ func (w *rubyWalker) handleModule(node *sitter.Node) {
 		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
 	})
 
-	w.push(rubyScope{name: name, kind: "module", visibility: "public", symFactIdx: len(w.out) - 1})
+	modIdx := len(w.out) - 1
+	w.push(rubyScope{name: name, kind: "module", visibility: "public", symFactIdx: modIdx})
 	w.walkBody(body)
+	// Capture executable calls made directly in the module body (see handleClass).
+	w.walkForCalls(body, modIdx, map[string]bool{}, nil)
 	w.pop()
 }
 
@@ -347,7 +422,12 @@ func (w *rubyWalker) handleClass(node *sitter.Node) {
 
 	w.push(rubyScope{name: name, kind: "class", visibility: "public", isModel: isModel,
 		isSerializer: isSerializerBase(superclass), symFactIdx: clsIdx})
-	w.walkBody(node.ChildByFieldName("body"))
+	body := node.ChildByFieldName("body")
+	w.walkBody(body)
+	// Capture executable calls made directly in the class body (assignment RHS,
+	// conditionals, hash/Proc literals, macro args) as uses of this class.
+	// walkForCalls returns at nested defs/classes, which get their own pass.
+	w.walkForCalls(body, clsIdx, map[string]bool{}, nil)
 	w.pop()
 }
 
@@ -355,7 +435,13 @@ func (w *rubyWalker) handleSingletonClass(node *sitter.Node) {
 	// class << self — methods inside become class (singleton) methods. The
 	// eigenclass entry carries no name and does not affect qualification.
 	w.push(rubyScope{name: "", kind: "eigenclass", visibility: "public", symFactIdx: -1})
-	w.walkBody(node.ChildByFieldName("body"))
+	body := node.ChildByFieldName("body")
+	w.walkBody(body)
+	// The eigenclass has no symbol fact (symFactIdx -1); attribute any executable
+	// calls in its body to the file-scope ref fact via bodyCallOwner.
+	if owner := w.bodyCallOwner(); owner >= 0 {
+		w.walkForCalls(body, owner, map[string]bool{}, nil)
+	}
 	w.pop()
 }
 
@@ -407,6 +493,10 @@ func (w *rubyWalker) handleMethod(node *sitter.Node, isClassMethod bool) {
 	// updates the emitted fact.
 	seen := make(map[string]bool)
 	locals := collectLocals(node, w.src)
+	// Default parameter values (`def f(x = self.class.foo)`) contain real call
+	// references. Walk them with metrics off (params are not the body, so they must
+	// not affect the complexity score); seen is shared so body calls still dedup.
+	w.walkForCalls(node.ChildByFieldName("parameters"), ownerIdx, seen, locals)
 	w.metrics = &rubyBodyMetrics{}
 	w.loopDepth = 0
 	w.selfName = fullName
@@ -469,6 +559,19 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 	switch node.Kind() {
 	case "method", "singleton_method", "class", "module", "singleton_class":
 		return
+	case "super":
+		// `super` invokes the same-named method in an ancestor (superclass or mixin),
+		// so it references that base method. Only meaningful inside a method body
+		// (metrics != nil), where selfShort is the enclosing method's bare name.
+		// Recurse afterwards to capture any calls in `super(args)`.
+		if w.metrics != nil && w.selfShort != "" {
+			w.addCall(ownerIdx, seen, w.selfShort)
+			w.recordCallMetrics(w.selfShort)
+		}
+		for i := uint(0); i < node.ChildCount(); i++ {
+			w.walkForCalls(node.Child(i), ownerIdx, seen, locals)
+		}
+		return
 	case "while", "until", "for", "while_modifier", "until_modifier":
 		// Syntactic loops: everything in the body runs per iteration.
 		if w.metrics != nil {
@@ -487,6 +590,16 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 	case "call":
 		method := node.ChildByFieldName("method")
 		recv := node.ChildByFieldName("receiver")
+		// Dynamic dispatch by LITERAL name — `obj.try(:foo)`, `send(:bar)`,
+		// `respond_to?(:baz)` — names the target method exactly, so record it as a
+		// call. Safe-nav `&.try` still exposes the `method` child. Distinct from an
+		// interpolated symbol (`:"report_#{x}"`), which is only a prefix hint.
+		if method != nil && rubyDispatchers[rubyText(method, w.src)] {
+			if nm := dispatchSymbolArg(node.ChildByFieldName("arguments"), w.src); nm != "" {
+				w.addCall(ownerIdx, seen, nm)
+				w.recordCallMetrics(nm)
+			}
+		}
 		if target := w.callTarget(node); target != "" {
 			w.addCall(ownerIdx, seen, target)
 			w.recordCallMetrics(target)
@@ -495,12 +608,33 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 				w.addCall(ownerIdx, seen, name)
 				w.recordCallMetrics(name)
 			}
-		} else if w.loopDepth > 0 && recv != nil && method != nil && method.Kind() == "identifier" {
-			// A no-arg instance call inside a loop that callTarget suppressed (e.g.
-			// the association read `u.posts` or a `record.reload`). It is not a graph
-			// edge, but its method name feeds the perf metric so the enterprise
-			// analyzer can flag lazy-loaded association / per-iteration I/O (N+1).
-			if name := rubyText(method, w.src); !rubyNonCalls[name] && !rubyCheapMethods[name] {
+		} else if recv != nil && method != nil && method.Kind() == "identifier" {
+			// A no-arg call on a receiver that callTarget suppressed. Bare target
+			// (no ".") -> no coupling impact. Skip keywords and common
+			// attribute/enumerable reads so a dead method sharing a name with
+			// `.name`/`.count`/`.first` isn't hidden.
+			name := rubyText(method, w.src)
+			switch {
+			case rubyNonCalls[name] || rubyCheapMethods[name]:
+				// keyword / cheap attribute-or-enumerable read — ignore
+			case recv.Kind() == "call" || strings.HasSuffix(name, "?") || strings.HasSuffix(name, "!") ||
+				(recv.Kind() == "identifier" && strings.Contains(name, "_")):
+				// Chained receiver (ActiveRecord scope / class-method chains
+				// `Model.scope1.scope2.final`, `assoc.class_method`, `x.class.method`),
+				// a predicate/bang call on ANY receiver (`viewer.rich?`, `x.save!`), OR a
+				// call on an identifier receiver (a local relation var OR a bare method)
+				// whose name is scope/class-method-like (has `_`) — e.g.
+				// `items.preload_relations`, `some_relation.pluck_job_id`. All are
+				// unambiguously method calls (an attribute read never ends in `?`/`!`,
+				// and a snake_case multi-word name is a scope/class-method, not a plain
+				// attribute). Single-word reads (`user.email`, `x.name`) stay out.
+				w.addCall(ownerIdx, seen, name)
+				w.recordCallMetrics(name)
+			case w.loopDepth > 0:
+				// A no-arg single-level read inside a loop (the association read
+				// `u.posts` or `record.reload`). It is not a graph edge, but its method
+				// name feeds the perf metric so the enterprise analyzer can flag
+				// lazy-loaded association / per-iteration I/O (N+1).
 				w.recordInLoopCall(name)
 			}
 		}
@@ -559,9 +693,179 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 			w.addCall(ownerIdx, seen, name)
 		}
 		return
+	case "delimited_symbol":
+		// An interpolated symbol `:"report_#{type}"` — the literal name of a method
+		// dispatched dynamically (public_send/send by computed name), which is not a
+		// resolvable call edge. Record its static prefix so the dead-code detector can
+		// treat same-prefix methods as used. Fall through to recurse: the interpolation
+		// (`#{...}`) may itself contain real calls.
+		if p := dynamicSymbolPrefix(node, w.src); p != "" {
+			if w.dynamicPrefixes == nil {
+				w.dynamicPrefixes = map[string]bool{}
+			}
+			w.dynamicPrefixes[p] = true
+		}
 	}
 	for i := uint(0); i < node.ChildCount(); i++ {
 		w.walkForCalls(node.Child(i), ownerIdx, seen, locals)
+	}
+}
+
+// dynamicSymbolPrefix returns the static literal prefix of an interpolated symbol
+// node (`:"report_#{type}"` -> "report_"), or "" when the node is not an
+// interpolated symbol or the prefix is not specific enough to be a useful dispatch
+// hint. The prefix is the string_content preceding the FIRST interpolation; it
+// qualifies only when at least one interpolation is present and the prefix is >= 4
+// chars ending in "_" (a word boundary), so generic 1-2 char stems don't over-match.
+func dynamicSymbolPrefix(node *sitter.Node, src []byte) string {
+	var prefix strings.Builder
+	sawInterp := false
+	for i := uint(0); i < node.ChildCount(); i++ {
+		c := node.Child(i)
+		switch c.Kind() {
+		case "interpolation":
+			sawInterp = true
+			i = node.ChildCount() // stop at the first interpolation
+		case "string_content":
+			prefix.WriteString(rubyText(c, src))
+		}
+	}
+	if !sawInterp {
+		return ""
+	}
+	p := prefix.String()
+	if len(p) >= 4 && strings.HasSuffix(p, "_") {
+		return p
+	}
+	return ""
+}
+
+// rubyDispatchers are methods that invoke (or reference) another method named by
+// their first argument: `obj.try(:foo)`, `send(:bar)`, `respond_to?(:baz)`,
+// `method(:qux)`. When that argument is a LITERAL symbol/string the target method
+// is statically known, so it is recorded as a call.
+var rubyDispatchers = map[string]bool{
+	"send": true, "public_send": true, "__send__": true,
+	"try": true, "try!": true, "respond_to?": true,
+	"method": true, "public_method": true,
+}
+
+// dispatchSymbolArg returns the method name named by the first argument of a
+// dispatcher call (`:foo` -> "foo", "foo" -> "foo"), or "" when the first argument
+// is not a literal symbol / static string (e.g. a variable or interpolated value).
+func dispatchSymbolArg(args *sitter.Node, src []byte) string {
+	if args == nil {
+		return ""
+	}
+	for i := uint(0); i < args.ChildCount(); i++ {
+		c := args.Child(i)
+		if !c.IsNamed() {
+			continue
+		}
+		switch c.Kind() {
+		case "simple_symbol":
+			return strings.TrimPrefix(rubyText(c, src), ":")
+		case "string":
+			// Static string only (no interpolation): the literal is the method name.
+			for j := uint(0); j < c.ChildCount(); j++ {
+				if c.Child(j).Kind() == "interpolation" {
+					return ""
+				}
+			}
+			return stringLiteralContent(c, src)
+		}
+		return "" // first positional arg is something else — not a literal name
+	}
+	return ""
+}
+
+// stringLiteralContent returns the concatenated string_content of a string node.
+func stringLiteralContent(node *sitter.Node, src []byte) string {
+	var b strings.Builder
+	for i := uint(0); i < node.ChildCount(); i++ {
+		if node.Child(i).Kind() == "string_content" {
+			b.WriteString(rubyText(node.Child(i), src))
+		}
+	}
+	return b.String()
+}
+
+// extractTestRefsAST parses a test/spec file and returns a single
+// facts.KindTestRef fact whose RelCalls relations name the production symbols the
+// test references. It reuses the production call-target conventions (callTarget +
+// bare receiver-less calls + bare constants) but descends through every scope —
+// a test file has no meaningful symbol surface of its own, and its references
+// live inside describe/context/it blocks and example methods. Local-variable
+// tracking is deliberately omitted (unlike walkForCalls): over-emitting a
+// reference can only ever keep a production symbol alive, never falsely flag one
+// dead, matching the orphan detector's conservative bias. Returns nil when the
+// file references nothing.
+func extractTestRefsAST(src []byte, relFile string) []facts.Fact {
+	parser := sitter.NewParser()
+	defer parser.Close()
+	if err := parser.SetLanguage(sitter.NewLanguage(ruby.Language())); err != nil {
+		return nil
+	}
+	tree := parser.Parse(src, nil)
+	defer tree.Close()
+
+	w := &rubyWalker{src: src, relFile: relFile, dir: filepath.Dir(relFile), fileRefIdx: -1}
+	seen := make(map[string]bool)
+	var rels []facts.Relation
+	add := func(target string) {
+		if target == "" || seen[target] {
+			return
+		}
+		seen[target] = true
+		rels = append(rels, facts.Relation{Kind: facts.RelCalls, Target: target})
+	}
+	w.walkTestRefs(tree.RootNode(), add)
+	if len(rels) == 0 {
+		return nil
+	}
+	return []facts.Fact{{
+		Kind:      facts.KindTestRef,
+		Name:      relFile,
+		File:      relFile,
+		Props:     map[string]any{"language": "ruby"},
+		Relations: rels,
+	}}
+}
+
+// walkTestRefs recurses through ALL named nodes of a test file, emitting a
+// RelCalls target for each qualified call, bare receiver-less call, and bare
+// constant — the same conventions as walkForCalls, minus the loop/complexity
+// metrics and the class/module/method early-returns (a spec's references live
+// inside those bodies).
+func (w *rubyWalker) walkTestRefs(node *sitter.Node, add func(string)) {
+	if node == nil || !node.IsNamed() {
+		return
+	}
+	switch node.Kind() {
+	case "call":
+		method := node.ChildByFieldName("method")
+		recv := node.ChildByFieldName("receiver")
+		if target := w.callTarget(node); target != "" {
+			add(target)
+		} else if recv == nil && method != nil && method.Kind() == "identifier" {
+			if name := rubyText(method, w.src); !rubyNonCalls[name] {
+				add(name)
+			}
+		}
+	case "identifier":
+		// A bare identifier: an arg-less method call or a local read. Emit unless a
+		// keyword/builtin; matching is conservative so over-emitting is safe.
+		if name := rubyText(node, w.src); name != "" && !rubyNonCalls[name] {
+			add(name)
+		}
+	case "constant", "scope_resolution":
+		if name := stripLeadingColons(rubyText(node, w.src)); name != "" && !rubyBuiltinConsts[name] {
+			add(name)
+		}
+		return // recorded whole; do not descend into scope_resolution segments
+	}
+	for i := uint(0); i < node.ChildCount(); i++ {
+		w.walkTestRefs(node.Child(i), add)
 	}
 }
 
@@ -731,11 +1035,30 @@ func (w *rubyWalker) callTarget(node *sitter.Node) string {
 	switch recv.Kind() {
 	case "constant", "scope_resolution":
 		return rubyText(recv, w.src) + "." + methodName
+	case "self":
+		// `self.foo` / `self.save!` — same-object dispatch. Emit the bare method
+		// name so the method is recorded as used (dead-code precision). Bare target
+		// (no "."), short-name matched, ignored by the coupling graph. `self.class`
+		// as a receiver-only expression emits nothing here; the OUTER call (handled
+		// in `case "call":` below) emits the real method.
+		if methodName == "class" {
+			return ""
+		}
+		return methodName
 	case "identifier":
 		if node.ChildByFieldName("arguments") != nil {
 			return rubyText(recv, w.src) + "." + methodName
 		}
 	case "call":
+		// `self.class.perform_when_readonly?`: the inner call is `self.class`
+		// (receiver kind "self", method "class"). Emit the OUTER method name, bare.
+		// No args-gate: the receiver is provably the class, so the name is provably
+		// a method (unlike a lowercase-variable attribute read).
+		if innerRecv := recv.ChildByFieldName("receiver"); innerRecv != nil && innerRecv.Kind() == "self" {
+			if innerMethod := recv.ChildByFieldName("method"); innerMethod != nil && rubyText(innerMethod, w.src) == "class" {
+				return methodName
+			}
+		}
 		// Chained call, e.g. Rails.logger.info(x): use the inner call's method
 		// name as a pseudo-receiver when it is a lowercase identifier.
 		inner := recv.ChildByFieldName("method")
@@ -813,11 +1136,32 @@ func (w *rubyWalker) handleBodyCall(node *sitter.Node) {
 	method := rubyText(node.ChildByFieldName("method"), w.src)
 	args := node.ChildByFieldName("arguments")
 
+	// Note: the macro NAME itself (`requires_login`, `cluster_concurrency`) is
+	// recorded as a use of the enclosing class by the walkForCalls pass that
+	// walkStatement now runs over every body-level call — so it is not repeated
+	// here (that would emit a duplicate RelCalls edge). This function only folds in
+	// the DSL's *symbol arguments* (callback/serializer method names), which
+	// walkForCalls does not special-case.
+
 	// Rails callback/validation DSL references methods by symbol literal
 	// (`before_action :authenticate_user!`, `validate :check`). Record each as a
 	// RelCalls edge on the enclosing class/module so callback-only methods are
 	// not mis-reported as dead code.
 	if rubyCallbackDSL[method] {
+		if cur := w.cur(); cur != nil && cur.symFactIdx >= 0 {
+			for _, name := range symbolArgs(args, w.src) {
+				w.addCallToFact(cur.symFactIdx, name)
+			}
+		}
+		return
+	}
+
+	// `delegate :a, :b, ..., to: X` generates methods that call each named method on
+	// the target — a real reference. Fold the delegated method names in as calls on
+	// the enclosing class so they are not mis-reported as dead. The `to:`/`prefix:`
+	// keyword args are `pair` nodes, so symbolArgs (direct simple_symbol children
+	// only) skips them.
+	if method == "delegate" {
 		if cur := w.cur(); cur != nil && cur.symFactIdx >= 0 {
 			for _, name := range symbolArgs(args, w.src) {
 				w.addCallToFact(cur.symFactIdx, name)
