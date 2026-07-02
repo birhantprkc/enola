@@ -50,7 +50,7 @@ func extractFileAST(src []byte, relFile string, isRails, exportedByPackwerk bool
 	// the file-scope ref fact. walkForCalls returns at nested defs/classes, which
 	// get their own pass.
 	if owner := w.bodyCallOwner(); owner >= 0 {
-		w.walkForCalls(root, owner, map[string]bool{}, nil)
+		w.walkScopeForCalls(root, owner, map[string]bool{}, nil)
 	}
 	// Attach any dynamic-dispatch prefixes discovered anywhere in the file to the
 	// file-scope fact so the collector can mark same-prefix methods as used.
@@ -101,7 +101,11 @@ type rubyScope struct {
 	moduleFunc   bool   // module_function active: subsequent defs are class methods
 	isModel      bool   // ActiveRecord model: associations/scopes/table_name apply
 	isSerializer bool   // ActiveModel::Serializer: attributes/associations back methods
-	symFactIdx   int    // index into w.out of this scope's class/module symbol fact, or -1
+	// hasInstanceMethod records that this scope directly defined a `def foo`
+	// (instance, not `def self.x`) method. For a module this signals a mixin
+	// (meant to be included), which makes the module abstract for package metrics.
+	hasInstanceMethod bool
+	symFactIdx        int // index into w.out of this scope's class/module symbol fact, or -1
 }
 
 type rubyWalker struct {
@@ -123,6 +127,14 @@ type rubyWalker struct {
 	// dynamic dispatch (public_send/send by computed name), letting the dead-code
 	// detector treat same-prefix methods as used. File-global; nil until first hit.
 	dynamicPrefixes map[string]bool
+
+	// pendingStrPrefixes / sawDispatcher gate interpolated-STRING prefixes
+	// (`"present_#{idx}"`) per scope: unlike symbols, snake_case strings are commonly
+	// cache/Redis keys, so a string prefix is committed to dynamicPrefixes only when
+	// the same scope also invokes a dispatcher (send/public_send/__send__/try). Reset
+	// at each scope-entry walk (walkScopeForCalls / handleMethod) and committed after.
+	pendingStrPrefixes map[string]bool
+	sawDispatcher      bool
 
 	// Per-method complexity state, set up by handleMethod around walkForCalls.
 	// metrics is nil outside a method body walk. loopDepth is the current loop
@@ -150,6 +162,14 @@ type rubyBodyMetrics struct {
 // File.open, …) run their block once and are deliberately not treated as loops.
 // Aggregate-or-iterate methods (count/sum/find/all?…) are safe to include
 // because a block is required before any of these counts as a loop.
+//
+// find_in_batches / in_batches are deliberately excluded: their block runs once
+// per *batch* (an array), so the real per-element loop is the inner .each/.map
+// over that batch. Counting the batch block as a loop as well double-counts and
+// mislabels a single O(n) pass as O(n²). (find_each yields individual elements
+// and is a genuine per-element loop, so it stays.) Both names remain in the
+// enterprise expensiveMethods gate, so a batch scan nested inside another loop is
+// still flagged by name — only the spurious extra depth is dropped.
 var rubyIterators = map[string]bool{
 	"each": true, "each_with_index": true, "each_with_object": true,
 	"each_pair": true, "each_key": true, "each_value": true,
@@ -159,7 +179,7 @@ var rubyIterators = map[string]bool{
 	"flat_map": true, "select": true, "select!": true, "filter": true,
 	"filter_map": true, "reject": true, "reject!": true,
 	"detect": true, "find": true, "find_all": true, "find_index": true,
-	"find_each": true, "find_in_batches": true, "in_batches": true,
+	"find_each": true,
 	"reduce": true, "inject": true, "min_by": true, "max_by": true,
 	"sort_by": true, "group_by": true, "partition": true, "chunk_while": true,
 	"zip": true, "cycle": true, "times": true, "upto": true, "downto": true,
@@ -175,6 +195,21 @@ func (w *rubyWalker) recordCallMetrics(target string) {
 	}
 	if target == w.selfShort || target == w.selfName || target == "self."+w.selfShort {
 		w.metrics.recursive = true
+	}
+	w.recordInLoopCall(target)
+}
+
+// recordSelfAwareMetrics records a call target's metrics but only counts it as
+// recursion when the call dispatches to the SAME object as the enclosing method —
+// a receiverless call or a plain `self.foo`. An explicit receiver (`x.foo`,
+// `self.class.foo`, `obj.try(:foo)`) targets a different object or a sibling
+// class/instance method, so it feeds the in-loop N+1 signal but never the recursion
+// flag. (A `Const.foo` that resolves to this exact method is handled by the caller
+// via a selfName match before reaching here.)
+func (w *rubyWalker) recordSelfAwareMetrics(target string, recv *sitter.Node) {
+	if recv == nil || recv.Kind() == "self" {
+		w.recordCallMetrics(target)
+		return
 	}
 	w.recordInLoopCall(target)
 }
@@ -344,9 +379,15 @@ func (w *rubyWalker) handleModule(node *sitter.Node) {
 		"symbol_kind": facts.SymbolInterface,
 		"exported":    w.exportedByPackwerk,
 		"language":    "ruby",
+		// Package-metrics abstractness: a Ruby module is only "abstract" when it is
+		// a mixin (defines instance methods or is an ActiveSupport::Concern). Most
+		// Rails modules are pure namespaces (`module Api; class Foo`), so default to
+		// concrete and promote to abstract below once the body is known.
+		"abstract": false,
 	}
 	if bodyHasConcern(body, w.src) {
 		props["concern"] = true
+		props["abstract"] = true // Concern = behavior mixed into includers
 	}
 	if w.isRails {
 		props["framework"] = "rails"
@@ -364,7 +405,13 @@ func (w *rubyWalker) handleModule(node *sitter.Node) {
 	w.push(rubyScope{name: name, kind: "module", visibility: "public", symFactIdx: modIdx})
 	w.walkBody(body)
 	// Capture executable calls made directly in the module body (see handleClass).
-	w.walkForCalls(body, modIdx, map[string]bool{}, nil)
+	w.walkScopeForCalls(body, modIdx, map[string]bool{}, nil)
+	// A module that defined instance methods during the walk is a mixin → abstract.
+	// props is shared by reference with the fact appended above, so this updates it
+	// in place (same mechanism handleMethod uses for cyclomatic).
+	if s := w.cur(); s != nil && s.hasInstanceMethod {
+		props["abstract"] = true
+	}
 	w.pop()
 }
 
@@ -427,7 +474,7 @@ func (w *rubyWalker) handleClass(node *sitter.Node) {
 	// Capture executable calls made directly in the class body (assignment RHS,
 	// conditionals, hash/Proc literals, macro args) as uses of this class.
 	// walkForCalls returns at nested defs/classes, which get their own pass.
-	w.walkForCalls(body, clsIdx, map[string]bool{}, nil)
+	w.walkScopeForCalls(body, clsIdx, map[string]bool{}, nil)
 	w.pop()
 }
 
@@ -440,7 +487,7 @@ func (w *rubyWalker) handleSingletonClass(node *sitter.Node) {
 	// The eigenclass has no symbol fact (symFactIdx -1); attribute any executable
 	// calls in its body to the file-scope ref fact via bodyCallOwner.
 	if owner := w.bodyCallOwner(); owner >= 0 {
-		w.walkForCalls(body, owner, map[string]bool{}, nil)
+		w.walkScopeForCalls(body, owner, map[string]bool{}, nil)
 	}
 	w.pop()
 }
@@ -451,6 +498,16 @@ func (w *rubyWalker) handleMethod(node *sitter.Node, isClassMethod bool) {
 	name := rubyText(node.ChildByFieldName("name"), w.src)
 	if name == "" {
 		return
+	}
+
+	// An instance method (`def foo`, not `def self.x`) directly in a module body
+	// marks that module as a mixin — behavior meant to be included into another
+	// type — which makes it abstract for package metrics. Fetch the scope fresh:
+	// push() can reallocate scopeStack, so a cached pointer would be stale.
+	if !isClassMethod {
+		if s := w.cur(); s != nil && s.kind == "module" {
+			s.hasInstanceMethod = true
+		}
 	}
 
 	scope := w.scopeQual()
@@ -493,6 +550,10 @@ func (w *rubyWalker) handleMethod(node *sitter.Node, isClassMethod bool) {
 	// updates the emitted fact.
 	seen := make(map[string]bool)
 	locals := collectLocals(node, w.src)
+	// The method scope (parameters + body) gates interpolated-string prefixes: reset
+	// the tentative state before the walks and commit after (see commitPendingStrPrefixes).
+	w.pendingStrPrefixes = nil
+	w.sawDispatcher = false
 	// Default parameter values (`def f(x = self.class.foo)`) contain real call
 	// references. Walk them with metrics off (params are not the body, so they must
 	// not affect the complexity score); seen is shared so body calls still dedup.
@@ -516,6 +577,120 @@ func (w *rubyWalker) handleMethod(node *sitter.Node, isClassMethod bool) {
 		props["recursive_self"] = true
 	}
 	w.metrics = nil
+	w.commitPendingStrPrefixes()
+}
+
+// isClassHoldingReceiver reports whether a call receiver is a variable named by the
+// Ruby idiom for a Class object (`klass`/`clazz`/`klazz`, plain or instance var). A
+// method call on such a receiver is a class-method dispatch (`klass.inline`), not an
+// attribute read, so it is recorded regardless of the method name.
+func isClassHoldingReceiver(recv *sitter.Node, src []byte) bool {
+	if recv == nil {
+		return false
+	}
+	switch recv.Kind() {
+	case "identifier", "instance_variable":
+		switch rubyText(recv, src) {
+		case "klass", "clazz", "klazz", "@klass", "@clazz", "@klazz":
+			return true
+		}
+	}
+	return false
+}
+
+// isVarReceiver reports whether a call receiver node kind is a simple variable
+// reference — a local/method identifier or an instance/class/global variable.
+// A no-arg, underscored call on such a receiver (`items.preload_relations`,
+// `@klass.bo_search_fields`) is a scope/class-method invocation, not an attribute
+// read, so it is recorded as a reference.
+func isVarReceiver(kind string) bool {
+	switch kind {
+	case "identifier", "instance_variable", "class_variable", "global_variable":
+		return true
+	}
+	return false
+}
+
+// constantBoundReceiver reports whether an iterator's receiver is provably bounded by
+// a compile-time constant, so the loop runs a fixed number of times regardless of the
+// method's input (O(1) in n): an integer literal (`6.times`), a collection literal
+// (`[…].each`, `{…}.each`, `%w[…]`, `%i[…]`), or an ALL-CAPS data constant
+// (`STOP_CHARS.any?`). Mixed-case constants (classes like `User`) are excluded — a
+// `.each` on a class/relation is not a bounded literal.
+func constantBoundReceiver(recv *sitter.Node, src []byte) bool {
+	if recv == nil {
+		return false
+	}
+	switch recv.Kind() {
+	case "integer", "array", "hash", "string_array", "symbol_array":
+		return true
+	case "constant":
+		return isScreamingSnake(rubyText(recv, src))
+	case "call":
+		// A trailing size-preserving/reducing chain method keeps a bounded base
+		// bounded: `[a,b].compact.all?`, `%w[x y].map { … }.each`. Unwrap it and
+		// re-check the inner receiver. Size-expanding ops (product/cycle/flat_map)
+		// are excluded, so this never turns an unbounded source into "bounded".
+		if m := recv.ChildByFieldName("method"); m != nil && chainPreservesBound[rubyText(m, src)] {
+			return constantBoundReceiver(recv.ChildByFieldName("receiver"), src)
+		}
+	}
+	return false
+}
+
+// chainPreservesBound are Enumerable methods that never grow a collection beyond its
+// input size, so a bounded literal/constant piped through them stays bounded.
+var chainPreservesBound = map[string]bool{
+	"compact": true, "uniq": true, "flatten": true, "sort": true, "sort_by": true,
+	"reverse": true, "to_a": true, "dup": true, "freeze": true,
+	"map": true, "collect": true, "select": true, "filter": true, "reject": true,
+	"first": true, "take": true,
+}
+
+// isScreamingSnake reports whether s is a SCREAMING_SNAKE_CASE data constant — only
+// uppercase letters, digits, and underscores, with at least one letter.
+func isScreamingSnake(s string) bool {
+	hasLetter := false
+	for _, r := range s {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			hasLetter = true
+		case r >= '0' && r <= '9', r == '_':
+		default:
+			return false
+		}
+	}
+	return hasLetter
+}
+
+// walkScopeForCalls runs walkForCalls over one scope (a class/module body or the
+// top-level program) with the per-scope interpolated-string-prefix gate: it resets
+// the tentative state, walks, then commits any pending string prefixes iff the scope
+// invoked a dispatcher. (Method bodies are gated inline in handleMethod, which spans
+// the parameter + body walks.)
+func (w *rubyWalker) walkScopeForCalls(node *sitter.Node, ownerIdx int, seen, locals map[string]bool) {
+	w.pendingStrPrefixes = nil
+	w.sawDispatcher = false
+	w.walkForCalls(node, ownerIdx, seen, locals)
+	w.commitPendingStrPrefixes()
+}
+
+// commitPendingStrPrefixes promotes the tentative interpolated-string dispatch
+// prefixes gathered in the current scope into the committed set — but only if the
+// scope also invoked a dispatcher (send/public_send/…). Then it clears the per-scope
+// state. This keeps `"present_#{idx}"` (in a method that calls send) while dropping
+// cache/Redis key strings like `"fetch_#{id}"` in non-dispatching methods.
+func (w *rubyWalker) commitPendingStrPrefixes() {
+	if w.sawDispatcher {
+		for p := range w.pendingStrPrefixes {
+			if w.dynamicPrefixes == nil {
+				w.dynamicPrefixes = map[string]bool{}
+			}
+			w.dynamicPrefixes[p] = true
+		}
+	}
+	w.pendingStrPrefixes = nil
+	w.sawDispatcher = false
 }
 
 // walkForCalls recursively scans a method body for call expressions and appends
@@ -563,10 +738,13 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 		// `super` invokes the same-named method in an ancestor (superclass or mixin),
 		// so it references that base method. Only meaningful inside a method body
 		// (metrics != nil), where selfShort is the enclosing method's bare name.
-		// Recurse afterwards to capture any calls in `super(args)`.
+		// Record the call edge (dead-code marks the ancestor method used) but NOT the
+		// complexity metrics: `super` climbs the inheritance chain and terminates —
+		// it is not self-recursion, and treating it as such was the dominant recursion
+		// false positive (every override with a `super` call). Recurse afterwards to
+		// capture any calls in `super(args)`.
 		if w.metrics != nil && w.selfShort != "" {
 			w.addCall(ownerIdx, seen, w.selfShort)
-			w.recordCallMetrics(w.selfShort)
 		}
 		for i := uint(0); i < node.ChildCount(); i++ {
 			w.walkForCalls(node.Child(i), ownerIdx, seen, locals)
@@ -595,14 +773,28 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 		// call. Safe-nav `&.try` still exposes the `method` child. Distinct from an
 		// interpolated symbol (`:"report_#{x}"`), which is only a prefix hint.
 		if method != nil && rubyDispatchers[rubyText(method, w.src)] {
+			w.sawDispatcher = true // gates tentative interpolated-string prefixes
 			if nm := dispatchSymbolArg(node.ChildByFieldName("arguments"), w.src); nm != "" {
 				w.addCall(ownerIdx, seen, nm)
-				w.recordCallMetrics(nm)
+				// `obj.try(:foo)` dispatches to a DIFFERENT object; only a
+				// receiverless/self dispatch (`send(:foo)`, `self.try(:foo)`) can recurse.
+				w.recordSelfAwareMetrics(nm, recv)
 			}
 		}
 		if target := w.callTarget(node); target != "" {
 			w.addCall(ownerIdx, seen, target)
-			w.recordCallMetrics(target)
+			// Recursion only for a same-object self dispatch. callTarget returns a bare
+			// method name for both plain `self.foo` (recv kind "self" — genuine
+			// recursion) and `self.class.foo` (recv kind "call" — the instance method
+			// calling its sibling CLASS method, NOT recursion), so the target string
+			// alone can't tell them apart; gate on the receiver. An explicit
+			// `Const.foo` that resolves to this exact method (selfName) is real
+			// class-method self-recursion and is preserved.
+			if target == w.selfName {
+				w.recordCallMetrics(target)
+			} else {
+				w.recordSelfAwareMetrics(target, recv)
+			}
 		} else if recv == nil && method != nil && method.Kind() == "identifier" {
 			if name := rubyText(method, w.src); !rubyNonCalls[name] {
 				w.addCall(ownerIdx, seen, name)
@@ -618,18 +810,27 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 			case rubyNonCalls[name] || rubyCheapMethods[name]:
 				// keyword / cheap attribute-or-enumerable read — ignore
 			case recv.Kind() == "call" || strings.HasSuffix(name, "?") || strings.HasSuffix(name, "!") ||
-				(recv.Kind() == "identifier" && strings.Contains(name, "_")):
+				(isVarReceiver(recv.Kind()) && strings.Contains(name, "_")) ||
+				isClassHoldingReceiver(recv, w.src):
 				// Chained receiver (ActiveRecord scope / class-method chains
 				// `Model.scope1.scope2.final`, `assoc.class_method`, `x.class.method`),
 				// a predicate/bang call on ANY receiver (`viewer.rich?`, `x.save!`), OR a
-				// call on an identifier receiver (a local relation var OR a bare method)
-				// whose name is scope/class-method-like (has `_`) — e.g.
+				// call on a variable receiver — a local, a bare method, or an
+				// instance/class/global variable (`@klass.bo_search_fields`) — whose name
+				// is scope/class-method-like (has `_`) — e.g.
 				// `items.preload_relations`, `some_relation.pluck_job_id`. All are
 				// unambiguously method calls (an attribute read never ends in `?`/`!`,
 				// and a snake_case multi-word name is a scope/class-method, not a plain
 				// attribute). Single-word reads (`user.email`, `x.name`) stay out.
+				//
+				// Record the call edge and (if in a loop) the in-loop N+1 signal, but
+				// NOT recursion: this branch always has an explicit, non-self receiver
+				// (self-receiver calls resolve via callTarget above), so a call whose
+				// name matches the enclosing method is a same-named call on a DIFFERENT
+				// object — the SimpleDelegator/decorator pattern (`@delegate.render`,
+				// `new.call`), not self-recursion.
 				w.addCall(ownerIdx, seen, name)
-				w.recordCallMetrics(name)
+				w.recordInLoopCall(name)
 			case w.loopDepth > 0:
 				// A no-arg single-level read inside a loop (the association read
 				// `u.posts` or `record.reload`). It is not a graph edge, but its method
@@ -644,10 +845,15 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 		// the Python comprehension handling).
 		block := node.ChildByFieldName("block")
 		isIter := block != nil && method != nil && rubyIterators[rubyText(method, w.src)]
+		// A constant-bounded iterator (`6.times`, `[…].each`, `STOP_CHARS.any?`) runs a
+		// fixed number of times regardless of the method's input, so it still counts as
+		// a loop (cyclomatic) but must not add scaling loop DEPTH — otherwise a literal
+		// or constant inner/outer loop inflates a genuine O(n) into a false O(n²)/O(n³).
+		bounded := isIter && constantBoundReceiver(recv, w.src)
 		if isIter && w.metrics != nil {
 			w.metrics.loopCount++
 			w.metrics.decisions++
-			if w.loopDepth+1 > w.metrics.loopDepth {
+			if !bounded && w.loopDepth+1 > w.metrics.loopDepth {
 				w.metrics.loopDepth = w.loopDepth + 1
 			}
 		}
@@ -660,6 +866,13 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 				continue
 			}
 			if isIter && c.StartByte() == block.StartByte() && c.EndByte() == block.EndByte() {
+				if bounded {
+					// Fixed iteration count: walk the block at the SAME depth so any
+					// inner scaling loop or per-iteration I/O is measured against the
+					// real input, not multiplied by a constant.
+					w.walkForCalls(c, ownerIdx, seen, locals)
+					continue
+				}
 				w.loopDepth++
 				w.walkForCalls(c, ownerIdx, seen, locals)
 				w.loopDepth--
@@ -694,16 +907,27 @@ func (w *rubyWalker) walkForCalls(node *sitter.Node, ownerIdx int, seen, locals 
 		}
 		return
 	case "delimited_symbol":
-		// An interpolated symbol `:"report_#{type}"` — the literal name of a method
-		// dispatched dynamically (public_send/send by computed name), which is not a
-		// resolvable call edge. Record its static prefix so the dead-code detector can
-		// treat same-prefix methods as used. Fall through to recurse: the interpolation
-		// (`#{...}`) may itself contain real calls.
+		// An interpolated symbol `:"report_#{type}"` — a method name computed for
+		// dynamic dispatch (public_send/send). Record its static prefix so the
+		// dead-code detector treats same-prefix methods as used. Symbols are captured
+		// unconditionally (they are almost always method names). Fall through to
+		// recurse: the interpolation may itself contain real calls.
 		if p := dynamicSymbolPrefix(node, w.src); p != "" {
 			if w.dynamicPrefixes == nil {
 				w.dynamicPrefixes = map[string]bool{}
 			}
 			w.dynamicPrefixes[p] = true
+		}
+	case "string":
+		// An interpolated string `"present_#{idx}"` may be a computed dispatch name
+		// too, but snake_case strings are commonly cache/Redis keys — so record its
+		// prefix only TENTATIVELY, committed after the scope walk iff the scope also
+		// invokes a dispatcher (see commitPendingStrPrefixes). Recurse for nested calls.
+		if p := dynamicSymbolPrefix(node, w.src); p != "" {
+			if w.pendingStrPrefixes == nil {
+				w.pendingStrPrefixes = map[string]bool{}
+			}
+			w.pendingStrPrefixes[p] = true
 		}
 	}
 	for i := uint(0); i < node.ChildCount(); i++ {
@@ -801,35 +1025,7 @@ func stringLiteralContent(node *sitter.Node, src []byte) string {
 // dead, matching the orphan detector's conservative bias. Returns nil when the
 // file references nothing.
 func extractTestRefsAST(src []byte, relFile string) []facts.Fact {
-	parser := sitter.NewParser()
-	defer parser.Close()
-	if err := parser.SetLanguage(sitter.NewLanguage(ruby.Language())); err != nil {
-		return nil
-	}
-	tree := parser.Parse(src, nil)
-	defer tree.Close()
-
-	w := &rubyWalker{src: src, relFile: relFile, dir: filepath.Dir(relFile), fileRefIdx: -1}
-	seen := make(map[string]bool)
-	var rels []facts.Relation
-	add := func(target string) {
-		if target == "" || seen[target] {
-			return
-		}
-		seen[target] = true
-		rels = append(rels, facts.Relation{Kind: facts.RelCalls, Target: target})
-	}
-	w.walkTestRefs(tree.RootNode(), add)
-	if len(rels) == 0 {
-		return nil
-	}
-	return []facts.Fact{{
-		Kind:      facts.KindTestRef,
-		Name:      relFile,
-		File:      relFile,
-		Props:     map[string]any{"language": "ruby"},
-		Relations: rels,
-	}}
+	return refsFromRuby(src, relFile, facts.KindTestRef)
 }
 
 // walkTestRefs recurses through ALL named nodes of a test file, emitting a
@@ -974,8 +1170,36 @@ func collectLocals(method *sitter.Node, src []byte) map[string]bool {
 	if params := method.ChildByFieldName("parameters"); params != nil {
 		collectIdentifiers(params, src, locals)
 	}
-	collectAssignTargets(method.ChildByFieldName("body"), src, locals)
+	body := method.ChildByFieldName("body")
+	collectAssignTargets(body, src, locals)
+	// Block parameters (`things.each do |user| … end`, `{ |k, v| … }`) are locals
+	// too — and, being the most common identifiers inside loops, are the main
+	// source of false N+1 findings when their name coincides with an ActiveRecord
+	// association (`user`, `hood_message`, …). collectLocals is method-wide, so a
+	// block var here shadows a same-named bare method call elsewhere in the method;
+	// that over-approximation is safe (it only suppresses over-emission) and matches
+	// how assignment targets are already collected.
+	collectBlockParams(body, src, locals)
 	return locals
+}
+
+// collectBlockParams adds every block-parameter identifier in a subtree to out.
+// The parameters field of a block/do_block is a block_parameters node whose
+// identifiers (including those nested in destructured/splat/keyword params) name
+// the block's locals; collectIdentifiers gathers them all.
+func collectBlockParams(node *sitter.Node, src []byte, out map[string]bool) {
+	if node == nil {
+		return
+	}
+	switch node.Kind() {
+	case "block", "do_block":
+		if params := node.ChildByFieldName("parameters"); params != nil {
+			collectIdentifiers(params, src, out)
+		}
+	}
+	for i := uint(0); i < node.ChildCount(); i++ {
+		collectBlockParams(node.Child(i), src, out)
+	}
 }
 
 // collectIdentifiers adds every identifier name in a subtree to out.

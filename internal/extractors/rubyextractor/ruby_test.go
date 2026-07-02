@@ -599,6 +599,10 @@ end
 	if c, _ := mod.Props["concern"].(bool); !c {
 		t.Errorf("Trackable should be flagged concern:true; props = %v", mod.Props)
 	}
+	// A Concern is a mixin → abstract for package metrics.
+	if ab, _ := mod.Props["abstract"].(bool); !ab {
+		t.Errorf("Concern Trackable should be abstract:true; props = %v", mod.Props)
+	}
 	// extend ActiveSupport::Concern must not be emitted as a mixin dependency.
 	for _, f := range result {
 		if f.Kind == facts.KindDependency {
@@ -608,6 +612,64 @@ end
 				}
 			}
 		}
+	}
+}
+
+// moduleAbstract returns the `abstract` prop of the named module symbol.
+func moduleAbstract(t *testing.T, result []facts.Fact, name string) bool {
+	t.Helper()
+	mod, ok := symbolsByName(result)[name]
+	if !ok {
+		t.Fatalf("module %q not found among symbols", name)
+	}
+	ab, _ := mod.Props["abstract"].(bool)
+	return ab
+}
+
+func TestAST_ModuleAbstractness(t *testing.T) {
+	// A namespace module (only nested class/module defs) is concrete.
+	nsResult := extractFileAST([]byte("module Api\n  module V2\n    class Foo\n    end\n  end\nend\n"),
+		"app/controllers/api/v2/foo.rb", true, false)
+	if moduleAbstract(t, nsResult, "Api") {
+		t.Error("namespace module Api should be abstract:false")
+	}
+	if moduleAbstract(t, nsResult, "Api::V2") {
+		t.Error("namespace module Api::V2 should be abstract:false")
+	}
+
+	// A mixin module (defines an instance method) is abstract.
+	mixinResult := extractFileAST([]byte("module Greetable\n  def greet\n    \"hi\"\n  end\nend\n"),
+		"app/models/concerns/greetable.rb", true, false)
+	if !moduleAbstract(t, mixinResult, "Greetable") {
+		t.Error("mixin module Greetable should be abstract:true")
+	}
+
+	// A utility module with only class methods (`def self.x`) is concrete.
+	utilResult := extractFileAST([]byte("module PhoneUtils\n  def self.format(n)\n    n\n  end\nend\n"),
+		"lib/phone_utils.rb", false, false)
+	if moduleAbstract(t, utilResult, "PhoneUtils") {
+		t.Error("class-method-only module PhoneUtils should be abstract:false")
+	}
+
+	// module_function makes subsequent defs class methods → still concrete.
+	mfResult := extractFileAST([]byte("module M\n  module_function\n  def helper\n    1\n  end\nend\n"),
+		"lib/m.rb", false, false)
+	if moduleAbstract(t, mfResult, "M") {
+		t.Error("module_function module M should be abstract:false")
+	}
+
+	// A mixed module (nested class AND an instance method) is abstract — the
+	// instance method wins.
+	mixedResult := extractFileAST([]byte("module M\n  class Inner\n  end\n  def instance_m\n    1\n  end\nend\n"),
+		"app/services/m.rb", false, false)
+	if !moduleAbstract(t, mixedResult, "M") {
+		t.Error("mixed module M with an instance method should be abstract:true")
+	}
+
+	// An empty module is a pure namespace → concrete.
+	emptyResult := extractFileAST([]byte("module Empty\nend\n"), "lib/empty.rb", false, false)
+	if moduleAbstract(t, emptyResult, "Empty") {
+		t.Error("empty module Empty should be abstract:false")
 	}
 }
 
@@ -1403,5 +1465,119 @@ end
 	meth := symbolsByName(result)["FeatureFlagsFinder#execute"]
 	if !hasCall(meth, "preload_relations") {
 		t.Errorf("scope call on a local relation var should record preload_relations; relations = %v", meth.Relations)
+	}
+}
+
+// TestExtractFile_IvarUnderscoredCall checks that an underscored method call on an
+// instance/class variable receiver (`@klass.bo_search_fields`) is recorded, while a
+// single-word read on an ivar (`@user.name`) is not.
+func TestExtractFile_IvarUnderscoredCall(t *testing.T) {
+	src := `class BoSearchService
+  def search
+    @klass.bo_search_fields
+    @@config.some_setting
+    @user.name
+  end
+end
+`
+	result := extractFileAST([]byte(src), "app/services/bo_search_service.rb", true, true)
+	meth := symbolsByName(result)["BoSearchService#search"]
+	for _, want := range []string{"bo_search_fields", "some_setting"} {
+		if !hasCall(meth, want) {
+			t.Errorf("underscored call on ivar/cvar receiver should record %s; relations = %v", want, meth.Relations)
+		}
+	}
+	if hasCall(meth, "name") {
+		t.Errorf("single-word read @user.name must not be recorded; relations = %v", meth.Relations)
+	}
+}
+
+// TestExtractFile_KlassReceiverDispatch checks that a method call on a klass-named
+// receiver (the Ruby idiom for a Class var) is recorded as a class-method dispatch
+// regardless of the method name, while cheap reads are not.
+func TestExtractFile_KlassReceiverDispatch(t *testing.T) {
+	src := `class Dispatcher
+  def run
+    registry.each do |klass|
+      klass.inline
+      klass.name
+    end
+    @klass.trigger_now
+  end
+end
+`
+	result := extractFileAST([]byte(src), "app/services/dispatcher.rb", true, true)
+	meth := symbolsByName(result)["Dispatcher#run"]
+	for _, want := range []string{"inline", "trigger_now"} {
+		if !hasCall(meth, want) {
+			t.Errorf("klass-receiver dispatch should record %s; relations = %v", want, meth.Relations)
+		}
+	}
+	if hasCall(meth, "name") {
+		t.Errorf("cheap klass.name must not be recorded; relations = %v", meth.Relations)
+	}
+}
+
+// TestExtractFile_InterpolatedStringPrefix checks that an interpolated string used
+// as a computed dispatch name records its prefix, while i18n-key and message strings
+// (`.`/space endings) do not.
+func TestExtractFile_InterpolatedStringPrefix(t *testing.T) {
+	src := `class ComposeResults
+  def handle(hit)
+    model_to_present = "present_#{hit['_index'].singularize}"
+    title = "reports.#{hit['type']}.title"
+    msg = "Hello #{hit['name']}"
+    SearchPresenter.send(model_to_present, hit)
+  end
+end
+`
+	result := extractFileAST([]byte(src), "app/services/es/compose_results.rb", true, true)
+	got := fileRefPrefixes(result)
+	has := func(p string) bool {
+		for _, x := range got {
+			if x == p {
+				return true
+			}
+		}
+		return false
+	}
+	if !has("present_") {
+		t.Errorf("expected dynamic_send_prefixes to contain present_ (method dispatches); got %v", got)
+	}
+	if has("reports.") || has("Hello ") {
+		t.Errorf("i18n/message string prefixes must be gated out; got %v", got)
+	}
+}
+
+// TestExtractFile_StringPrefixGatedOnDispatcher checks that an interpolated-string
+// prefix is NOT recorded when the enclosing scope invokes no dispatcher (so cache/key
+// strings like `"fetch_#{id}"` don't hide genuine orphans), while an interpolated
+// SYMBOL is still recorded unconditionally.
+func TestExtractFile_StringPrefixGatedOnDispatcher(t *testing.T) {
+	src := `class Keys
+  def cache_key(id)
+    "fetch_#{id}"
+  end
+  def dispatch_by_symbol(type)
+    m = :"report_#{type}"
+    public_send(m)
+  end
+end
+`
+	result := extractFileAST([]byte(src), "app/services/keys.rb", true, true)
+	got := fileRefPrefixes(result)
+	has := func(p string) bool {
+		for _, x := range got {
+			if x == p {
+				return true
+			}
+		}
+		return false
+	}
+	if has("fetch_") {
+		t.Errorf("string prefix in a non-dispatching method must NOT be recorded; got %v", got)
+	}
+	if !has("report_") {
+		t.Errorf("interpolated symbol prefix should be recorded unconditionally; got %v", got)
 	}
 }
