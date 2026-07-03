@@ -73,8 +73,11 @@ func (e *SwiftExtractor) Extract(ctx context.Context, repoPath string, files []s
 	isiOS := detectiOSProject(repoPath)
 
 	modules := make(map[string]bool)
-	typeIndex := make(map[string]string) // simple type name -> module (directory)
-	dirToFile := make(map[string]string) // module dir -> a representative source file
+	typeIndex := make(map[string]string)     // simple type name -> module identity
+	typeAmbiguous := make(map[string]bool)   // simple type name -> defined in >1 module
+	methodIndex := make(map[string][]string) // method short name -> qualified dir.Type.method names
+	funcIndex := make(map[string][]string)   // top-level function short name -> qualified dir.func names
+	dirToFile := make(map[string]string)     // module identity -> a representative source file
 	var swiftFiles []string
 	var manifestFiles []string // Package.swift manifests, parsed after the walk
 
@@ -92,24 +95,54 @@ func (e *SwiftExtractor) Extract(ctx context.Context, repoPath string, files []s
 		swiftFiles = append(swiftFiles, relFile)
 	}
 
+	// Resolve modules at the target level. Parse the XcodeGen project.yml and the
+	// SPM manifest target roots up-front, then build a resolver mapping each file
+	// to its owning target module. Both signals are additive: when neither covers
+	// a file, moduleForFile falls back to the file's leaf directory, preserving
+	// behaviour for loose Swift projects.
+	xp, xerr := parseXcodeGenProject(repoPath, projectManifestName)
+	if xerr != nil {
+		log.Printf("[swift-extractor] project.yml parse error: %v", xerr)
+	}
+	spmRoots := map[string]string{}
+	for _, relFile := range manifestFiles {
+		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
+		if err != nil {
+			continue
+		}
+		for name, dir := range manifestTargetRoots(src, relFile) {
+			spmRoots[name] = dir
+		}
+	}
+	resolver := buildModuleResolver(xp, spmRoots)
+	moduleForFile := func(relFile string) string {
+		if id, ok := resolver.moduleFor(relFile); ok {
+			return id
+		}
+		return filepath.Dir(relFile)
+	}
+
 	// extractFileAST/extractURLSessionFacts are pure; parse the source files in
 	// parallel. The indices below are rebuilt by iterating the per-file results in
 	// file order, so modules, dirToFile and typeIndex match a serial run exactly.
+	// moduleForFile is pure and order-independent, so the identity a file resolves
+	// to is the same in the parallel walk and the serial fold below.
 	perFileFacts := parallel.MapFiles(ctx, swiftFiles, func(relFile string) []facts.Fact {
 		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
 		if err != nil {
 			log.Printf("[swift-extractor] error reading %s: %v", relFile, err)
 			return nil
 		}
-		ff := extractFileAST(src, relFile, isiOS)
-		return append(ff, extractURLSessionFacts(src, relFile)...)
+		dir := moduleForFile(relFile)
+		ff := extractFileASTWithDir(src, relFile, isiOS, dir)
+		return append(ff, extractURLSessionFactsWithDir(src, relFile, dir)...)
 	})
 
 	for i, fileFacts := range perFileFacts {
 		relFile := swiftFiles[i]
 		allFacts = append(allFacts, fileFacts...)
 
-		dir := filepath.Dir(relFile)
+		dir := moduleForFile(relFile)
 		modules[dir] = true
 		if _, ok := dirToFile[dir]; !ok {
 			dirToFile[dir] = relFile
@@ -121,10 +154,44 @@ func (e *SwiftExtractor) Extract(ctx context.Context, repoPath string, files []s
 				continue
 			}
 			sk, _ := fact.Props["symbol_kind"].(string)
-			if sk == facts.SymbolStruct || sk == facts.SymbolClass || sk == facts.SymbolInterface {
+			switch sk {
+			case facts.SymbolStruct, facts.SymbolClass, facts.SymbolInterface:
 				if simpleName := lastDotComponent(fact.Name); simpleName != "" {
+					// A bare type name is not unique across modules: Swift namespaces
+					// nested types by their enclosing type/module, so short names like
+					// Event/State/Style/Coordinator recur in many targets. Track which
+					// names are defined in >1 module so the cross-module reference pass
+					// can refuse to fabricate an edge from an ambiguous name (which
+					// would otherwise resolve to one arbitrary owning module and create
+					// a false — often cyclic — dependency).
+					if prev, ok := typeIndex[simpleName]; ok && prev != dir {
+						typeAmbiguous[simpleName] = true
+					}
 					typeIndex[simpleName] = dir
 				}
+			case facts.SymbolMethod:
+				// Index methods by short name so the resolveMethodCalls post-pass can
+				// bind tentative member-call edges (self?.x(), coordinator?.y()) to a
+				// concrete method — or drop them when no project method matches.
+				if short := lastDotComponent(fact.Name); short != "" {
+					methodIndex[short] = append(methodIndex[short], fact.Name)
+				}
+			case facts.SymbolFunc:
+				short := lastDotComponent(fact.Name)
+				if short == "" {
+					break
+				}
+				// Operator overloads (func +, func <-, …) go in methodIndex so
+				// custom-operator usage edges bind.
+				if isOperatorToken(short) {
+					methodIndex[short] = append(methodIndex[short], fact.Name)
+				}
+				// All top-level functions also go in funcIndex — the fallback used by
+				// resolveMethodCalls when a member call's receiver type failed to parse
+				// and its methods were flattened to top-level functions. Kept separate
+				// from methodIndex so a genuine method call is only rescued by a
+				// top-level function when no real method of that name exists.
+				funcIndex[short] = append(funcIndex[short], fact.Name)
 			}
 		}
 	}
@@ -153,9 +220,29 @@ func (e *SwiftExtractor) Extract(ctx context.Context, repoPath string, files []s
 	// (impact_analysis) connects dependents to their targets.
 	canonicalizeTargets(allFacts, typeIndex)
 
-	// Emit module facts for directories not already described by a manifest target.
+	// Bind the walker's tentative bare-short-name member-call edges to concrete
+	// project methods (or drop stdlib/framework calls). Runs after
+	// canonicalizeTargets so type-target rewrites are already settled.
+	resolveMethodCalls(allFacts, methodIndex, funcIndex)
+
+	// Resolve dangling inherited-method calls (a subclass calling a base-class or
+	// protocol-extension method) to the declaring ancestor's method fact, so class /
+	// protocol hierarchies are traversable. Runs before computePerformsIO so its
+	// closure follows the newly-resolved inheritance edges.
+	resolveInheritedCalls(allFacts)
+
+	// Propagate the walk-time io_direct flag up the call graph into a transitive
+	// performs_io prop, so callers of I/O methods are discoverable even when the
+	// call chain runs through ambiguous (kept-bare) member-call edges.
+	computePerformsIO(allFacts, methodIndex, funcIndex)
+
+	// Emit XcodeGen target module facts + declared inter-target dependency edges.
+	allFacts = append(allFacts, emitXcodeGenFacts(resolver, xp, spmRoots, dirToFile)...)
+
+	// Emit module facts for leaf directories not already described by an XcodeGen
+	// or SPM target identity (files that fell back to leaf-directory grouping).
 	for dir := range modules {
-		if manifestModules[dir] {
+		if manifestModules[dir] || resolver.identities[dir] {
 			continue
 		}
 		allFacts = append(allFacts, facts.Fact{
@@ -163,14 +250,29 @@ func (e *SwiftExtractor) Extract(ctx context.Context, repoPath string, files []s
 			Name: dir,
 			File: dir,
 			Props: map[string]any{
-				"language": "swift",
+				"language":    "swift",
+				"module_role": facts.ModuleRoleForPath(dir),
 			},
 		})
 	}
 
 	// Pass 2: resolve type references to discover cross-module dependencies.
+	// Seed the seen-set with the declared (manifest/XcodeGen) edges so a used edge
+	// that is also declared isn't emitted twice (which would double coupling
+	// counts). Declared-dependency facts anchor File inside the source module dir,
+	// so slashDir(File) recovers the source identity.
 	type edge struct{ from, to string }
 	seenEdges := make(map[edge]bool)
+	for _, f := range allFacts {
+		if f.Kind != facts.KindDependency {
+			continue
+		}
+		for _, r := range f.Relations {
+			if r.Kind == facts.RelImports {
+				seenEdges[edge{slashDir(f.File), r.Target}] = true
+			}
+		}
+	}
 
 	for _, relFile := range swiftFiles {
 		select {
@@ -179,11 +281,33 @@ func (e *SwiftExtractor) Extract(ctx context.Context, repoPath string, files []s
 		default:
 		}
 
-		sourceModule := filepath.Dir(relFile)
+		// When the file belongs to a resolved SPM/XcodeGen target, its module-level
+		// dependencies are already captured completely and unambiguously by its
+		// `import X` statements (resolveImports) plus the declared target graph
+		// (emitXcodeGenFacts) — Swift requires an explicit import to use another
+		// module's type, so those edges are a superset of every real cross-module
+		// use. The type-reference inference below adds nothing correct there and,
+		// because it resolves bare short names through a collision-prone index, is
+		// the sole source of impossible back-edges (e.g. a Foundation-level target
+		// "importing" a feature target) that SPM's acyclic-target guarantee forbids.
+		// Skip it for target-resolved files; keep it only for loose Swift projects
+		// where a file falls back to leaf-directory grouping and has no target graph.
+		if _, resolved := resolver.moduleFor(relFile); resolved {
+			continue
+		}
+
+		sourceModule := moduleForFile(relFile)
 		absFile := filepath.Join(repoPath, relFile)
 		refs := extractTypeReferences(absFile)
 
 		for _, typeName := range refs {
+			// An ambiguous short name (defined in >1 module) cannot be resolved to a
+			// single owning module by name alone; emitting an edge to the arbitrary
+			// index winner fabricates a false dependency. Skip it — the real edge, if
+			// any, is still recovered from the file's import statements.
+			if typeAmbiguous[typeName] {
+				continue
+			}
 			targetModule, ok := typeIndex[typeName]
 			if !ok || targetModule == sourceModule {
 				continue
@@ -197,7 +321,7 @@ func (e *SwiftExtractor) Extract(ctx context.Context, repoPath string, files []s
 			allFacts = append(allFacts, facts.Fact{
 				Kind: facts.KindDependency,
 				Name: sourceModule + " -> " + targetModule,
-				File: relFile,
+				File: moduleAnchorFile(sourceModule, dirToFile),
 				Props: map[string]any{
 					"language": "swift",
 					"internal": true,
@@ -209,8 +333,8 @@ func (e *SwiftExtractor) Extract(ctx context.Context, repoPath string, files []s
 		}
 	}
 
-	// Resolve bare `import X` targets to SPM module dirs and classify
-	// stdlib/external, now that all module facts (incl. SPM targets) exist.
+	// Resolve bare `import X` targets to SPM/XcodeGen target module dirs and
+	// classify stdlib/external, now that all module facts exist.
 	resolveImports(allFacts)
 
 	return allFacts, nil
@@ -233,6 +357,251 @@ func canonicalizeTargets(allFacts []facts.Fact, typeIndex map[string]string) {
 					r.Target = dir + "." + r.Target
 				}
 			}
+		}
+	}
+}
+
+// resolveMethodCalls binds the walker's tentative bare-short-name RelCalls edges
+// (member calls whose receiver type was unknown at walk time — self?.x() to a
+// method in another extension, coordinator?.y(), delegate?.tap()) against the
+// project-wide method index. A tentative edge is a RelCalls target with no "." and
+// a non-capitalized head; every resolved edge the walker emits directly is either
+// dir-qualified or a capitalized type, so this shape is unambiguous. Unique match
+// -> rewrite to the qualified dir.Type.method name (a resolved graph edge, good for
+// impact_analysis); ambiguous -> keep the bare name (still short-name matched by
+// the dead-code detector, which is all that clears the false positive); no match
+// -> drop the edge (a stdlib/framework call such as .map()/.dismissAnimated()).
+//
+// funcIndex (top-level function short name -> qualified names) is a fallback used
+// only when methodIndex has no entry: when a type fails to parse (tree-sitter error
+// recovery flattens its body to top level), its methods are emitted as top-level
+// functions, so a member call on such a type has no method to bind to. Falling back
+// to the function index recovers those edges. The precision cost — a member call
+// whose short name coincides with an unrelated top-level free function resolves to
+// it — is a false negative (a missed dead-code lead), the safe direction, and
+// top-level free functions are rare in Swift.
+func resolveMethodCalls(allFacts []facts.Fact, methodIndex, funcIndex map[string][]string) {
+	for i := range allFacts {
+		rels := allFacts[i].Relations
+		if len(rels) == 0 {
+			continue
+		}
+		out := rels[:0]
+		for _, r := range rels {
+			if r.Kind == facts.RelCalls && r.Target != "" &&
+				!strings.Contains(r.Target, ".") && !isCapitalized(r.Target) {
+				cands := methodIndex[r.Target]
+				if len(cands) == 0 {
+					cands = funcIndex[r.Target] // fallback: flattened/top-level function
+				}
+				switch len(cands) {
+				case 0:
+					continue // drop: no project method or function by this name
+				case 1:
+					r.Target = cands[0]
+					// default (>1): keep the bare ambiguous name
+				}
+			}
+			out = append(out, r)
+		}
+		allFacts[i].Relations = out
+	}
+}
+
+// resolveInheritedCalls rewrites a caller's DANGLING call-graph edges — a phantom
+// `dir.name` (a bare call to an inherited method, mis-shaped as a top-level function
+// by resolveCall) or a resolver-kept ambiguous bare name — to the qualified method
+// fact of the nearest ancestor (superclass or conformed protocol's extension) that
+// declares it. This makes class / protocol hierarchies traversable: a subclass method
+// calling an inherited base method now points at `dir.Base.method`.
+//
+// Conservative and additive: only targets that are NOT already a fact and whose short
+// name IS declared by an ancestor of the caller's type are rewritten; every resolved
+// edge (and thus dead-code short-name matching and coupling) is left untouched. The
+// extractor does not distinguish a superclass from a protocol in `implements`, and it
+// need not here — both put their methods in facts under `dir.Ancestor.method`, so the
+// ancestry walk treats them uniformly. Nearest-first BFS matches Swift override order.
+func resolveInheritedCalls(allFacts []facts.Fact) {
+	factNames := make(map[string]bool, len(allFacts))
+	typeSupers := make(map[string][]string)            // simple type -> supertype simple names
+	methodByType := make(map[string]map[string]string) // simple type -> (method short -> qualified name)
+
+	for i := range allFacts {
+		f := &allFacts[i]
+		if f.Kind != facts.KindSymbol {
+			continue
+		}
+		factNames[f.Name] = true
+		sk, _ := f.Props["symbol_kind"].(string)
+		switch sk {
+		case facts.SymbolClass, facts.SymbolStruct, facts.SymbolInterface:
+			simple := lastDotComponent(f.Name)
+			for _, r := range f.Relations {
+				if r.Kind == facts.RelImplements {
+					typeSupers[simple] = append(typeSupers[simple], r.Target)
+				}
+			}
+		case facts.SymbolMethod:
+			recv, _ := f.Props["receiver"].(string)
+			if recv == "" {
+				continue
+			}
+			t := lastDotComponent(recv)
+			if methodByType[t] == nil {
+				methodByType[t] = make(map[string]string)
+			}
+			// First declaration wins; overloads share a name and one target suffices.
+			if _, ok := methodByType[t][lastDotComponent(f.Name)]; !ok {
+				methodByType[t][lastDotComponent(f.Name)] = f.Name
+			}
+		}
+	}
+
+	// resolveInAncestry returns the qualified method fact for `short` declared by the
+	// nearest ancestor of `callerType` (inclusive), or "" if none declares it.
+	resolveInAncestry := func(callerType, short string) string {
+		visited := map[string]bool{}
+		queue := []string{callerType}
+		for len(queue) > 0 {
+			t := queue[0]
+			queue = queue[1:]
+			if visited[t] {
+				continue
+			}
+			visited[t] = true
+			if q, ok := methodByType[t][short]; ok {
+				return q
+			}
+			queue = append(queue, typeSupers[t]...)
+		}
+		return ""
+	}
+
+	for i := range allFacts {
+		f := &allFacts[i]
+		if f.Kind != facts.KindSymbol {
+			continue
+		}
+		if sk, _ := f.Props["symbol_kind"].(string); sk != facts.SymbolMethod {
+			continue
+		}
+		recv, _ := f.Props["receiver"].(string)
+		callerType := lastDotComponent(recv)
+		if callerType == "" || len(typeSupers[callerType]) == 0 {
+			continue // no supertypes → nothing to inherit; skip the common leaf case
+		}
+		for j := range f.Relations {
+			r := &f.Relations[j]
+			if r.Kind != facts.RelCalls || factNames[r.Target] {
+				continue // not a call, or already resolved to a real fact
+			}
+			if q := resolveInAncestry(callerType, lastDotComponent(r.Target)); q != "" && q != f.Name {
+				r.Target = q
+			}
+		}
+	}
+}
+
+// ioFanoutCap bounds how many candidate methods an ambiguous (kept-bare) call
+// target is expanded to during the performs_io closure. A small cap keeps the
+// derived flag from over-propagating along very common method names (a bare `save`
+// with dozens of candidates) while still crossing the narrow 2–3-way ambiguities
+// that legitimately reach the network layer (e.g. `dataModel.updateMembershipRequest`).
+const ioFanoutCap = 6
+
+// computePerformsIO derives a transitive `performs_io` prop over the resolved call
+// graph: a method performs I/O if its body directly invokes an I/O primitive
+// (the walk-time `io_direct` flag) or it transitively calls a method that does.
+//
+// Ambiguous call targets — which resolveMethodCalls leaves as a bare short name
+// because 2+ methods share it — are expanded through the methodIndex/funcIndex
+// candidate sets DURING this closure only, so the closure can cross them without
+// adding false edges to the shared call graph (dead-code / impact stay precise).
+// A bounded fixpoint (correct under call cycles) replaces a memoized DFS to avoid
+// the cycle-back-edge false negatives that a visiting-guard DFS would introduce.
+func computePerformsIO(allFacts []facts.Fact, methodIndex, funcIndex map[string][]string) {
+	// name -> indices of the method/func symbol facts with that name.
+	byName := make(map[string][]int)
+	for i := range allFacts {
+		f := &allFacts[i]
+		if f.Kind != facts.KindSymbol {
+			continue
+		}
+		if sk, _ := f.Props["symbol_kind"].(string); sk == facts.SymbolMethod || sk == facts.SymbolFunc {
+			byName[f.Name] = append(byName[f.Name], i)
+		}
+	}
+
+	// resolveTargets maps a call target to the candidate callee names to follow: the
+	// target itself when it names a known method/func, else its (capped) methodIndex/
+	// funcIndex candidates for the ambiguous bare case.
+	resolveTargets := func(target string) []string {
+		if _, ok := byName[target]; ok {
+			return []string{target}
+		}
+		cands := methodIndex[target]
+		if len(cands) == 0 {
+			cands = funcIndex[target]
+		}
+		if len(cands) == 0 || len(cands) > ioFanoutCap {
+			return nil
+		}
+		return cands
+	}
+
+	// Seed io[name] from the io_direct flag, and build name->callee-names adjacency.
+	io := make(map[string]bool, len(byName))
+	adj := make(map[string][]string, len(byName))
+	for name, idxs := range byName {
+		seen := make(map[string]bool)
+		for _, i := range idxs {
+			if b, _ := allFacts[i].Props["io_direct"].(bool); b {
+				io[name] = true
+			}
+			for _, r := range allFacts[i].Relations {
+				if r.Kind != facts.RelCalls {
+					continue
+				}
+				for _, c := range resolveTargets(r.Target) {
+					if c != name && !seen[c] {
+						seen[c] = true
+						adj[name] = append(adj[name], c)
+					}
+				}
+			}
+		}
+	}
+
+	// Fixpoint: a method performs I/O if any callee does. Iterate to stability.
+	for changed := true; changed; {
+		changed = false
+		for name, callees := range adj {
+			if io[name] {
+				continue
+			}
+			for _, c := range callees {
+				if io[c] {
+					io[name] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+
+	// Emit the prop on every fact whose name reaches I/O (covers all overloads of a
+	// name) and on any io_direct property/observer leaf not indexed above.
+	for i := range allFacts {
+		f := &allFacts[i]
+		if f.Kind != facts.KindSymbol {
+			continue
+		}
+		direct, _ := f.Props["io_direct"].(bool)
+		if io[f.Name] || direct {
+			if f.Props == nil {
+				f.Props = map[string]any{}
+			}
+			f.Props["performs_io"] = true
 		}
 	}
 }

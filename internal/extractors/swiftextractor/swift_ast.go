@@ -21,6 +21,14 @@ import (
 // and canonicalised to "<dir>.<Type>" by the post-pass in Extract, which has the
 // project-wide type index needed to resolve them.
 func extractFileAST(src []byte, relFile string, isiOS bool) []facts.Fact {
+	return extractFileASTWithDir(src, relFile, isiOS, filepath.Dir(relFile))
+}
+
+// extractFileASTWithDir is extractFileAST with an explicit module identity dir.
+// Extract passes the file's resolved target module (from moduleResolver) so
+// symbols are named "<targetDir>.<Type>" and declare into the target module
+// rather than the file's leaf directory.
+func extractFileASTWithDir(src []byte, relFile string, isiOS bool, dir string) []facts.Fact {
 	parser := sitter.NewParser()
 	defer parser.Close()
 	if err := parser.SetLanguage(sitter.NewLanguage(swift.Language())); err != nil {
@@ -33,10 +41,11 @@ func extractFileAST(src []byte, relFile string, isiOS bool) []facts.Fact {
 	defer tree.Close()
 
 	w := &astWalker{
-		src:     src,
-		relFile: relFile,
-		dir:     filepath.Dir(relFile),
-		isiOS:   isiOS,
+		src:        src,
+		relFile:    relFile,
+		dir:        dir,
+		isiOS:      isiOS,
+		fileRefIdx: -1,
 	}
 	w.walkSourceFile(tree.RootNode())
 	return w.out
@@ -68,11 +77,22 @@ type astWalker struct {
 	// Per-function complexity state, set up by handleFunction around walkForCalls.
 	// metrics is nil outside a function body walk. loopDepth is the current loop
 	// nesting depth; selfName/selfShort are the enclosing function's full and short
-	// names (for direct-recursion detection).
-	metrics   *swiftBodyMetrics
-	loopDepth int
-	selfName  string
-	selfShort string
+	// names, and selfParamLabels its external argument labels — both used for
+	// direct-recursion detection (a self-named call is only recursion when its
+	// argument labels match, distinguishing genuine recursion from a call to a
+	// sibling/stdlib/super overload of the same bare name).
+	metrics         *swiftBodyMetrics
+	loopDepth       int
+	selfName        string
+	selfShort       string
+	selfParamLabels []string
+
+	// fileRefIdx is the index into out of this file's lazily-created file-scope
+	// reference fact (facts.KindFileRef), or -1 before one is created. It owns the
+	// call edges from top-level statements (bare `foo()` calls, `let x = foo()`
+	// initializers) that have no enclosing symbol — e.g. #!/usr/bin/swift build
+	// scripts that invoke their own top-level functions. Mirrors the Ruby extractor.
+	fileRefIdx int
 }
 
 // swiftBodyMetrics accumulates per-function complexity signals during the single
@@ -84,6 +104,7 @@ type swiftBodyMetrics struct {
 	callsInLoop []string        // distinct call targets invoked at loop depth >= 1
 	inLoopSeen  map[string]bool // dedup set for callsInLoop
 	recursive   bool            // body directly calls the enclosing function
+	ioDirect    bool            // body directly invokes a network/file I/O primitive
 }
 
 // swiftIterators are higher-order methods whose closure runs once per element —
@@ -111,16 +132,271 @@ var swiftCheapMethods = map[string]bool{
 	"keys": true, "values": true, "sorted_": true, "reversed": true, "enumerated": true,
 }
 
+// swiftIOPrimitiveMethods are method names that denote a real network / file I/O
+// call regardless of receiver — the high-confidence leaves that seed the
+// performs_io closure (a method with one of these in its body directly does I/O).
+var swiftIOPrimitiveMethods = map[string]bool{
+	"dataTask": true, "dataTaskPublisher": true, "downloadTask": true,
+	"uploadTask": true, "download": true, "upload": true,
+}
+
+// swiftIONetworkRoots are receiver/type tokens whose presence in a call's receiver
+// chain marks it as network I/O (URLSession.shared.data(for:), a URLRequest send).
+var swiftIONetworkRoots = []string{"URLSession", "URLRequest"}
+
+// isIOPrimitiveCall reports whether a call — decomposed by calleeInfo into name /
+// root / isNav — is a high-confidence network or file-read I/O primitive: a known
+// I/O method name, a URLSession/URLRequest receiver or construction, an Alamofire
+// request/transfer, or a `Data(contentsOf:)` / `String(contentsOf:)` read. Core Data
+// (`context.fetch`/`save`) is intentionally NOT here: telling it from an in-memory
+// `fetch`/`save` needs the receiver's type, which the extractor cannot yet infer.
+func isIOPrimitiveCall(name, root string, isNav bool, call *sitter.Node, src []byte) bool {
+	if swiftIOPrimitiveMethods[name] {
+		return true
+	}
+	for _, tok := range swiftIONetworkRoots {
+		if name == tok || strings.Contains(root, tok) {
+			return true
+		}
+	}
+	// Alamofire: AF.request(...), session.download/upload(...).
+	if isNav && (root == "AF" || root == "Session" || root == "session") {
+		switch name {
+		case "request", "download", "upload", "streamRequest":
+			return true
+		}
+	}
+	// Data(contentsOf:) / String(contentsOf:) — a URL/file read (contentsOf is an
+	// argument label on a capitalized construction, not the callee name).
+	if name == "Data" || name == "String" {
+		for _, lbl := range callArgumentLabels(call, src) {
+			if lbl == "contentsOf" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// swiftChainPreservesBound are collection methods that never grow a collection
+// beyond its input size, so a bounded literal/constant piped through them stays
+// bounded (`[a,b].sorted().forEach`, `STOP_CHARS.filter { … }.forEach`). Mirrors
+// the Ruby extractor's chainPreservesBound. Size-expanding ops (flatMap, joined)
+// are excluded so a bounded source is never turned unbounded's opposite.
+var swiftChainPreservesBound = map[string]bool{
+	"sorted": true, "reversed": true, "map": true, "compactMap": true,
+	"filter": true, "prefix": true, "suffix": true, "dropFirst": true,
+	"dropLast": true, "shuffled": true, "enumerated": true, "lazy": true,
+}
+
+// isScreamingSnake reports whether s is SCREAMING_SNAKE_CASE — only uppercase
+// letters, digits, and underscores, with at least one letter (`STOP_CHARS`,
+// `MAX_RETRIES`). A data constant with a fixed element count, unlike a mixed-case
+// type/relation (`Users`) whose `.forEach` is not a bounded literal.
+func isScreamingSnake(s string) bool {
+	hasLetter := false
+	for _, r := range s {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			hasLetter = true
+		case r >= '0' && r <= '9', r == '_':
+		default:
+			return false
+		}
+	}
+	return hasLetter
+}
+
+// swiftConstantBoundReceiver reports whether an iterator's receiver is provably
+// bounded by a compile-time-fixed number of elements, so the closure runs a fixed
+// number of times regardless of the method's input (O(1) in n): an array or
+// dictionary literal (`[a,b].forEach`), or an ALL-CAPS data constant
+// (`STOP_CHARS.forEach`). A trailing size-preserving chain method
+// (`[a,b].sorted().forEach`) is unwrapped and its receiver re-checked. Mixed-case
+// identifiers (a `var`/property/relation) are NOT bounded. Mirrors Ruby's
+// constantBoundReceiver so literal/constant loops don't inflate a genuine O(n)
+// into a false O(n²)/O(n³).
+func swiftConstantBoundReceiver(recv *sitter.Node, src []byte) bool {
+	if recv == nil {
+		return false
+	}
+	switch recv.Kind() {
+	case "array_literal", "dictionary_literal":
+		return true
+	case "simple_identifier", "identifier":
+		return isScreamingSnake(nodeText(recv, src))
+	case "call_expression":
+		// A trailing size-preserving chain (`[a,b].sorted().forEach`): the chain
+		// method is the navigation suffix of this call's callee — unwrap to the
+		// chain's base receiver and re-check.
+		if callee := firstNamedChild(recv); callee != nil && callee.Kind() == "navigation_expression" {
+			if name, isNav, _, _ := calleeInfo(callee, src); isNav && swiftChainPreservesBound[name] {
+				return swiftConstantBoundReceiver(callee.ChildByFieldName("target"), src)
+			}
+		}
+	}
+	return false
+}
+
+// swiftBoundedForCollection reports whether a `for … in <collection>` iterates a
+// compile-time-fixed number of times: a literal integer range (`for i in 0..<10`,
+// `1...5`) or a `stride(...)` whose bounds are all integer literals. A range with a
+// variable endpoint (`0..<items.count`) or a stride over a variable bound scales
+// with n and is NOT bounded.
+func swiftBoundedForCollection(coll *sitter.Node, src []byte) bool {
+	if coll == nil {
+		return false
+	}
+	switch coll.Kind() {
+	case "range_expression":
+		return isIntegerLiteralNode(coll.ChildByFieldName("start")) &&
+			isIntegerLiteralNode(coll.ChildByFieldName("end"))
+	case "call_expression":
+		if callee := firstNamedChild(coll); callee != nil {
+			if name, isNav, _, _ := calleeInfo(callee, src); !isNav && name == "stride" {
+				return strideBoundsAreLiteral(coll)
+			}
+		}
+	}
+	return false
+}
+
+func isIntegerLiteralNode(n *sitter.Node) bool {
+	return n != nil && n.Kind() == "integer_literal"
+}
+
+// isSubscriptCall reports whether a call_expression is actually a subscript access
+// (`dict[key]`, `parameters["x"]`) rather than a function call. The tree-sitter
+// grammar models both as a call_expression, but a subscript's call_suffix is
+// bracketed with `[` where a real call uses `(` (or a `{` trailing closure) — so
+// the leading delimiter of the call_suffix distinguishes them. Without this, a
+// subscript on an identifier that shares a method's name is mis-recorded as a call
+// (and, when the names match, as self-recursion).
+func isSubscriptCall(call *sitter.Node, src []byte) bool {
+	suffix := findChildByKind(call, "call_suffix")
+	if suffix == nil {
+		return false
+	}
+	t := nodeText(suffix, src)
+	return len(t) > 0 && t[0] == '['
+}
+
+// strideBoundsAreLiteral reports whether every argument of a `stride(...)` call is
+// an integer literal — so the iteration count is fixed. A single non-literal bound
+// (`stride(from: 0, to: n, by: 2)`) makes it scale with n.
+func strideBoundsAreLiteral(call *sitter.Node) bool {
+	suffix := findChildByKind(call, "call_suffix")
+	if suffix == nil {
+		return false
+	}
+	args := findChildByKind(suffix, "value_arguments")
+	if args == nil {
+		return false
+	}
+	sawArg := false
+	for i := uint(0); i < uint(args.ChildCount()); i++ {
+		a := args.Child(i)
+		if a.Kind() != "value_argument" {
+			continue
+		}
+		sawArg = true
+		if !isIntegerLiteralNode(a.ChildByFieldName("value")) {
+			return false
+		}
+	}
+	return sawArg
+}
+
 // recordCallMetrics notes a resolved call target against the current function's
 // complexity metrics: flags direct recursion and records calls made inside loops.
-func (w *astWalker) recordCallMetrics(target string) {
+// call is the call_expression node, used to compare argument labels so a call that
+// merely shares the enclosing function's bare name but targets a different overload
+// (`decode(_:forKey:)` from `decode(key:)`, a sibling `loadMore(service:)` from
+// `loadMore(completion:)`) is not mistaken for recursion.
+func (w *astWalker) recordCallMetrics(target string, call *sitter.Node) {
 	if w.metrics == nil || target == "" {
 		return
 	}
-	if target == w.selfShort || target == w.selfName || target == "self."+w.selfShort {
+	if (target == w.selfShort || target == w.selfName || target == "self."+w.selfShort) &&
+		w.callArgsMatchSelf(call) {
 		w.metrics.recursive = true
 	}
 	w.recordInLoopCall(target)
+}
+
+// callArgsMatchSelf reports whether a call's argument labels match the enclosing
+// function's external parameter labels — the signal that a same-named call could
+// actually be the enclosing function (genuine recursion) rather than a different
+// overload. An exact match is required; a default-omitted or trailing-closure call
+// that differs in arity is treated as a different overload (a conservative false
+// negative, consistent with this analysis erring away from false recursion).
+func (w *astWalker) callArgsMatchSelf(call *sitter.Node) bool {
+	return labelSignaturesMatch(w.selfParamLabels, callArgumentLabels(call, w.src))
+}
+
+func labelSignaturesMatch(params, args []string) bool {
+	if len(params) != len(args) {
+		return false
+	}
+	for i := range params {
+		if params[i] != args[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// parameterLabels returns a function declaration's external argument labels in
+// order — the `external_name` when present (including `_` for an unlabeled
+// parameter), otherwise the parameter's own name (which doubles as the label in
+// `name: Type`). Used to build the enclosing function's call signature.
+func parameterLabels(fn *sitter.Node, src []byte) []string {
+	var labels []string
+	for i := uint(0); i < uint(fn.ChildCount()); i++ {
+		p := fn.Child(i)
+		if p.Kind() != "parameter" {
+			continue
+		}
+		if ext := p.ChildByFieldName("external_name"); ext != nil {
+			labels = append(labels, nodeText(ext, src))
+		} else if nm := p.ChildByFieldName("name"); nm != nil {
+			labels = append(labels, nodeText(nm, src))
+		} else {
+			labels = append(labels, "_")
+		}
+	}
+	return labels
+}
+
+// callArgumentLabels returns a call's argument labels in order — the
+// value_argument_label when present, `_` for a positional argument. A trailing
+// closure (outside value_arguments) is not counted, matching parameterLabels which
+// lists only declared parameters positionally.
+func callArgumentLabels(call *sitter.Node, src []byte) []string {
+	if call == nil {
+		return nil
+	}
+	suffix := findChildByKind(call, "call_suffix")
+	if suffix == nil {
+		return nil
+	}
+	args := findChildByKind(suffix, "value_arguments")
+	if args == nil {
+		return nil
+	}
+	var labels []string
+	for i := uint(0); i < uint(args.ChildCount()); i++ {
+		a := args.Child(i)
+		if a.Kind() != "value_argument" {
+			continue
+		}
+		if lbl := a.ChildByFieldName("name"); lbl != nil {
+			labels = append(labels, strings.TrimSuffix(nodeText(lbl, src), ":"))
+		} else {
+			labels = append(labels, "_")
+		}
+	}
+	return labels
 }
 
 // recordInLoopCall adds a target to calls_in_loop (deduped) when inside a loop,
@@ -191,6 +467,25 @@ func (w *astWalker) addOwnerEdge(kind, target string) {
 	w.out[idx].Relations = append(w.out[idx].Relations, facts.Relation{Kind: kind, Target: target})
 }
 
+// addTentativeMethodCall emits a RelCalls edge to the bare method short name for a
+// member call whose receiver type is unknown at walk time (extraction is
+// parallel-per-file, so the project-wide method set is not yet available). The
+// serial resolveMethodCalls post-pass then rewrites it to a qualified
+// dir.Type.method target when the name maps to exactly one project method, keeps
+// it bare when the name is ambiguous (still short-name matched by dead-code
+// detection), and drops it when no project method matches (a stdlib/framework call
+// like .map()/.dismissAnimated()). Known stdlib/iterator/cheap names and
+// capitalized names (nested-type constructors) are skipped up front to cut noise.
+func (w *astWalker) addTentativeMethodCall(name string) {
+	if name == "" || isCapitalized(name) {
+		return
+	}
+	if swiftBuiltins[name] || swiftIterators[name] || swiftCheapMethods[name] {
+		return
+	}
+	w.addOwnerEdge(facts.RelCalls, name)
+}
+
 func (w *astWalker) walkSourceFile(root *sitter.Node) {
 	if root == nil {
 		return
@@ -212,6 +507,69 @@ func (w *astWalker) walkSourceFile(root *sitter.Node) {
 			w.handleTypeAlias(child)
 		}
 	}
+	w.walkFileScopeCalls(root)
+}
+
+// fileScopeDecls are the top-level child kinds whose call edges are already
+// captured under their own owner (function/class/protocol bodies) or that carry no
+// calls (import/typealias). walkFileScopeCalls skips them and captures calls from
+// every other top-level statement against the file-scope reference fact.
+var fileScopeDecls = map[string]bool{
+	"import_declaration":    true,
+	"class_declaration":     true,
+	"protocol_declaration":  true,
+	"function_declaration":  true,
+	"typealias_declaration": true,
+}
+
+// walkFileScopeCalls captures calls made by top-level statements — bare `foo()`
+// calls and `let x = foo()` initializers that have no enclosing symbol — attaching
+// them to a lazily-created facts.KindFileRef fact so the dead-code detector treats
+// the callees as used. The file-ref fact is dropped again if it accrued no edges.
+func (w *astWalker) walkFileScopeCalls(root *sitter.Node) {
+	// Most Swift files contain only top-level declarations; skip the file-ref
+	// machinery entirely unless there is a genuine top-level statement.
+	hasStmt := false
+	for i := uint(0); i < uint(root.ChildCount()); i++ {
+		if !fileScopeDecls[root.Child(i).Kind()] {
+			hasStmt = true
+			break
+		}
+	}
+	if !hasStmt {
+		return
+	}
+
+	w.pushOwner(w.ensureFileRefFact())
+	for i := uint(0); i < uint(root.ChildCount()); i++ {
+		child := root.Child(i)
+		if fileScopeDecls[child.Kind()] {
+			continue
+		}
+		w.walkForCalls(child)
+	}
+	w.popOwner()
+
+	// Drop the file-ref fact if none of the statements produced a call edge.
+	if w.fileRefIdx >= 0 && len(w.out[w.fileRefIdx].Relations) == 0 {
+		w.out = append(w.out[:w.fileRefIdx], w.out[w.fileRefIdx+1:]...)
+		w.fileRefIdx = -1
+	}
+}
+
+// ensureFileRefFact returns the index of this file's lazily-created file-scope
+// reference fact (facts.KindFileRef), creating it on first use.
+func (w *astWalker) ensureFileRefFact() int {
+	if w.fileRefIdx < 0 {
+		w.out = append(w.out, facts.Fact{
+			Kind:  facts.KindFileRef,
+			Name:  w.relFile,
+			File:  w.relFile,
+			Props: map[string]any{"language": "swift"},
+		})
+		w.fileRefIdx = len(w.out) - 1
+	}
+	return w.fileRefIdx
 }
 
 func (w *astWalker) handleImport(node *sitter.Node) {
@@ -441,13 +799,23 @@ func (w *astWalker) handleFunction(node *sitter.Node) {
 	body := findChildByKind(node, "function_body")
 	header := headerText(node, body, w.src)
 
+	// A function declared inside a type is a method (dispatch/reflection usage is
+	// not edge-tracked), so it must be classified SymbolMethod — not SymbolFunc —
+	// or the dead-code detector mislabels it high-confidence "safest to remove".
+	// This matches the Python/Java extractors. Free functions stay SymbolFunc.
+	enclosing := w.enclosingType()
+	symbolKind := facts.SymbolFunc
+	if enclosing != "" {
+		symbolKind = facts.SymbolMethod
+	}
+
 	f := facts.Fact{
 		Kind: facts.KindSymbol,
 		Name: w.dir + "." + w.qualify(name),
 		File: w.relFile,
 		Line: int(node.StartPosition().Row) + 1,
 		Props: map[string]any{
-			"symbol_kind": facts.SymbolFunc,
+			"symbol_kind": symbolKind,
 			"exported":    !isPrivateAccess(modifierText),
 			"language":    "swift",
 		},
@@ -455,8 +823,8 @@ func (w *astWalker) handleFunction(node *sitter.Node) {
 			{Kind: facts.RelDeclares, Target: w.dir},
 		},
 	}
-	if t := w.enclosingType(); t != "" {
-		f.Props["receiver"] = t
+	if enclosing != "" {
+		f.Props["receiver"] = enclosing
 	}
 	if strings.Contains(header, " async") {
 		f.Props["async"] = true
@@ -481,8 +849,20 @@ func (w *astWalker) handleFunction(node *sitter.Node) {
 	w.loopDepth = 0
 	w.selfName = f.Name
 	w.selfShort = name
+	w.selfParamLabels = parameterLabels(node, w.src)
 	w.walkForCalls(body)
-	props := w.out[ownerIdx].Props
+	w.finishMetrics(w.out[ownerIdx].Props)
+	w.popOwner()
+}
+
+// finishMetrics writes the accumulated complexity signals onto props and clears
+// w.metrics. cyclomatic is always written; loop_depth/loop_count/calls_in_loop/
+// recursive_self only when non-zero (so a loop-free body stays clean). Shared by
+// handleFunction, handleProperty (computed getters / observers), and handleInit.
+func (w *astWalker) finishMetrics(props map[string]any) {
+	if w.metrics == nil {
+		return
+	}
 	props["cyclomatic"] = 1 + w.metrics.decisions
 	if w.metrics.loopDepth > 0 {
 		props["loop_depth"] = w.metrics.loopDepth
@@ -496,8 +876,10 @@ func (w *astWalker) handleFunction(node *sitter.Node) {
 	if w.metrics.recursive {
 		props["recursive_self"] = true
 	}
+	if w.metrics.ioDirect {
+		props["io_direct"] = true
+	}
 	w.metrics = nil
-	w.popOwner()
 }
 
 func (w *astWalker) handleProperty(node *sitter.Node) {
@@ -531,9 +913,42 @@ func (w *astWalker) handleProperty(node *sitter.Node) {
 			{Kind: facts.RelDeclares, Target: w.dir},
 		},
 	})
-	// A property initializer may construct types (let x = Foo()); attribute those
-	// to the enclosing type owner.
-	w.walkForCalls(node)
+	propIdx := len(w.out) - 1
+
+	// A computed getter or a willSet/didSet observer has a real body that can hold a
+	// loop or per-iteration I/O, so measure its complexity like a function's — a
+	// hotspot inside `var items: [X] { … }` or `didSet { for … }` is otherwise
+	// invisible to analyze_performance. Stored properties with a plain initializer
+	// get no metrics (avoids a cyclomatic=1 prop on every field).
+	measure := findChildByKind(node, "computed_property") != nil ||
+		findChildByKind(node, "willset_didset_block") != nil
+	if measure {
+		w.metrics = &swiftBodyMetrics{}
+		w.loopDepth = 0
+		w.selfName = w.out[propIdx].Name
+		w.selfShort = name
+		w.selfParamLabels = nil // a property takes no arguments
+	}
+
+	// A property initializer or computed-getter body may call/construct
+	// (`let x = Foo()`, `var y: T { return helper() }`). Inside a type body the
+	// enclosing type is already the owner and captures these edges. But an
+	// `extension` pushes NO owner (handleExtension), so at extension scope
+	// currentOwner() == -1 and the edges would be dropped — a helper called only
+	// from an extension property then looked dead. Only in that ownerless case do we
+	// push the property itself as owner, keeping class-property attribution (and the
+	// coupling graph) unchanged.
+	if w.currentOwner() < 0 {
+		w.pushOwner(propIdx)
+		w.walkForCalls(node)
+		w.popOwner()
+	} else {
+		w.walkForCalls(node)
+	}
+
+	if measure {
+		w.finishMetrics(w.out[propIdx].Props)
+	}
 }
 
 // handlePropertyInjection emits DI edges from the enclosing type for a property
@@ -655,28 +1070,58 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 		}
 	}
 
-	// Syntactic loops: everything in the body runs per iteration.
+	// Syntactic loops: everything in the body runs per iteration. A `for` over a
+	// literal integer range or a literal-bound `stride(...)` runs a fixed number of
+	// times, so it counts as a loop (cyclomatic) but must not add scaling loop DEPTH
+	// — otherwise a `for i in 0..<10` inflates a genuine O(n) into a false O(n²).
 	switch kind {
 	case "for_statement", "for_statement_await", "while_statement", "repeat_while_statement":
+		bounded := (kind == "for_statement" || kind == "for_statement_await") &&
+			swiftBoundedForCollection(node.ChildByFieldName("collection"), w.src)
 		if w.metrics != nil {
 			w.metrics.loopCount++
 			w.metrics.decisions++
-			if w.loopDepth+1 > w.metrics.loopDepth {
+			if !bounded && w.loopDepth+1 > w.metrics.loopDepth {
 				w.metrics.loopDepth = w.loopDepth + 1
 			}
 		}
-		w.loopDepth++
+		if !bounded {
+			w.loopDepth++
+		}
 		for i := uint(0); i < uint(node.ChildCount()); i++ {
 			w.walkForCalls(node.Child(i))
 		}
-		w.loopDepth--
+		if !bounded {
+			w.loopDepth--
+		}
+		return
+	}
+
+	// A subscript access (`dict[key]`, `parameters["x"] = 1`) parses as a
+	// call_expression whose callee is the base and whose `[...]` is a call_suffix —
+	// indistinguishable in kind from a real `foo()` call. Skip the callee-as-call
+	// handling so a local/property whose name collides with a method
+	// (`parameters["x"]` inside `func parameters()`) is not mistaken for a call or
+	// self-recursion; still recurse into children so calls in the receiver or the
+	// subscript key (`getDict()["x"]`, `a[compute()]`) are captured.
+	if kind == "call_expression" && isSubscriptCall(node, w.src) {
+		for i := uint(0); i < uint(node.ChildCount()); i++ {
+			w.walkForCalls(node.Child(i))
+		}
 		return
 	}
 
 	if kind == "call_expression" {
 		var iterClosure *sitter.Node
 		if callee := firstNamedChild(node); callee != nil {
-			name, isNav, root := calleeInfo(callee, w.src)
+			name, isNav, root, directSelf := calleeInfo(callee, w.src)
+			// Seed the performs_io closure: flag the enclosing method when its body
+			// directly invokes a network/file I/O primitive. Framework I/O calls are
+			// otherwise dropped by the call-edge resolver, so this is the only durable
+			// signal that a method does I/O.
+			if w.metrics != nil && !w.metrics.ioDirect && isIOPrimitiveCall(name, root, isNav, node, w.src) {
+				w.metrics.ioDirect = true
+			}
 			switch {
 			case name == "":
 				// unresolved
@@ -687,27 +1132,42 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 					}
 				} else if target := w.resolveCall(name); target != "" {
 					w.addOwnerEdge(facts.RelCalls, target)
-					w.recordCallMetrics(target)
+					w.recordCallMetrics(target, node)
 				}
-			case isNav && (root == "self" || root == "Self"):
+			case directSelf && w.enclosingType() != "":
+				// self.foo() / self?.foo(): a member of the enclosing type. When
+				// declared in the current body, emit the resolved dir.Type.method
+				// edge. Otherwise (a member declared in another extension of the
+				// same type, or an inherited/framework method) emit a tentative
+				// bare edge for the serial post-pass to resolve or drop — this is
+				// what recovers the coordinator "[weak self] switch { self?.x() }"
+				// routing calls that the old currentMethods gate silently dropped.
 				if w.currentMethods()[name] {
 					t := w.dir + "." + w.enclosingType() + "." + name
 					w.addOwnerEdge(facts.RelCalls, t)
-					w.recordCallMetrics(t)
+					w.recordCallMetrics(t, node)
+				} else {
+					w.addTentativeMethodCall(name)
 				}
 			case isNav && isCapitalized(root) && !isSystemType(root):
-				// e.g. AppComposition.shared.makeRepo() — depend on the root type.
+				// e.g. AppComposition.shared.makeRepo() — depend on the root type,
+				// and also credit the invoked method by short name (post-pass).
 				w.addOwnerEdge(facts.RelCalls, root)
-				w.recordCallMetrics(root)
-			case isNav && w.loopDepth > 0 && !swiftCheapMethods[name]:
-				// Method call on a lowercase receiver inside a loop (ctx.fetch(),
-				// repo.save()). No graph edge today, but its name feeds the perf
-				// metric so the enterprise analyzer can flag per-iteration I/O.
-				tgt := name
-				if root != "" {
-					tgt = root + "." + name
+				w.recordCallMetrics(root, node)
+				w.addTentativeMethodCall(name)
+			case isNav:
+				// Member call on a lowercase / property-chain receiver
+				// (coordinator?.show(), delegate?.tap(), self.prop.foo()). Emit a
+				// tentative bare short-name edge, resolved or dropped in the
+				// post-pass. Preserve the existing in-loop perf metric.
+				w.addTentativeMethodCall(name)
+				if w.loopDepth > 0 && !swiftCheapMethods[name] {
+					tgt := name
+					if root != "" {
+						tgt = root + "." + name
+					}
+					w.recordInLoopCall(tgt)
 				}
-				w.recordInLoopCall(tgt)
 			}
 			// An iterator method with a trailing closure (items.map { … }) is a
 			// loop: its closure body runs per element, but the receiver/arguments
@@ -717,14 +1177,25 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 			}
 		}
 		if iterClosure != nil {
+			// A constant-bounded iterator (`[a,b].forEach`, `STOP_CHARS.map`) runs a
+			// fixed number of times: still a loop (cyclomatic) but its closure body
+			// walks at the SAME depth, so any inner scaling loop or per-iteration I/O
+			// is measured against the real input, not multiplied by a constant.
+			bounded := false
+			if callee := firstNamedChild(node); callee != nil {
+				bounded = swiftConstantBoundReceiver(callee.ChildByFieldName("target"), w.src)
+			}
 			w.metrics.loopCount++
 			w.metrics.decisions++
-			if w.loopDepth+1 > w.metrics.loopDepth {
+			delta := 1
+			if bounded {
+				delta = 0
+			} else if w.loopDepth+1 > w.metrics.loopDepth {
 				w.metrics.loopDepth = w.loopDepth + 1
 			}
 			for i := uint(0); i < uint(node.ChildCount()); i++ {
 				if c := node.Child(i); byteContains(c, iterClosure) {
-					w.walkClosureSubtree(c, iterClosure)
+					w.walkClosureSubtree(c, iterClosure, delta)
 				} else {
 					w.walkForCalls(c)
 				}
@@ -733,9 +1204,65 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 		}
 	}
 
+	// Custom operator usage (`a <- b`, prefix `<>x`): the operator token names a
+	// project-declared `func <op>(…)`. Emit a tentative edge so the operator overload
+	// is not seen as dead (resolved/dropped in the serial post-pass). Standard-token
+	// operators (+, +=, ^, ==, …) are intentionally NOT tracked — their overloads
+	// share tokens with builtin arithmetic, so edges would flood every arithmetic
+	// site and inflate the operator's fan-in.
+	if op := customOperatorToken(node, w.src); op != "" {
+		w.addOwnerEdge(facts.RelCalls, op)
+	}
+
 	for i := uint(0); i < uint(node.ChildCount()); i++ {
 		w.walkForCalls(node.Child(i))
 	}
+}
+
+// swiftStandardOperators are Swift stdlib operators that the tree-sitter scanner
+// nonetheless emits as `custom_operator` tokens (e.g. multi-char `<=`, `>=`, `??`,
+// `..<`). Overloads of these share tokens with builtin uses, so tracking their
+// usage would flood every arithmetic/comparison site and inflate the operator's
+// fan-in — they are excluded so only genuinely user-defined operators (`<-`, `~>`,
+// `|>`, …) get usage edges. Their overloads stay covered by the confidence
+// downgrade in the dead-code detector.
+var swiftStandardOperators = map[string]bool{
+	"=": true, "+": true, "-": true, "*": true, "/": true, "%": true,
+	"==": true, "!=": true, "===": true, "!==": true,
+	"<": true, ">": true, "<=": true, ">=": true,
+	"&&": true, "||": true, "!": true, "??": true, "~=": true,
+	"&": true, "|": true, "^": true, "~": true, "<<": true, ">>": true,
+	"+=": true, "-=": true, "*=": true, "/=": true, "%=": true,
+	"&=": true, "|=": true, "^=": true, "<<=": true, ">>=": true,
+	"&+": true, "&-": true, "&*": true, "&<<": true, "&>>": true,
+	"...": true, "..<": true, "?": true,
+}
+
+// customOperatorToken returns the operator token text when node is an operator
+// expression whose operator is a user-defined `custom_operator` (e.g. `<-`), else
+// "". Standard-token operators — both those with dedicated grammar nodes (`+` via
+// additive_expression) and stdlib multi-char operators the scanner emits as
+// `custom_operator` (`<=`, `>=`, `??`, …, see swiftStandardOperators) — are excluded,
+// because their overloads are indistinguishable from builtin uses and would flood.
+func customOperatorToken(node *sitter.Node, src []byte) string {
+	var opField string
+	switch node.Kind() {
+	case "infix_expression":
+		opField = "op"
+	case "prefix_expression":
+		opField = "operation"
+	default:
+		return ""
+	}
+	op := node.ChildByFieldName(opField)
+	if op == nil || op.Kind() != "custom_operator" {
+		return ""
+	}
+	text := nodeText(op, src)
+	if swiftStandardOperators[text] {
+		return ""
+	}
+	return text
 }
 
 // trailingClosure returns a call's closure argument (lambda_literal) — a trailing
@@ -764,29 +1291,31 @@ func byteContains(outer, inner *sitter.Node) bool {
 	return inner.StartByte() >= outer.StartByte() && inner.EndByte() <= outer.EndByte()
 }
 
-// walkClosureSubtree descends toward an iterator's closure, bumping the loop depth
-// exactly at the closure (its body is per-iteration) while walking everything else
-// (the receiver, sibling arguments) at the current depth.
-func (w *astWalker) walkClosureSubtree(node, closure *sitter.Node) {
+// walkClosureSubtree descends toward an iterator's closure, changing the loop depth
+// by delta exactly at the closure (its body is per-iteration) while walking
+// everything else (the receiver, sibling arguments) at the current depth. delta is
+// 1 for a scaling iterator and 0 for a constant-bounded one (whose body runs a
+// fixed number of times, so an inner scaling loop is measured at the outer depth).
+func (w *astWalker) walkClosureSubtree(node, closure *sitter.Node, delta int) {
 	if node == nil {
 		return
 	}
 	// Match the closure itself (kind-checked so an ancestor with the same byte span,
 	// e.g. a call_suffix that wraps only the trailing closure, isn't mistaken for it).
 	if node.Kind() == "lambda_literal" && node.StartByte() == closure.StartByte() && node.EndByte() == closure.EndByte() {
-		// The iterator invokes this closure per element: walk its BODY at +1.
+		// The iterator invokes this closure per element: walk its BODY at +delta.
 		// Descend into the closure's children directly rather than walkForCalls(node),
 		// which would treat the closure as a deferred scope and reset the depth.
-		w.loopDepth++
+		w.loopDepth += delta
 		for i := uint(0); i < uint(node.ChildCount()); i++ {
 			w.walkForCalls(node.Child(i))
 		}
-		w.loopDepth--
+		w.loopDepth -= delta
 		return
 	}
 	for i := uint(0); i < uint(node.ChildCount()); i++ {
 		if c := node.Child(i); byteContains(c, closure) {
-			w.walkClosureSubtree(c, closure)
+			w.walkClosureSubtree(c, closure, delta)
 		} else {
 			w.walkForCalls(c)
 		}
@@ -817,6 +1346,9 @@ var swiftBuiltins = map[string]bool{
 	"stride": true, "sequence": true, "repeatElement": true,
 	"withUnsafePointer": true, "withExtendedLifetime": true, "withAnimation": true,
 	"isKnownUniquelyReferenced": true, "numericCast": true,
+	// `defer { … }` parses as a call to an identifier named "defer" with a trailing
+	// closure; suppress it so it does not become a phantom `calls -> …defer` edge.
+	"defer": true,
 }
 
 // --- node helpers ---
@@ -1014,12 +1546,16 @@ func headerText(node, body *sitter.Node, src []byte) string {
 }
 
 // calleeInfo inspects a call_expression's callee and returns the called simple
-// name, whether it was a navigation (a.b.foo()) call, and the leftmost receiver
-// identifier ("self" for self-calls; the root type/var name otherwise).
-func calleeInfo(callee *sitter.Node, src []byte) (name string, isNav bool, root string) {
+// name, whether it was a navigation (a.b.foo()) call, the leftmost receiver
+// identifier ("self" for self-calls; the root type/var name otherwise), and
+// whether the DIRECT receiver is self ("self.foo()"/"self?.foo()" — but NOT the
+// property-chain "self.prop.foo()", whose direct receiver is a navigation node).
+// The optional-chaining "?." is folded into the navigation token by the grammar's
+// external scanner, so "self?.foo()" parses identically to "self.foo()".
+func calleeInfo(callee *sitter.Node, src []byte) (name string, isNav bool, root string, directSelf bool) {
 	switch callee.Kind() {
 	case "simple_identifier", "identifier":
-		return nodeText(callee, src), false, ""
+		return nodeText(callee, src), false, "", false
 	case "navigation_expression":
 		suffix := callee.ChildByFieldName("suffix")
 		if suffix == nil {
@@ -1031,9 +1567,14 @@ func calleeInfo(callee *sitter.Node, src []byte) (name string, isNav bool, root 
 			}
 		}
 		root = navigationRoot(callee, src)
-		return name, true, root
+		if tgt := callee.ChildByFieldName("target"); tgt != nil {
+			if tgt.Kind() == "self_expression" || nodeText(tgt, src) == "Self" {
+				directSelf = true
+			}
+		}
+		return name, true, root, directSelf
 	}
-	return "", false, ""
+	return "", false, "", false
 }
 
 // navigationRoot drills to the leftmost receiver of a (possibly nested)
@@ -1061,6 +1602,17 @@ func isCapitalized(s string) bool {
 		return false
 	}
 	return unicode.IsUpper([]rune(s)[0])
+}
+
+// isOperatorToken reports whether s is a Swift operator name (e.g. "+", "<-", "^=")
+// rather than an identifier — i.e. its first rune is neither a letter nor an
+// underscore. Used to index operator overloads so custom-operator usage edges bind.
+func isOperatorToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	r := []rune(s)[0]
+	return !unicode.IsLetter(r) && r != '_'
 }
 
 // isTypeName reports whether s looks like a simple Swift type name (an uppercase

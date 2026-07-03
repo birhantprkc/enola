@@ -11,10 +11,11 @@ import (
 
 // manifestTarget is a target declared in a Package.swift manifest.
 type manifestTarget struct {
-	name string
-	dir  string // module directory: <pkgDir>/Sources/<name>, or a path: override
-	deps []manifestDep
-	line int
+	name   string
+	dir    string // module directory: <pkgDir>/Sources/<name>, or a path: override
+	deps   []manifestDep
+	line   int
+	isTest bool // declared via testTarget(...) → module_role=test
 }
 
 type manifestDep struct {
@@ -64,7 +65,8 @@ func parsePackageManifest(src []byte, manifestRel string, dirToFile map[string]s
 			if elem.Kind() != "call_expression" {
 				continue
 			}
-			switch memberCallName(elem, src) {
+			callName := memberCallName(elem, src)
+			switch callName {
 			case "target", "executableTarget", "testTarget", "macro", "plugin", "systemLibrary", "binaryTarget":
 			default:
 				continue
@@ -82,9 +84,10 @@ func parsePackageManifest(src []byte, manifestRel string, dirToFile map[string]s
 				dir = filepath.ToSlash(filepath.Join(pkgDir, p))
 			}
 			t := manifestTarget{
-				name: name,
-				dir:  dir,
-				line: int(elem.StartPosition().Row) + 1,
+				name:   name,
+				dir:    dir,
+				line:   int(elem.StartPosition().Row) + 1,
+				isTest: callName == "testTarget",
 			}
 			if depsArr := argValue(tArgs, "dependencies", src); depsArr != nil {
 				t.deps = parseManifestDeps(depsArr, src)
@@ -99,6 +102,10 @@ func parsePackageManifest(src []byte, manifestRel string, dirToFile map[string]s
 	// Module fact per declared target (guarantees even an empty/stub target is a
 	// node, and tags it with its SPM identity).
 	for _, t := range targets {
+		role := facts.ModuleRoleProduction
+		if t.isTest {
+			role = facts.ModuleRoleTest
+		}
 		out = append(out, facts.Fact{
 			Kind: facts.KindModule,
 			Name: t.dir,
@@ -107,6 +114,7 @@ func parsePackageManifest(src []byte, manifestRel string, dirToFile map[string]s
 				"language":    "swift",
 				"spm_target":  t.name,
 				"spm_package": pkgName,
+				"module_role": role,
 			},
 		})
 	}
@@ -139,6 +147,63 @@ func parsePackageManifest(src []byte, manifestRel string, dirToFile map[string]s
 	}
 
 	return out
+}
+
+// manifestTargetRoots parses a Package.swift and returns a map of SPM target
+// name -> module directory (repo-relative, slash), without emitting facts. It is
+// used to seed the module resolver before the AST walk so package source files
+// declare into their SPM target module (e.g. LocalPackages/X/Sources/X) rather
+// than their leaf directory. Returns nil when the manifest has no parseable
+// Package(...) call.
+func manifestTargetRoots(src []byte, manifestRel string) map[string]string {
+	parser := sitter.NewParser()
+	defer parser.Close()
+	if err := parser.SetLanguage(sitter.NewLanguage(swift.Language())); err != nil {
+		return nil
+	}
+	tree := parser.Parse(src, nil)
+	if tree == nil {
+		return nil
+	}
+	defer tree.Close()
+
+	pkgCall := findPackageCall(tree.RootNode(), src)
+	if pkgCall == nil {
+		return nil
+	}
+	args := callValueArguments(pkgCall)
+	if args == nil {
+		return nil
+	}
+
+	pkgDir := filepath.ToSlash(filepath.Dir(manifestRel))
+	roots := map[string]string{}
+	if targetsArr := argValue(args, "targets", src); targetsArr != nil {
+		for _, elem := range arrayElements(targetsArr) {
+			if elem.Kind() != "call_expression" {
+				continue
+			}
+			switch memberCallName(elem, src) {
+			case "target", "executableTarget", "testTarget", "macro", "plugin", "systemLibrary", "binaryTarget":
+			default:
+				continue
+			}
+			tArgs := callValueArguments(elem)
+			if tArgs == nil {
+				continue
+			}
+			name := argString(tArgs, "name", src)
+			if name == "" {
+				continue
+			}
+			dir := pkgDir + "/Sources/" + name
+			if p := argString(tArgs, "path", src); p != "" {
+				dir = filepath.ToSlash(filepath.Join(pkgDir, p))
+			}
+			roots[name] = dir
+		}
+	}
+	return roots
 }
 
 // parseManifestDeps reads a target's `dependencies:` array. Each element is a
