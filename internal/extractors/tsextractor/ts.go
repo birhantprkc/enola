@@ -131,9 +131,11 @@ func (e *TSExtractor) Extract(ctx context.Context, repoPath string, files []stri
 	// pure function of (src, relFile, …), so per-file work is independent. Results
 	// are merged in file order for deterministic output.
 	var tsFiles []string
+	knownFiles := make(map[string]bool)
 	for _, relFile := range files {
 		if isTypeScriptFile(relFile) {
 			tsFiles = append(tsFiles, relFile)
+			knownFiles[filepath.ToSlash(relFile)] = true
 		}
 	}
 
@@ -143,16 +145,34 @@ func (e *TSExtractor) Extract(ctx context.Context, repoPath string, files []stri
 			log.Printf("[ts-extractor] error reading %s: %v", relFile, err)
 			return nil
 		}
+		if isMinifiedSource(src) {
+			// Minified/bundled artifact (e.g. a checked-in webpack/vendor bundle
+			// served statically). Emitting facts for its obfuscated symbols
+			// pollutes complexity/hotspot/performance analysis, so skip it.
+			log.Printf("[ts-extractor] skipping minified/bundled file %s", relFile)
+			return nil
+		}
 		aliases := aliasesForDir(aliasRoots, filepath.Dir(relFile))
-		return e.extractFile(src, relFile, isNextJS, isVue, isNuxt, isSvelteKit, aliases)
+		return e.extractFile(src, relFile, isNextJS, isVue, isNuxt, isSvelteKit, aliases, knownFiles)
 	})
 
-	// Group files by directory for module detection
+	// Group files by directory for module detection. Files that produced no
+	// facts (unreadable, or skipped as minified/bundled) do not register a
+	// module, so a directory containing only skipped bundles (e.g. a vendored
+	// scripts dir) stays out of the graph rather than surfacing as an empty module.
 	modules := make(map[string]bool)
 	for i, fileFacts := range perFileFacts {
+		if len(fileFacts) == 0 {
+			continue
+		}
 		allFacts = append(allFacts, fileFacts...)
 		modules[filepath.Dir(tsFiles[i])] = true
 	}
+
+	// Serial post-pass: propagate the per-body io_direct flag transitively across the
+	// call graph into performs_io, so wrapper-hidden network/file I/O is visible to the
+	// enterprise performance analyzer. Mirrors the Swift extractor's computePerformsIO.
+	computeTSPerformsIO(allFacts)
 
 	// Emit module facts for each directory
 	for dir := range modules {
@@ -172,17 +192,19 @@ func (e *TSExtractor) Extract(ctx context.Context, repoPath string, files []stri
 // extractCtx bundles the per-file state threaded through declaration extraction
 // so symbols can be enriched with React/Next.js semantic classification.
 type extractCtx struct {
-	src       []byte
-	relFile   string
-	dir       string
-	isTSX     bool
-	isNextJS  bool
-	isVue     bool
-	isNuxt    bool
-	importMap map[string]string
+	src        []byte
+	relFile    string
+	dir        string
+	isTSX      bool
+	isNextJS   bool
+	isVue      bool
+	isNuxt     bool
+	importMap  map[string]string
+	ioBindings map[string]bool // local names bound to imports from a network module (I/O sinks)
+	knownFiles map[string]bool // repo-relative (slash) paths of all indexed TS/JS files
 }
 
-func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, isNuxt, isSvelteKit bool, aliases map[string]string) []facts.Fact {
+func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, isNuxt, isSvelteKit bool, aliases map[string]string, knownFiles map[string]bool) []facts.Fact {
 	if isVueFile(relFile) {
 		return e.extractVueSFC(src, relFile, isNuxt, aliases)
 	}
@@ -222,14 +244,16 @@ func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, i
 	result = append(result, e.extractImports(root, src, relFile, aliases)...)
 
 	ctx := &extractCtx{
-		src:       src,
-		relFile:   relFile,
-		dir:       filepath.Dir(relFile),
-		isTSX:     isTSX,
-		isNextJS:  isNextJS,
-		isVue:     isVue,
-		isNuxt:    isNuxt,
-		importMap: buildImportSymbols(root, src, relFile, aliases),
+		src:        src,
+		relFile:    relFile,
+		dir:        filepath.Dir(relFile),
+		isTSX:      isTSX,
+		isNextJS:   isNextJS,
+		isVue:      isVue,
+		isNuxt:     isNuxt,
+		importMap:  buildImportSymbols(root, src, relFile, aliases),
+		ioBindings: buildIOImportBindings(root, src),
+		knownFiles: knownFiles,
 	}
 	decls := e.extractDeclarations(root, ctx)
 
@@ -248,6 +272,12 @@ func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, i
 		}
 	}
 	result = append(result, decls...)
+
+	// Whole-file reference pass (JSX component rendering, imported-identifier values
+	// like route configs, namespace member access, require()-bound names). Emitted as
+	// a KindFileRef so file-scope references the per-function call walk cannot see do
+	// not leave used code mis-reported as dead.
+	result = append(result, e.collectTSFileRefs(root, ctx, aliases)...)
 
 	// Detect Next.js routes
 	if isNextJS {
@@ -327,6 +357,53 @@ func (e *TSExtractor) extractImports(root *sitter.Node, src []byte, relFile stri
 			},
 		})
 	}
+
+	// CommonJS require() and dynamic import() calls are the only import mechanism in
+	// server/build/task trees and code-split call sites; capture them as dependency
+	// edges too so those graphs are not invisible. These calls can be nested anywhere,
+	// so walk the whole tree; a dir-pair is deduped against the static imports above.
+	seenDep := make(map[string]bool)
+	for _, r := range result {
+		seenDep[r.Name] = true
+	}
+	var walkDeps func(n *sitter.Node)
+	walkDeps = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		if n.Kind() == "call_expression" {
+			if fn := n.ChildByFieldName("function"); fn != nil {
+				isRequire := fn.Kind() == "identifier" && nodeText(fn, src) == "require"
+				isDynImport := fn.Kind() == "import"
+				if isRequire || isDynImport {
+					if strArg := findChildByKind(n.ChildByFieldName("arguments"), "string"); strArg != nil {
+						importPath := strings.Trim(nodeText(strArg, src), `"'`)
+						resolved, isExternal := resolveImportPath(importPath, dir, aliases)
+						name := dir + " -> " + resolved
+						if !seenDep[name] {
+							seenDep[name] = true
+							source := "internal"
+							if isExternal {
+								source = "external"
+							}
+							result = append(result, facts.Fact{
+								Kind:      facts.KindDependency,
+								Name:      name,
+								File:      relFile,
+								Line:      int(n.StartPosition().Row) + 1,
+								Props:     map[string]any{"language": "typescript", "source": source, "dynamic": true},
+								Relations: []facts.Relation{{Kind: facts.RelImports, Target: resolved}},
+							})
+						}
+					}
+				}
+			}
+		}
+		for i := range n.ChildCount() {
+			walkDeps(n.Child(i))
+		}
+	}
+	walkDeps(root)
 
 	return result
 }
@@ -413,6 +490,13 @@ func (e *TSExtractor) extractNode(node *sitter.Node, ctx *extractCtx, isExported
 			},
 		}
 
+		// A TS `abstract class` is an abstraction (has unimplemented members and
+		// cannot be instantiated) — tag it so package-metrics counts it toward
+		// abstractness, matching Java/Kotlin/Python. Plain classes stay concrete.
+		if node.Kind() == "abstract_class_declaration" {
+			f.Props["abstract"] = true
+		}
+
 		// Check for implements clause (nested under class_heritage)
 		for j := range node.ChildCount() {
 			c := node.Child(j)
@@ -465,7 +549,7 @@ func (e *TSExtractor) extractNode(node *sitter.Node, ctx *extractCtx, isExported
 					}
 				}
 				mRels := []facts.Relation{{Kind: facts.RelDeclares, Target: dir}}
-				callRels, m := collectCallsWithMetrics(member, src, dir, symbolName, ctx.importMap, dir+"."+symbolName+"."+mName, mName)
+				callRels, m := collectCallsWithMetrics(member, src, dir, symbolName, ctx.importMap, ctx.ioBindings, dir+"."+symbolName+"."+mName, mName)
 				mRels = append(mRels, callRels...)
 				mProps := map[string]any{
 					"symbol_kind": facts.SymbolMethod,
@@ -542,7 +626,7 @@ func (e *TSExtractor) extractNode(node *sitter.Node, ctx *extractCtx, isExported
 			vRels := []facts.Relation{{Kind: facts.RelDeclares, Target: dir}}
 			var vMetrics *tsBodyMetrics
 			if body != nil {
-				callRels, m := collectCallsWithMetrics(body, src, dir, "", ctx.importMap, dir+"."+symbolName, symbolName)
+				callRels, m := collectCallsWithMetrics(body, src, dir, "", ctx.importMap, ctx.ioBindings, dir+"."+symbolName, symbolName)
 				vRels = append(vRels, callRels...)
 				vMetrics = m
 			}
@@ -573,7 +657,7 @@ func (e *TSExtractor) extractNode(node *sitter.Node, ctx *extractCtx, isExported
 // location; body is walked for outgoing calls and JSX-based classification.
 func (e *TSExtractor) funcSymbol(declNode, body *sitter.Node, ctx *extractCtx, name string, exported bool) facts.Fact {
 	rels := []facts.Relation{{Kind: facts.RelDeclares, Target: ctx.dir}}
-	callRels, m := collectCallsWithMetrics(body, ctx.src, ctx.dir, "", ctx.importMap, ctx.dir+"."+name, name)
+	callRels, m := collectCallsWithMetrics(body, ctx.src, ctx.dir, "", ctx.importMap, ctx.ioBindings, ctx.dir+"."+name, name)
 	rels = append(rels, callRels...)
 	f := facts.Fact{
 		Kind: facts.KindSymbol,
@@ -751,6 +835,34 @@ func detectNextJSAt(dir string) bool {
 func isTypeScriptFile(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	return ext == ".ts" || ext == ".tsx" || ext == ".vue" || ext == ".js" || ext == ".jsx" || ext == ".svelte"
+}
+
+// minifiedLineThreshold is the line length above which a file is treated as
+// minified/generated. Hand-written source effectively never has a single line
+// this long; bundlers, minifiers, and embedded data blobs routinely produce
+// lines of tens of thousands of characters on one line.
+const minifiedLineThreshold = 2000
+
+// isMinifiedSource reports whether content looks like a minified or bundled
+// artifact rather than hand-written source, by the presence of any line longer
+// than minifiedLineThreshold. Parsing such files (e.g. a checked-in webpack /
+// vendor bundle served statically) pollutes the fact graph with obfuscated
+// symbols and drives spurious complexity/hotspot findings, so they are skipped.
+// The scan is bounded: it stops at the first over-length line without buffering
+// the whole file.
+func isMinifiedSource(content []byte) bool {
+	col := 0
+	for _, b := range content {
+		if b == '\n' {
+			col = 0
+			continue
+		}
+		col++
+		if col > minifiedLineThreshold {
+			return true
+		}
+	}
+	return false
 }
 
 // OwnsFile implements plugin.FileOwner for incremental caching.
@@ -963,6 +1075,9 @@ func isComponentWrapper(call *sitter.Node, src []byte) bool {
 }
 
 func findChildByKind(node *sitter.Node, kind string) *sitter.Node {
+	if node == nil {
+		return nil
+	}
 	for i := range node.ChildCount() {
 		child := node.Child(i)
 		if child.Kind() == kind {
@@ -1137,6 +1252,33 @@ func resolveImportPath(importPath, fileDir string, aliases map[string]string) (s
 	return importPath, true
 }
 
+// tsModuleExts are the source extensions a bare import path may resolve to, tried in
+// TS-before-JS order (a project with both prefers the typed file).
+var tsModuleExts = []string{".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte"}
+
+// resolveModuleFile resolves an extensionless internal import path to the actual
+// source file backing it, using the set of known indexed files. It returns the
+// resolved file path, the directory that owns its symbols, and whether a match was
+// found. A file module (`./utils` → utils.ts) owns symbols under its PARENT dir (the
+// symbol naming convention "<dir>.<sym>" uses filepath.Dir of the file); a folder
+// module (`./feed_item` → feed_item/index.tsx) owns symbols under the folder itself.
+// This is what lets a default import bind to the folder-index default export, whose
+// name (fileSymbolName → "<Folder>Index") is otherwise unmatchable.
+func resolveModuleFile(resolved string, knownFiles map[string]bool) (indexPath, dir string, ok bool) {
+	resolved = filepath.ToSlash(resolved)
+	for _, ext := range tsModuleExts {
+		if knownFiles[resolved+ext] {
+			return resolved + ext, filepath.ToSlash(filepath.Dir(resolved)), true
+		}
+	}
+	for _, ext := range tsModuleExts {
+		if idx := resolved + "/index" + ext; knownFiles[idx] {
+			return idx, resolved, true
+		}
+	}
+	return "", "", false
+}
+
 // buildImportSymbols returns a map of locally-bound import name → canonical symbol
 // fact name for named imports from internal modules. It lets bare calls to
 // imported functions (e.g. `formatName()`) resolve to the callee's declaration
@@ -1190,6 +1332,322 @@ func buildImportSymbols(root *sitter.Node, src []byte, relFile string, aliases m
 	return m
 }
 
+// collectTSFileRefs performs a whole-file reference pass for the dead-code detector.
+//
+// The per-function call walk (collectCallsWithMetrics) only records call_expression
+// edges inside function bodies, so it misses the ways a React/CommonJS codebase
+// actually uses a symbol: rendering a component in JSX (<Foo/>), passing an imported
+// identifier as a value (route configs — `{ component: Foo }`), namespace member
+// access (`ns.foo`), and require()-bound names. Many of these live at module scope
+// (top-level route arrays), which has no enclosing symbol fact to hang an edge on.
+//
+// We fold every such reference into a single KindFileRef fact — the reference-only
+// carrier the dead-code detector already consumes for top-level references — so
+// genuinely-used code is not mis-reported as dead. References are matched downstream
+// by short name, so binding a local import name to "<moduleDir>.<name>" is enough
+// even when the canonical declaration lives behind a folder index (the last segment
+// still matches). This only ever ADDS references, so it can hide a real orphan but
+// never invent a false one — the detector's deliberate conservative bias.
+func (e *TSExtractor) collectTSFileRefs(root *sitter.Node, ctx *extractCtx, aliases map[string]string) []facts.Fact {
+	src := ctx.src
+	fileDir := filepath.Dir(ctx.relFile)
+	internal := make(map[string]string)   // local name -> canonical target (internal modules only)
+	namespaces := make(map[string]string) // `import * as ns` local -> module dir
+	var reexports []string                // canonical targets re-exported via `export { x } from './y'`
+	var defaultRefs []string              // default-export targets of default-imported modules
+
+	bind := func(local, moduleDir, exportName string) {
+		if local != "" {
+			internal[local] = moduleDir + "." + exportName
+		}
+	}
+	// resolveModule resolves an import specifier to its owning module directory and,
+	// when the backing file is known, that file's path (for computing the module's
+	// default-export name). ok is false for external modules. It prefers the exact
+	// file/folder-index from the known-files set — so a folder module resolves to the
+	// folder itself, not its parent — falling back to filepath.Dir when the target
+	// isn't indexed (still lets short-name matching link named imports).
+	resolveModule := func(node *sitter.Node) (moduleDir, indexPath string, ok bool) {
+		if node == nil {
+			return "", "", false
+		}
+		importPath := strings.Trim(nodeText(node, src), `"'`)
+		resolved, isExternal := resolveImportPath(importPath, fileDir, aliases)
+		if isExternal {
+			return "", "", false
+		}
+		if idx, dir, found := resolveModuleFile(resolved, ctx.knownFiles); found {
+			return dir, idx, true
+		}
+		return filepath.Dir(resolved), "", true
+	}
+
+	// Pass 1: parse the bindings — static imports, `export … from` re-exports, and
+	// require()/dynamic-import assignments — into name → target maps.
+	for i := range root.ChildCount() {
+		child := root.Child(i)
+		switch child.Kind() {
+		case "import_statement":
+			moduleDir, indexPath, ok := resolveModule(findChildByKind(child, "string"))
+			if !ok {
+				continue
+			}
+			clause := findChildByKind(child, "import_clause")
+			if clause == nil {
+				continue
+			}
+			for j := range clause.ChildCount() {
+				c := clause.Child(j)
+				switch c.Kind() {
+				case "identifier": // default import: `import Foo from './x'`
+					local := nodeText(c, src)
+					bind(local, moduleDir, local)
+					// A default import IS a use of the module's default export, whose
+					// symbol is named by fileSymbolName (an anonymous
+					// `export default connect(...)(X)` in a folder index becomes
+					// "<Folder>Index" — unmatchable by the local name). Record it so the
+					// wrapper symbol is not falsely reported dead.
+					if indexPath != "" {
+						defaultRefs = append(defaultRefs, moduleDir+"."+fileSymbolName(indexPath))
+					}
+				case "namespace_import": // `import * as ns from './x'`
+					if id := findChildByKind(c, "identifier"); id != nil {
+						namespaces[nodeText(id, src)] = moduleDir
+					}
+				case "named_imports":
+					for k := range c.ChildCount() {
+						spec := c.Child(k)
+						if spec.Kind() != "import_specifier" {
+							continue
+						}
+						nameNode := spec.ChildByFieldName("name")
+						if nameNode == nil {
+							continue
+						}
+						exportName := nodeText(nameNode, src)
+						local := exportName
+						if a := spec.ChildByFieldName("alias"); a != nil {
+							local = nodeText(a, src)
+						}
+						bind(local, moduleDir, exportName)
+					}
+				}
+			}
+		case "export_statement":
+			// `export { a, default as b } from './y'` re-exports y's symbols; record a
+			// reference to each so a symbol consumed only through a barrel is not
+			// mis-reported as dead (matched by short name downstream).
+			moduleDir, indexPath, ok := resolveModule(child.ChildByFieldName("source"))
+			if !ok {
+				continue
+			}
+			if clause := findChildByKind(child, "export_clause"); clause != nil {
+				for k := range clause.ChildCount() {
+					spec := clause.Child(k)
+					if spec.Kind() != "export_specifier" {
+						continue
+					}
+					nameNode := spec.ChildByFieldName("name")
+					if nameNode == nil {
+						continue
+					}
+					// `export { default as X } from './y'` re-exports y's default; the
+					// literal name "default" matches no symbol, so resolve it to y's
+					// default-export name (fileSymbolName) instead.
+					if name := nodeText(nameNode, src); name == "default" && indexPath != "" {
+						reexports = append(reexports, moduleDir+"."+fileSymbolName(indexPath))
+					} else {
+						reexports = append(reexports, moduleDir+"."+name)
+					}
+				}
+			}
+		case "lexical_declaration", "variable_declaration":
+			// CommonJS: `const x = require('./y')` / `const { a } = require('./y')`.
+			for j := range child.ChildCount() {
+				d := child.Child(j)
+				if d.Kind() != "variable_declarator" {
+					continue
+				}
+				val := d.ChildByFieldName("value")
+				if val == nil || val.Kind() != "call_expression" {
+					continue
+				}
+				fn := val.ChildByFieldName("function")
+				if fn == nil || nodeText(fn, src) != "require" {
+					continue
+				}
+				moduleDir, _, ok := resolveModule(findChildByKind(val.ChildByFieldName("arguments"), "string"))
+				if !ok {
+					continue
+				}
+				nameNode := d.ChildByFieldName("name")
+				if nameNode == nil {
+					continue
+				}
+				switch nameNode.Kind() {
+				case "identifier":
+					local := nodeText(nameNode, src)
+					bind(local, moduleDir, local)
+				case "object_pattern":
+					for k := range nameNode.ChildCount() {
+						if p := nameNode.Child(k); p.Kind() == "shorthand_property_identifier_pattern" {
+							nm := nodeText(p, src)
+							bind(nm, moduleDir, nm)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Pass 2: walk the whole tree collecting references — to the imported/required
+	// bindings above and, in call positions, to same-module declarations.
+	var targets []string
+	seen := make(map[string]bool)
+	add := func(t string) {
+		if t != "" && !seen[t] {
+			seen[t] = true
+			targets = append(targets, t)
+		}
+	}
+	var walk func(n *sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n == nil {
+			return
+		}
+		switch n.Kind() {
+		case "import_statement":
+			return // binding sites, not uses
+		case "identifier", "type_identifier":
+			// type_identifier covers an imported type/interface used only as an
+			// annotation (`repo: Repo`), which is otherwise never an edge.
+			if t, ok := internal[nodeText(n, src)]; ok {
+				add(t)
+			}
+			return
+		case "member_expression":
+			obj := n.ChildByFieldName("object")
+			prop := n.ChildByFieldName("property")
+			if obj != nil && obj.Kind() == "identifier" {
+				name := nodeText(obj, src)
+				if dir, ok := namespaces[name]; ok && prop != nil {
+					add(dir + "." + nodeText(prop, src)) // ns.foo -> <dir>.foo
+					return
+				}
+				if t, ok := internal[name]; ok {
+					add(t) // Foo.bar on imported Foo marks Foo used
+				}
+			}
+			for i := range n.ChildCount() {
+				walk(n.Child(i))
+			}
+			return
+		case "jsx_opening_element", "jsx_self_closing_element":
+			if nameNode := n.ChildByFieldName("name"); nameNode != nil {
+				add(resolveJSXTag(nameNode, src, ctx.dir, internal, namespaces))
+			}
+			for i := range n.ChildCount() {
+				walk(n.Child(i))
+			}
+			return
+		case "call_expression":
+			// A bare callee and identifier arguments are USE positions (never
+			// declarations), so it is safe to resolve them same-module as well as via
+			// imports. This catches module-scope calls the per-function walk cannot see
+			// (`startSession()` at file top level) and functions passed as values
+			// (`connect(mapStateToProps, actions)`, HOC/callback wiring) — otherwise a
+			// symbol used only that way is falsely reported dead.
+			if fn := n.ChildByFieldName("function"); fn != nil && fn.Kind() == "identifier" {
+				add(resolveLocalOrImport(nodeText(fn, src), ctx.dir, internal))
+			}
+			if args := n.ChildByFieldName("arguments"); args != nil {
+				for i := range args.ChildCount() {
+					if a := args.Child(i); a.Kind() == "identifier" {
+						add(resolveLocalOrImport(nodeText(a, src), ctx.dir, internal))
+					}
+				}
+			}
+			for i := range n.ChildCount() {
+				walk(n.Child(i))
+			}
+			return
+		}
+		for i := range n.ChildCount() {
+			walk(n.Child(i))
+		}
+	}
+	walk(root)
+
+	for _, t := range reexports {
+		add(t)
+	}
+	for _, t := range defaultRefs {
+		add(t)
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+
+	rels := make([]facts.Relation, 0, len(targets))
+	for _, t := range targets {
+		rels = append(rels, facts.Relation{Kind: facts.RelCalls, Target: t})
+	}
+	return []facts.Fact{{
+		Kind:      facts.KindFileRef,
+		Name:      ctx.relFile,
+		File:      ctx.relFile,
+		Line:      1,
+		Props:     map[string]any{"language": "typescript"},
+		Relations: rels,
+	}}
+}
+
+// resolveLocalOrImport resolves a bare name used in a value/call position to its
+// canonical symbol target: the imported binding when it is one, otherwise the
+// same-module declaration "<dir>.<name>". A name that matches neither yields a target
+// no symbol fact will match (harmless), so this only ever adds real references.
+func resolveLocalOrImport(name, dir string, internal map[string]string) string {
+	if t, ok := internal[name]; ok {
+		return t
+	}
+	return dir + "." + name
+}
+
+// resolveJSXTag resolves a JSX element's tag name to a canonical symbol target, or ""
+// when it is a host element (`<div>`) or an unresolvable/external component. A bare
+// PascalCase tag that is not an import is resolved same-module (`<dir>.<Name>`) so a
+// component rendered only by a sibling in the same file is not flagged dead.
+func resolveJSXTag(nameNode *sitter.Node, src []byte, dir string, internal, namespaces map[string]string) string {
+	switch nameNode.Kind() {
+	case "identifier":
+		name := nodeText(nameNode, src)
+		if t, ok := internal[name]; ok {
+			return t
+		}
+		if isComponentName(name) {
+			return dir + "." + name
+		}
+	case "member_expression", "nested_identifier":
+		// <Foo.Bar/> — resolve via the root object Foo.
+		obj := nameNode.ChildByFieldName("object")
+		if obj == nil && nameNode.ChildCount() > 0 {
+			obj = nameNode.Child(0)
+		}
+		if obj != nil {
+			root := nodeText(obj, src)
+			if d, ok := namespaces[root]; ok {
+				if prop := nameNode.ChildByFieldName("property"); prop != nil {
+					return d + "." + nodeText(prop, src)
+				}
+			}
+			if t, ok := internal[root]; ok {
+				return t
+			}
+		}
+	}
+	return ""
+}
+
 // tsBodyMetrics accumulates per-function complexity signals during the single
 // body walk — mirrors the Go/Python/Ruby/Swift/Kotlin extractors.
 type tsBodyMetrics struct {
@@ -1199,6 +1657,7 @@ type tsBodyMetrics struct {
 	callsInLoop []string        // distinct call targets invoked at loop depth >= 1
 	inLoopSeen  map[string]bool // dedup set for callsInLoop
 	recursive   bool            // body directly calls the enclosing function
+	ioDirect    bool            // body directly invokes a network/file I/O primitive
 }
 
 // tsIterators are array/collection methods whose callback runs once per element —
@@ -1231,6 +1690,149 @@ var tsCheapMethods = map[string]bool{
 	"toLocaleDateString": true, "toLocaleString": true, "toLocaleTimeString": true,
 	"toISOString": true, "getTime": true, "getFullYear": true, "getMonth": true,
 	"getDate": true, "getHours": true, "getMinutes": true, "getDay": true,
+}
+
+// --- Network/file I/O primitive detection (seeds the performs_io closure) ---
+//
+// A body is tagged io_direct when it directly invokes an I/O primitive. Detection
+// is syntactic (no type inference), matching three shapes: a bare global callee
+// (fetch), a member call on a known receiver (axios.get, fs.readFile), or a call to
+// a local binding imported from a network module (e.g. a `request` helper default-
+// exported from a `.../lib/network/request` module). The io_direct flag is then
+// propagated transitively into performs_io by computeTSPerformsIO, mirroring Swift.
+
+// tsIOCallNames are bare-identifier callees that are unambiguous network/file I/O.
+var tsIOCallNames = map[string]bool{
+	"fetch": true, "axios": true, "importScripts": true,
+}
+
+// tsIOReceivers are receiver root tokens whose method calls are I/O regardless of the
+// method name (axios.get, http.request, https.get, fs.readFile). Matched against the
+// first dotted segment of the receiver, so `fs.promises.readFile` still matches on `fs`.
+var tsIOReceivers = map[string]bool{
+	"axios": true, "http": true, "https": true, "fs": true,
+}
+
+// tsIOMemberMethods are method names that denote I/O regardless of receiver.
+var tsIOMemberMethods = map[string]bool{
+	"sendBeacon": true, // navigator.sendBeacon
+}
+
+// tsIOConstructors are constructor names (new X()) that open a network/stream resource.
+var tsIOConstructors = map[string]bool{
+	"WebSocket": true, "XMLHttpRequest": true, "EventSource": true,
+}
+
+// tsIONetworkPackages are npm packages that are HTTP clients — a call to a binding
+// imported from one of these is I/O. Matched against the first path segment (the
+// package name), so `got`/`ky` cannot false-match `forgot`/`sky`.
+var tsIONetworkPackages = map[string]bool{
+	"axios": true, "node-fetch": true, "cross-fetch": true, "isomorphic-fetch": true,
+	"ky": true, "got": true, "superagent": true, "undici": true, "phin": true,
+}
+
+// tsNonClientModuleBasenames are submodule leaf names that carry types/constants/pure
+// helpers rather than a request function, so a `.../network/types` or `.../network/utils`
+// path must NOT qualify as an I/O sink even though it has a `network` segment (e.g. a
+// redux-tools `network/types` module exports pure action-status helpers like `resolved`).
+var tsNonClientModuleBasenames = map[string]bool{
+	"types": true, "type": true, "constants": true, "const": true,
+	"errors": true, "error": true, "utils": true, "util": true,
+	"helpers": true, "helper": true, "config": true, "schema": true, "middleware": true,
+}
+
+// tsIsNetworkModule reports whether an import path denotes a network client — either a
+// known HTTP-client package, or a path with a `network` segment (which catches an
+// internal `.../lib/network/request` request helper). Paths whose leaf is a types/utils/
+// constants submodule are excluded — they carry pure helpers, not a request function.
+// Segment/exact matching only, never substring, to avoid collisions.
+func tsIsNetworkModule(importPath string) bool {
+	segs := strings.Split(importPath, "/")
+	if len(segs) == 0 {
+		return false
+	}
+	if tsNonClientModuleBasenames[segs[len(segs)-1]] {
+		return false
+	}
+	if tsIONetworkPackages[segs[0]] {
+		return true
+	}
+	for _, s := range segs {
+		if s == "network" {
+			return true
+		}
+	}
+	return false
+}
+
+// buildIOImportBindings returns the set of local names bound to the DEFAULT or NAMESPACE
+// import of a network module — the request-function pattern `import request from
+// '.../network/request'` or `import * as net from '.../network'`. A call to one of these
+// names, or a member call on one, is treated as direct I/O. Named imports are
+// deliberately NOT bound: a network barrel/types module exports pure helpers, error
+// classes, and action-status utilities (`resolved`, `NetworkError`, `assignPaginationDefaults`)
+// alongside any request function, and binding those mislabels every caller as doing I/O.
+// Sibling to buildImportSymbols, which drops external and default imports entirely.
+func buildIOImportBindings(root *sitter.Node, src []byte) map[string]bool {
+	bindings := make(map[string]bool)
+	for i := range root.ChildCount() {
+		child := root.Child(i)
+		if child.Kind() != "import_statement" {
+			continue
+		}
+		source := findChildByKind(child, "string")
+		if source == nil {
+			continue
+		}
+		if !tsIsNetworkModule(strings.Trim(nodeText(source, src), `"'`)) {
+			continue
+		}
+		clause := findChildByKind(child, "import_clause")
+		if clause == nil {
+			continue
+		}
+		for j := range clause.ChildCount() {
+			spec := clause.Child(j)
+			switch spec.Kind() {
+			case "identifier": // default import: import request from '...'
+				bindings[nodeText(spec, src)] = true
+			case "namespace_import": // import * as net from '...'
+				if id := findChildByKind(spec, "identifier"); id != nil {
+					bindings[nodeText(id, src)] = true
+				}
+			}
+		}
+	}
+	return bindings
+}
+
+// tsCalleeRoot returns the first dotted segment of a member-expression receiver text
+// (`fs.promises` → `fs`, `axios` → `axios`), for matching against tsIOReceivers / bindings.
+func tsCalleeRoot(recv string) string {
+	if i := strings.IndexByte(recv, '.'); i >= 0 {
+		return recv[:i]
+	}
+	return recv
+}
+
+// tsIsIOCall reports whether a call_expression directly performs network/file I/O:
+// a bare global primitive (fetch) or network-imported binding (request); or a member
+// call on a known I/O receiver (axios.get, fs.readFile), a network-imported binding, or
+// an I/O method name (navigator.sendBeacon).
+func tsIsIOCall(call *sitter.Node, src []byte, ioBindings map[string]bool) bool {
+	fn := call.ChildByFieldName("function")
+	if fn == nil {
+		return false
+	}
+	if fn.Kind() == "identifier" {
+		name := nodeText(fn, src)
+		return tsIOCallNames[name] || ioBindings[name]
+	}
+	if recv, prop := tsMemberCall(call, src); prop != "" {
+		root := tsCalleeRoot(recv)
+		return tsIOReceivers[root] || ioBindings[root] || tsIOMemberMethods[prop]
+	}
+	return false
 }
 
 // tsIsFunctionLike reports whether a node introduces a function scope (a deferred
@@ -1309,6 +1911,7 @@ type tsBodyWalker struct {
 	src                 []byte
 	dir, className      string
 	importMap           map[string]string
+	ioBindings          map[string]bool
 	selfName, selfShort string
 	metrics             *tsBodyMetrics
 	loopDepth           int
@@ -1393,6 +1996,12 @@ func (w *tsBodyWalker) walk(n *sitter.Node) {
 	}
 
 	if kind == "call_expression" {
+		// Seed the performs_io closure: flag the enclosing body when it directly
+		// invokes a network/file I/O primitive. Independent of loop depth — a wrapper
+		// calls its I/O sink once, and the transitive pass carries the signal upward.
+		if w.metrics != nil && !w.metrics.ioDirect && tsIsIOCall(n, w.src, w.ioBindings) {
+			w.metrics.ioDirect = true
+		}
 		if target := resolveTSCall(n, w.src, w.dir, w.className, w.importMap); target != "" {
 			if !w.seen[target] {
 				w.seen[target] = true
@@ -1428,6 +2037,31 @@ func (w *tsBodyWalker) walk(n *sitter.Node) {
 					}
 				}
 				return
+			}
+		}
+	}
+
+	// `new WebSocket(...)` / `new XMLHttpRequest()` opens a network/stream resource —
+	// tag the enclosing body io_direct (constructors are new_expression, not call_expression).
+	if kind == "new_expression" && w.metrics != nil && !w.metrics.ioDirect {
+		if ctor := n.ChildByFieldName("constructor"); ctor != nil && tsIOConstructors[nodeText(ctor, w.src)] {
+			w.metrics.ioDirect = true
+		}
+	}
+
+	// A `this.<member>` reference inside a class method marks that member used, even
+	// when it is not called: React binds event handlers as prop VALUES
+	// (onClick={this.handleClick}), so a handler referenced only in JSX has no call
+	// edge and would otherwise be mis-reported dead. className is the exact class
+	// symbol name, so the target matches the method fact "<dir>.<Class>.<member>".
+	if kind == "member_expression" && w.className != "" {
+		if obj := n.ChildByFieldName("object"); obj != nil && obj.Kind() == "this" {
+			if prop := n.ChildByFieldName("property"); prop != nil {
+				target := w.dir + "." + w.className + "." + nodeText(prop, w.src)
+				if !w.seen[target] {
+					w.seen[target] = true
+					w.rels = append(w.rels, facts.Relation{Kind: facts.RelCalls, Target: target})
+				}
 			}
 		}
 	}
@@ -1469,9 +2103,9 @@ func (w *tsBodyWalker) walkCallbackSubtree(n, cb *sitter.Node) {
 // deduplicated RelCalls relations plus per-function complexity metrics,
 // used for function/method/arrow facts. selfName/selfShort enable direct-recursion
 // detection.
-func collectCallsWithMetrics(node *sitter.Node, src []byte, dir, className string, importMap map[string]string, selfName, selfShort string) ([]facts.Relation, *tsBodyMetrics) {
+func collectCallsWithMetrics(node *sitter.Node, src []byte, dir, className string, importMap map[string]string, ioBindings map[string]bool, selfName, selfShort string) ([]facts.Relation, *tsBodyMetrics) {
 	m := &tsBodyMetrics{}
-	w := &tsBodyWalker{src: src, dir: dir, className: className, importMap: importMap, selfName: selfName, selfShort: selfShort, metrics: m, seen: make(map[string]bool)}
+	w := &tsBodyWalker{src: src, dir: dir, className: className, importMap: importMap, ioBindings: ioBindings, selfName: selfName, selfShort: selfShort, metrics: m, seen: make(map[string]bool)}
 	w.walk(node)
 	return w.rels, m
 }
@@ -1493,6 +2127,73 @@ func applyTSMetrics(props map[string]any, m *tsBodyMetrics) {
 	}
 	if m.recursive {
 		props["recursive_self"] = true
+	}
+	if m.ioDirect {
+		props["io_direct"] = true
+	}
+}
+
+// computeTSPerformsIO propagates the walk-time io_direct flag transitively across the
+// call graph into a performs_io prop, so a function that reaches network/file I/O only
+// through helpers is still flagged — the signal the enterprise analyzer reads to catch a
+// per-iteration network call behind a wrapper. Mirrors the Swift computePerformsIO, but
+// simpler: TS call targets are already canonical fact names, so no bare-name fan-out is
+// needed. A monotone fixpoint (only ever flips false→true) makes it cycle-safe.
+func computeTSPerformsIO(allFacts []facts.Fact) {
+	// Index symbol facts by name (a name may map to >1 fact) and record which names exist.
+	exists := make(map[string]bool)
+	for i := range allFacts {
+		if allFacts[i].Kind == facts.KindSymbol {
+			exists[allFacts[i].Name] = true
+		}
+	}
+
+	io := make(map[string]bool)      // name → performs I/O (directly or transitively)
+	adj := make(map[string][]string) // name → called names that are known symbols
+	for i := range allFacts {
+		f := &allFacts[i]
+		if f.Kind != facts.KindSymbol {
+			continue
+		}
+		if b, _ := f.Props["io_direct"].(bool); b {
+			io[f.Name] = true
+		}
+		seen := make(map[string]bool)
+		for _, r := range f.Relations {
+			if r.Kind != facts.RelCalls || r.Target == f.Name || seen[r.Target] || !exists[r.Target] {
+				continue
+			}
+			seen[r.Target] = true
+			adj[f.Name] = append(adj[f.Name], r.Target)
+		}
+	}
+
+	// Fixpoint: a name performs I/O if any callee does. Monotone, so it terminates
+	// even with call cycles (a no-I/O cycle simply stays false).
+	for changed := true; changed; {
+		changed = false
+		for name, callees := range adj {
+			if io[name] {
+				continue
+			}
+			for _, c := range callees {
+				if io[c] {
+					io[name] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+
+	for i := range allFacts {
+		f := &allFacts[i]
+		if f.Kind == facts.KindSymbol && io[f.Name] {
+			if f.Props == nil {
+				f.Props = map[string]any{}
+			}
+			f.Props["performs_io"] = true
+		}
 	}
 }
 

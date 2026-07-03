@@ -100,7 +100,36 @@ import (
 // (Java & Kotlin); a Dagger @Component interface is no longer mislabeled a Spring component
 // (disambiguated by interface-vs-class). Lets package-metrics exclude DI wiring from
 // abstractness/type counts (a Dagger component package was falsely "useless").
-const cacheVersion = "v60"
+// v61: TS/JS extractor now emits file-scope reference facts (KindFileRef) for JSX
+// component rendering (<Foo/>), imported-identifier values (route configs like
+// `{ component: Foo }`), namespace member access (`ns.foo`), require()-bound names,
+// and `export … from` re-exports — plus require()/dynamic-import() dependency edges.
+// Fixes massive dead-code false positives on React/CommonJS codebases, where a
+// component used only via JSX or a route table previously had no incoming edge.
+// v62: the TS/JS file-scope reference pass now also records same-module use
+// positions — a bare call callee and identifier call arguments — so a function used
+// only at module scope (`startSession()` at file top level) or passed as a value to
+// an HOC (`connect(mapStateToProps)`) is no longer falsely reported dead.
+// v63: a default import now also references the target module's default-export symbol
+// (resolved via the known-files set + fileSymbolName), so an anonymous folder-index
+// default like `export default connect(...)(X)` — named "<Folder>Index" — is no longer
+// falsely reported dead when imported by the component's own name.
+// v64: a `this.<member>` reference inside a class method now records a use of that
+// member, so a React class-component event handler bound as a prop value
+// (onClick={this.handleClick}) — never called by name — is no longer falsely dead.
+// v65: the TypeScript extractor now skips minified/bundled files (any line longer
+// than ~2000 chars), so checked-in vendor bundles emit no facts — invalidates
+// caches that still hold the obfuscated symbols.
+// v66: the TypeScript extractor now emits io_direct (body calls a network/file
+// primitive or a network-module import binding) and a transitively-propagated
+// performs_io prop, so cached TS facts must be re-extracted to carry them.
+// v67: tightened TS io_direct — only DEFAULT/NAMESPACE network-module imports are
+// I/O bindings (not named imports), and types/utils submodules are excluded, so pure
+// helpers (e.g. `resolved` from network/types) no longer mislabel callers.
+// v68: the TypeScript extractor now sets abstract:true on `abstract class`
+// declarations (was previously indistinguishable from a concrete class), so
+// package-metrics abstractness for TS must re-extract to pick up the flag.
+const cacheVersion = "v68"
 
 // extractorCache holds per-extractor facts keyed by a content hash of the files
 // the extractor depends on. It is loaded from disk at the start of a snapshot and
