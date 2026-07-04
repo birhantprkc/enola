@@ -13,17 +13,30 @@ import (
 // facts. Block boundaries come from the grammar (do_block) rather than counting
 // `do`/`end`, so nested namespaces/resources/scopes are tracked precisely.
 func parseRouteFileAST(src []byte, relFile string) []facts.Fact {
+	ff, _ := parseRouteFile(src, relFile, "")
+	return ff
+}
+
+// parseRouteFile parses a Rails route file, seeding the scope stack with
+// initialPrefix (the URL prefix a parent routes.rb delegated this file under via
+// draw(:pkg)), and additionally returns the draw(:pkg) -> prefix map discovered in
+// this file, so the caller can inline each delegated file under its real scope.
+func parseRouteFile(src []byte, relFile, initialPrefix string) ([]facts.Fact, map[string]string) {
 	parser := sitter.NewParser()
 	defer parser.Close()
 	if err := parser.SetLanguage(sitter.NewLanguage(ruby.Language())); err != nil {
-		return nil
+		return nil, nil
 	}
 	tree := parser.Parse(src, nil)
 	defer tree.Close()
 
-	rw := &routeWalker{src: src, relFile: relFile, dir: filepath.Dir(relFile)}
-	rw.walk(tree.RootNode(), nil)
-	return rw.out
+	var stack []routeScope
+	if initialPrefix != "" {
+		stack = []routeScope{{pathPrefix: initialPrefix}}
+	}
+	rw := &routeWalker{src: src, relFile: relFile, dir: filepath.Dir(relFile), draws: map[string]string{}}
+	rw.walk(tree.RootNode(), stack)
+	return rw.out, rw.draws
 }
 
 type routeWalker struct {
@@ -31,6 +44,9 @@ type routeWalker struct {
 	relFile string
 	dir     string
 	out     []facts.Fact
+	// draws maps each draw(:pkg) delegation found in this file to the URL prefix it
+	// is scoped under, so the caller can parse config/routes/<pkg>.rb with it.
+	draws map[string]string
 }
 
 // walk iterates the statements of a program / body_statement, dispatching each
@@ -103,8 +119,25 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 		}
 		only := pairSymbols(args, "only", rw.src)
 		except := pairSymbols(args, "except", rw.src)
-		resourcePath := prefix + "/" + name
-		for _, a := range restfulActions(only, except) {
+		singular := method == "resource"
+
+		// A resource nested inside a *plural* `resources` block nests under the parent
+		// member (`/widgets/:widget_id/...`); the parent supplies that param via the
+		// enclosing scope's memberParam.
+		parentMember := ""
+		if len(stack) > 0 {
+			if p := stack[len(stack)-1].memberParam; p != "" {
+				parentMember = "/:" + p
+			}
+		}
+		segment := parentMember + "/" + name
+		resourcePath := prefix + segment
+
+		actions := restfulActions(only, except)
+		if singular {
+			actions = restfulActionsSingular(only, except)
+		}
+		for _, a := range actions {
 			rw.emit(resourcePath+a.suffix, line(call), map[string]any{
 				"method":    a.method,
 				"framework": "rails",
@@ -114,7 +147,12 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 			})
 		}
 		if body != nil {
-			rw.walk(body, append(stack, routeScope{pathPrefix: "/" + name}))
+			// A plural resource exposes a member id to its children; a singular one does not.
+			childMember := ""
+			if !singular {
+				childMember = singularize(name) + "_id"
+			}
+			rw.walk(body, append(stack, routeScope{pathPrefix: segment, memberParam: childMember}))
 		}
 
 	case "namespace":
@@ -156,6 +194,13 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 			return
 		}
 		if pkg := firstSymbolArg(args, rw.src); pkg != "" {
+			// Record the delegation so the caller can parse config/routes/<pkg>.rb
+			// seeded with this prefix, giving its routes their real /api/vN scope.
+			if rw.draws != nil {
+				rw.draws[pkg] = prefix
+			}
+			// A DRAW placeholder route is still emitted (it backs route helpers); the
+			// linker treats method "DRAW" as inert, so it never matches or is flagged.
 			rw.out = append(rw.out, facts.Fact{
 				Kind: facts.KindRoute,
 				Name: prefix + "/" + pkg,

@@ -129,7 +129,20 @@ import (
 // v68: the TypeScript extractor now sets abstract:true on `abstract class`
 // declarations (was previously indistinguishable from a concrete class), so
 // package-metrics abstractness for TS must re-extract to pick up the flag.
-const cacheVersion = "v68"
+// v69: HTTP-client detection expanded — TS options-object/openapi-fetch clients,
+// Swift endpoint-enum (APIEndpoint/TargetType) clients, Rails draw(:pkg) routes now
+// carry their /api/vN scope prefix, and Swift URLSession skips test/fixture sources.
+// v70: Swift endpoint extractor resolves the version prefix — repo-wide default
+// (protocol-extension urlPrefixComponent), single-value/switch-default overrides,
+// and version-constant interpolation — so prefix-less endpoints match backend routes.
+// v71: Swift endpoint extractor resolves stored-method endpoint structs (path/prefix
+// computed, `method` a stored property) by reading the HTTP verb from each
+// instantiation site's `method:` argument, emitting one client route per (path, verb).
+// v72: Swift extractor also resolves request-wrapper endpoints (path supplied at the
+// call site's `urlPathComponent:` arg, verb from `method:`/`httpMethod:` or a type
+// default); Ruby extractor fixes nested Rails resource paths — a singular `resource`
+// gets no `:id`, and children of a plural `resources` nest under `:<singular>_id`.
+const cacheVersion = "v72"
 
 // extractorCache holds per-extractor facts keyed by a content hash of the files
 // the extractor depends on. It is loaded from disk at the start of a snapshot and
