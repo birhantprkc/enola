@@ -142,7 +142,24 @@ import (
 // call site's `urlPathComponent:` arg, verb from `method:`/`httpMethod:` or a type
 // default); Ruby extractor fixes nested Rails resource paths — a singular `resource`
 // gets no `:id`, and children of a plural `resources` nest under `:<singular>_id`.
-const cacheVersion = "v72"
+// v73: new gRPC extractor emits a server-role KindRoute per proto RPC (Name
+// "/pkg.Service/Method", method POST) plus service/rpc/message symbols; the TS
+// extractor detects gRPC-web client call sites as client-role routes
+// (source "ts-grpc-client"), so gRPC flows through the cross-repo linker and
+// unused-routes like HTTP.
+// v74: Go extractor detects gRPC client call sites (NewXxxClient(...) +
+// client.Method(...)) and emits client-role routes (source "go-grpc-client"),
+// resolving the wire path from the generated concrete client's Invoke/NewStream
+// literal. Documentation-only bump — goextractor is not a FileOwner, so its
+// facts are never cached; recorded for changelog continuity.
+// v75: broadened gRPC client detection — Go now resolves struct-field-injected
+// clients (via the field-type map) and connect-go (procedure-const paths); the
+// TypeScript extractor detects connect-es createClient/createPromiseClient(...)
+// call sites. Bump required because the TS extractor is a FileOwner (cached).
+// v76: classic grpc-web clients recognized (TS extractor derives service+methods
+// from MethodDescriptor/rpcCall path literals); Go extractor resolves gRPC
+// clients held in package-level vars. Bump required for the TS (FileOwner) change.
+const cacheVersion = "v76"
 
 // extractorCache holds per-extractor facts keyed by a content hash of the files
 // the extractor depends on. It is loaded from disk at the start of a snapshot and
