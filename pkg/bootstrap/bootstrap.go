@@ -54,6 +54,16 @@ func (e *Engine) Snapshot() *facts.Snapshot {
 	return e.eng.Snapshot()
 }
 
+// ActiveRepo returns the absolute repo path of the currently loaded snapshot,
+// or "" if none is loaded. Used to attribute tool usage to the repo a call
+// actually operated on.
+func (e *Engine) ActiveRepo() string {
+	if snap := e.eng.Snapshot(); snap != nil {
+		return snap.Meta.RepoPath
+	}
+	return ""
+}
+
 // SetSnapshot sets the snapshot (used when auto-loading from disk).
 func (e *Engine) SetSnapshot(snap *facts.Snapshot) {
 	e.eng.SetSnapshot(snap)
@@ -135,8 +145,10 @@ func (s *Server) Run(ctx context.Context) error {
 	return s.srv.Run(ctx)
 }
 
-// SetToolCallback sets a callback invoked each time a tool is called.
-func (s *Server) SetToolCallback(cb func(string)) {
+// SetToolCallback sets a callback invoked each time a tool is called. The
+// callback receives the tool name and the absolute repo path the call operated
+// on.
+func (s *Server) SetToolCallback(cb func(tool, repo string)) {
 	s.srv.SetToolCallback(cb)
 }
 

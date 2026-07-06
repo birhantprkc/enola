@@ -26,7 +26,7 @@ type Server struct {
 	eng          *engine.Engine
 	cfg          *config.Config
 	startTime    time.Time
-	toolCallback func(string)
+	toolCallback func(tool, repo string)
 
 	// snapshotsGenerated records whether generate_snapshot has run at least once
 	// in this session. It distinguishes a user-driven multi-repo session from a
@@ -62,10 +62,28 @@ func (s *Server) Run(ctx context.Context) error {
 	return s.mcp.Run(ctx, &mcp.StdioTransport{})
 }
 
-// SetToolCallback sets a callback invoked each time a tool is called.
-// The callback receives the tool name. It is safe to call before Run().
-func (s *Server) SetToolCallback(cb func(string)) {
+// SetToolCallback sets a callback invoked each time a tool is called. The
+// callback receives the tool name and the absolute path of the repo the call
+// operated on (the active snapshot's repo, or the target repo for
+// generate_snapshot). It is safe to call before Run().
+func (s *Server) SetToolCallback(cb func(tool, repo string)) {
 	s.toolCallback = cb
+}
+
+// fireToolCallback invokes the tool callback if set.
+func (s *Server) fireToolCallback(tool, repo string) {
+	if s.toolCallback != nil {
+		s.toolCallback(tool, repo)
+	}
+}
+
+// activeRepo returns the repo path the current snapshot is loaded for, falling
+// back to the configured repo when nothing is loaded yet.
+func (s *Server) activeRepo() string {
+	if snap := s.eng.Snapshot(); snap != nil && snap.Meta.RepoPath != "" {
+		return snap.Meta.RepoPath
+	}
+	return s.cfg.Repo
 }
 
 // GetStartTime returns the time the server started (zero value if Run() hasn't been called).
@@ -380,9 +398,6 @@ func (s *Server) registerTools() {
 			"enola auto-enables append when it detects you have switched to a different repo. " +
 			"If you have instead moved to a DIFFERENT project and want a clean single-repo snapshot (not merged into the current store), pass fresh=true to reset.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args generateSnapshotArgs) (*mcp.CallToolResult, any, error) {
-		if s.toolCallback != nil {
-			s.toolCallback("generate_snapshot")
-		}
 		repoPath := args.RepoPath
 		if repoPath == "" {
 			repoPath = s.cfg.Repo
@@ -392,6 +407,10 @@ func (s *Server) registerTools() {
 		if err != nil {
 			return errorResult(fmt.Sprintf("invalid repo path: %v", err)), nil, nil
 		}
+
+		// Attribute this call to the repo actually being indexed (resolved
+		// above), not the previously loaded one.
+		s.fireToolCallback("generate_snapshot", absRepo)
 
 		if args.Fresh && args.Append {
 			return errorResult("fresh and append are mutually exclusive: fresh forces a single-repo reset; append adds to the existing store. Pick one."), nil, nil
@@ -522,9 +541,7 @@ func (s *Server) registerTools() {
 			"For dependencies, set prop='source' prop_value='internal'|'external'|'stdlib' to filter noise. " +
 			"Supports pagination via offset/limit (default 100, max 500).",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args queryFactsArgs) (*mcp.CallToolResult, any, error) {
-		if s.toolCallback != nil {
-			s.toolCallback("query_facts")
-		}
+		s.fireToolCallback("query_facts", s.activeRepo())
 		store := s.eng.Store()
 		if store.Count() == 0 {
 			return errorResult("No facts available. Run generate_snapshot first."), nil, nil
@@ -655,9 +672,7 @@ func (s *Server) registerTools() {
 			"Use context_lines to widen or narrow the window. " +
 			"Works in both single-repo and multi-repo (append) mode.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args showSymbolArgs) (*mcp.CallToolResult, any, error) {
-		if s.toolCallback != nil {
-			s.toolCallback("show_symbol")
-		}
+		s.fireToolCallback("show_symbol", s.activeRepo())
 		snapshot := s.eng.Snapshot()
 		if snapshot == nil {
 			return errorResult("No snapshot available. Run generate_snapshot first."), nil, nil
@@ -753,9 +768,7 @@ func (s *Server) registerTools() {
 			"Accepts absolute filesystem paths — they are normalised automatically. Pass max_tokens to hard-cap large directory/module output. " +
 			"Use query_facts for precise filtering, traverse for multi-hop graph walks.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args exploreArgs) (*mcp.CallToolResult, any, error) {
-		if s.toolCallback != nil {
-			s.toolCallback("explore")
-		}
+		s.fireToolCallback("explore", s.activeRepo())
 		store := s.eng.Store()
 		if store.Count() == 0 {
 			return errorResult("No facts available. Run generate_snapshot first."), nil, nil
@@ -816,9 +829,7 @@ func (s *Server) registerTools() {
 			"Start with summary; escalate to compact/full only when you need specific nodes. Always keep max_depth/max_nodes bounded, and pass max_tokens to hard-cap the response. " +
 			"Defaults: max_depth=5, max_nodes=100. Use instead of repeated explore calls for transitive relationships.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args traverseArgs) (*mcp.CallToolResult, any, error) {
-		if s.toolCallback != nil {
-			s.toolCallback("traverse")
-		}
+		s.fireToolCallback("traverse", s.activeRepo())
 		store := s.eng.Store()
 		if store.Count() == 0 {
 			return errorResult("No facts available. Run generate_snapshot first."), nil, nil
@@ -900,9 +911,7 @@ func (s *Server) registerTools() {
 			"If no path connects any candidate pair, found=false and a 'note' explains whether the endpoints were " +
 			"ambiguous (with the candidates tried) or resolved uniquely but unreachable within max_depth hops.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args findPathArgs) (*mcp.CallToolResult, any, error) {
-		if s.toolCallback != nil {
-			s.toolCallback("find_path")
-		}
+		s.fireToolCallback("find_path", s.activeRepo())
 		store := s.eng.Store()
 		if store.Count() == 0 {
 			return errorResult("No facts available. Run generate_snapshot first."), nil, nil
@@ -978,9 +987,7 @@ func (s *Server) registerTools() {
 			"Start with summary; escalate only when you need the specific nodes. Keep max_depth/max_nodes bounded and pass max_tokens to hard-cap the response. " +
 			"Defaults: max_depth=3, max_nodes=200.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args impactAnalysisArgs) (*mcp.CallToolResult, any, error) {
-		if s.toolCallback != nil {
-			s.toolCallback("impact_analysis")
-		}
+		s.fireToolCallback("impact_analysis", s.activeRepo())
 		store := s.eng.Store()
 		if store.Count() == 0 {
 			return errorResult("No facts available. Run generate_snapshot first."), nil, nil
@@ -1040,9 +1047,7 @@ func (s *Server) registerTools() {
 			"Use this before concluding a service is isolated. Only meaningful for multi-repo (append-mode) snapshots; single-repo snapshots have no service nodes. " +
 			"output_mode='summary' (DEFAULT) returns a markdown table; 'full' returns JSON. Optional repo= filters to one service.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args coverageReportArgs) (*mcp.CallToolResult, any, error) {
-		if s.toolCallback != nil {
-			s.toolCallback("coverage_report")
-		}
+		s.fireToolCallback("coverage_report", s.activeRepo())
 		store := s.eng.Store()
 		if store.Count() == 0 {
 			return errorResult("No facts available. Run generate_snapshot first."), nil, nil
@@ -1072,9 +1077,7 @@ func (s *Server) registerTools() {
 			"All explainers populate insights, but route/cross-repo findings (unused-routes, crossrepo, coverage) only appear for multi-repo (append-mode) snapshots of a backend plus its clients. " +
 			"Prefer this over hand-diffing query_facts results: e.g. query_insights(explainer=\"unused-routes\") returns the per-repo dead-route candidates directly.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args queryInsightsArgs) (*mcp.CallToolResult, any, error) {
-		if s.toolCallback != nil {
-			s.toolCallback("query_insights")
-		}
+		s.fireToolCallback("query_insights", s.activeRepo())
 		snap := s.eng.Snapshot()
 		if snap == nil {
 			return errorResult("No snapshot available. Run generate_snapshot first."), nil, nil
@@ -1113,9 +1116,7 @@ func (s *Server) registerTools() {
 			"The pinned baseline survives repeated generate_snapshot runs, so it stays valid across several edit rounds — " +
 			"unlike the auto-rotated 'previous' snapshot, which only ever holds the immediately-preceding run.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args setBaselineArgs) (*mcp.CallToolResult, any, error) {
-		if s.toolCallback != nil {
-			s.toolCallback("set_baseline")
-		}
+		s.fireToolCallback("set_baseline", s.activeRepo())
 		repoPath := s.currentRepoPath()
 		if repoPath == "" {
 			return errorResult("No snapshot available. Run generate_snapshot first, then set_baseline."), nil, nil
@@ -1144,9 +1145,7 @@ func (s *Server) registerTools() {
 			"output_mode ladder: 'summary' (DEFAULT — headline regressions/improvements + structural tally) → 'compact' (adds finding descriptions, evidence, and the changed edges/facts) → 'full' (complete JSON). " +
 			"New findings carry their original confidence and caveats; confidence < 1.0 is a candidate to verify, not a verdict.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args diffSnapshotArgs) (*mcp.CallToolResult, any, error) {
-		if s.toolCallback != nil {
-			s.toolCallback("diff_snapshot")
-		}
+		s.fireToolCallback("diff_snapshot", s.activeRepo())
 		snap := s.eng.Snapshot()
 		if snap == nil || s.eng.Store().Count() == 0 {
 			return errorResult("No snapshot available. Run generate_snapshot first."), nil, nil
@@ -1210,9 +1209,7 @@ func (s *Server) registerTools() {
 			"Read it before trusting an impact_analysis or a diff, and to spot thin extraction (a missing detection, a bad ignore glob, a failing extractor). " +
 			"output_mode: 'summary' (DEFAULT — the headline provenance + quality metrics) → 'full' (complete JSON receipt).",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args snapshotReceiptArgs) (*mcp.CallToolResult, any, error) {
-		if s.toolCallback != nil {
-			s.toolCallback("snapshot_receipt")
-		}
+		s.fireToolCallback("snapshot_receipt", s.activeRepo())
 		snap := s.eng.Snapshot()
 		if snap == nil || s.eng.Store().Count() == 0 {
 			return errorResult("No snapshot available. Run generate_snapshot first."), nil, nil
@@ -1234,9 +1231,7 @@ func (s *Server) registerTools() {
 			"baseline= selects what to compare against: 'pinned' (DEFAULT — set_baseline snapshot), 'previous' (the immediately-preceding run), or an explicit path to a directory holding receipt.json/snapshot.meta.json. " +
 			"output_mode: 'summary' (DEFAULT — markdown) → 'full' (complete JSON).",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args compareReceiptsArgs) (*mcp.CallToolResult, any, error) {
-		if s.toolCallback != nil {
-			s.toolCallback("compare_receipts")
-		}
+		s.fireToolCallback("compare_receipts", s.activeRepo())
 		snap := s.eng.Snapshot()
 		if snap == nil || s.eng.Store().Count() == 0 {
 			return errorResult("No snapshot available. Run generate_snapshot first."), nil, nil
