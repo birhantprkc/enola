@@ -89,19 +89,25 @@ func (e *PythonExtractor) Extract(ctx context.Context, repoPath string, files []
 	// Pass 1: build a global symbol index across all Python files. Each file is
 	// indexed into a local table in parallel, then the tables are merged in file
 	// order so duplicate-module last-write-wins stays deterministic.
-	idx := &pySymbolIndex{classes: make(map[string]*pyClassInfo)}
-	localIdxs := parallel.MapFiles(ctx, pyFiles, func(relFile string) map[string]*pyClassInfo {
+	idx := &pySymbolIndex{classes: make(map[string]*pyClassInfo), moduleDefs: make(map[string]map[string]bool)}
+	localIdxs := parallel.MapFiles(ctx, pyFiles, func(relFile string) *pySymbolIndex {
 		src, err := os.ReadFile(filepath.Join(repoPath, relFile))
 		if err != nil {
 			return nil
 		}
-		local := &pySymbolIndex{classes: make(map[string]*pyClassInfo)}
+		local := &pySymbolIndex{classes: make(map[string]*pyClassInfo), moduleDefs: make(map[string]map[string]bool)}
 		buildFileIndex(src, relFile, local)
-		return local.classes
+		return local
 	})
 	for _, m := range localIdxs {
-		for qualName, info := range m {
+		if m == nil {
+			continue
+		}
+		for qualName, info := range m.classes {
 			idx.classes[qualName] = info
+		}
+		for module, defs := range m.moduleDefs {
+			idx.moduleDefs[module] = defs
 		}
 	}
 	finalizeImplMap(idx)
@@ -129,6 +135,28 @@ func (e *PythonExtractor) Extract(ctx context.Context, repoPath string, files []
 	// Python imports never match module Names downstream.
 	resolveImports(allFacts, modules)
 
+	// Parse pyproject.toml entry-points (console_scripts, plugin groups) into
+	// reference edges, so functions registered as entry points — loaded by name by
+	// the framework, never called in-code — are not mis-reported as dead. Emitted
+	// before resolveCallTargets so their dotted targets resolve to slash symbols.
+	allFacts = append(allFacts, extractEntryPoints(repoPath, files)...)
+
+	// Resolve the dotted call/instantiate targets emitted for absolute imports into
+	// canonical slash symbol names (dropping stdlib/third-party edges) now that the
+	// full file set is known. Without this, functions reached via absolute imports
+	// have no incoming edge and read as dead code.
+	fileModules := make(map[string]bool, len(pyFiles))
+	for _, f := range pyFiles {
+		fileModules[strings.TrimSuffix(f, ".py")] = true
+	}
+	resolveCallTargets(allFacts, fileModules)
+
+	// Propagate the walk-time io_direct flag transitively across the (now canonical)
+	// call graph into performs_io, so a function that reaches DB/network I/O only through
+	// helpers is still flagged — the signal the enterprise analyzer reads to tell a real
+	// per-iteration I/O call from a name that merely collides with a DB verb.
+	computePyPerformsIO(allFacts)
+
 	for dir := range modules {
 		allFacts = append(allFacts, facts.Fact{
 			Kind: facts.KindModule,
@@ -143,12 +171,80 @@ func (e *PythonExtractor) Extract(ctx context.Context, repoPath string, files []
 	return allFacts, nil
 }
 
+// computePyPerformsIO propagates the per-body io_direct flag transitively across the
+// call graph into a performs_io prop, so a function that reaches DB/network/file I/O only
+// through helpers is still flagged. Mirrors computeTSPerformsIO: a monotone fixpoint that
+// only ever flips false→true, so it is cycle-safe. Only edges to known symbol names
+// propagate (unresolved external calls are ignored), so the closure stays within the repo.
+func computePyPerformsIO(allFacts []facts.Fact) {
+	exists := make(map[string]bool)
+	for i := range allFacts {
+		if allFacts[i].Kind == facts.KindSymbol {
+			exists[allFacts[i].Name] = true
+		}
+	}
+
+	io := make(map[string]bool)      // name → performs I/O (directly or transitively)
+	adj := make(map[string][]string) // name → called names that are known symbols
+	for i := range allFacts {
+		f := &allFacts[i]
+		if f.Kind != facts.KindSymbol {
+			continue
+		}
+		if b, _ := f.Props["io_direct"].(bool); b {
+			io[f.Name] = true
+		}
+		seen := make(map[string]bool)
+		for _, r := range f.Relations {
+			if r.Kind != facts.RelCalls || r.Target == f.Name || seen[r.Target] || !exists[r.Target] {
+				continue
+			}
+			seen[r.Target] = true
+			adj[f.Name] = append(adj[f.Name], r.Target)
+		}
+	}
+
+	for changed := true; changed; {
+		changed = false
+		for name, callees := range adj {
+			if io[name] {
+				continue
+			}
+			for _, c := range callees {
+				if io[c] {
+					io[name] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+
+	for i := range allFacts {
+		f := &allFacts[i]
+		if f.Kind == facts.KindSymbol && io[f.Name] {
+			if f.Props == nil {
+				f.Props = map[string]any{}
+			}
+			f.Props["performs_io"] = true
+		}
+	}
+}
+
 // --- Regex patterns used by the AST walker ---
 
 var (
 	// routeDecoratorRe matches FastAPI/Starlette route decorators.
-	// Groups: (object, method, path).
-	routeDecoratorRe = regexp.MustCompile(`^\s*@([\w.]+)\.(get|post|put|delete|patch|head|options)\s*\(\s*["']([^"']+)["']`)
+	// Groups: (object, method, path). The path may be positional (`@r.get("/x")`) or
+	// the `path=` keyword (`@r.get(path="/x")`), and may be empty (`path=""` — the
+	// collection endpoint under the router prefix); `\s*` spans the newline of a
+	// multi-line decorator.
+	routeDecoratorRe = regexp.MustCompile(`^\s*@([\w.]+)\.(get|post|put|delete|patch|head|options)\s*\(\s*(?:path\s*=\s*)?["']([^"']*)["']`)
+
+	// routeMethodRe matches a route-method decorator in ANY path form (literal,
+	// path= keyword, or a computed expression), used to tag the handler as a
+	// framework-dispatched entry point even when the path isn't a parseable literal.
+	routeMethodRe = regexp.MustCompile(`^\s*@[\w.]+\.(?:get|post|put|delete|patch|head|options)\s*\(`)
 
 	// tableNameRe matches SQLAlchemy __tablename__ assignments. Group: (table).
 	tableNameRe = regexp.MustCompile(`^\s*__tablename__\s*=\s*["']([^"']+)["']`)
@@ -167,7 +263,83 @@ var (
 	// urlPathRe matches Django path() and re_path() calls in urls.py.
 	// Groups: (url_path, view_ref)
 	urlPathRe = regexp.MustCompile(`(?:re_)?path\s*\(\s*r?["']([^"']+)["']\s*,\s*([\w.]+)`)
+
+	// entryPointSectionRe matches pyproject.toml TOML section headers that declare
+	// entry points: [project.scripts], [project.gui-scripts], and
+	// [project.entry-points…] (incl. quoted group subtables).
+	entryPointSectionRe = regexp.MustCompile(`^\s*\[\s*project\.(scripts|gui-scripts|entry-points)\b`)
+	// anyTOMLSectionRe matches any TOML section header (ends an entry-point section).
+	anyTOMLSectionRe = regexp.MustCompile(`^\s*\[`)
+	// entryPointValueRe matches an entry-point line `name = "module.path:attr"`,
+	// capturing the module path and the attribute (a function or Class.method).
+	entryPointValueRe = regexp.MustCompile(`^\s*[^=\[\]#]+=\s*["']([A-Za-z_][\w.]*):([A-Za-z_][\w.]*)["']`)
+
+	// registrationDecorators are decorator names (matched on the last dotted segment)
+	// that REGISTER their function with a framework, which then dispatches it — so the
+	// function has no in-code caller by construction (like a route handler or CLI
+	// command). Covers SQLAlchemy (@compiles, @event.listens_for), functools
+	// singledispatch (@base.register), signals (@sig.connect), and Flask app/blueprint
+	// hooks. A function with any such decorator is marked used via a self file-ref edge.
+	registrationDecorators = map[string]bool{
+		"compiles": true, "listens_for": true, // SQLAlchemy
+		"register":     true, // functools.singledispatch (also ABCMeta/registries)
+		"connect":      true, // blinker/Celery/Django signals
+		"errorhandler": true, "app_errorhandler": true,
+		"before_request": true, "after_request": true,
+		"teardown_request": true, "teardown_appcontext": true,
+		"context_processor": true,
+		"template_filter":   true, "template_global": true, "template_test": true,
+	}
+
+	// dottedPathRe matches a string literal that is an identifier-dotted symbol path
+	// of at least 3 segments (module.sub.symbol), e.g. a lazy_load_command target or
+	// a provider "class-name". The ≥3-segment floor avoids crediting short dotted
+	// strings (logger names, config keys); resolveCallTargets prunes non-internal ones.
+	dottedPathRe = regexp.MustCompile(`^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*){2,}$`)
 )
+
+// extractEntryPoints scans each pyproject.toml in files for console-script / plugin
+// entry points and emits a KindFileRef fact per file carrying RelCalls edges to the
+// referenced module.attr targets (colon rewritten to dot). Entry-point functions are
+// loaded by name by the framework, so without these edges they read as dead code.
+// The dotted targets are resolved to slash symbols by resolveCallTargets.
+func extractEntryPoints(repoPath string, files []string) []facts.Fact {
+	var out []facts.Fact
+	for _, rel := range files {
+		if filepath.Base(rel) != "pyproject.toml" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(repoPath, rel))
+		if err != nil {
+			continue
+		}
+		var rels []facts.Relation
+		inEntryPoints := false
+		for _, line := range strings.Split(string(data), "\n") {
+			if anyTOMLSectionRe.MatchString(line) {
+				inEntryPoints = entryPointSectionRe.MatchString(line)
+				continue
+			}
+			if !inEntryPoints {
+				continue
+			}
+			if m := entryPointValueRe.FindStringSubmatch(line); m != nil {
+				rels = append(rels, facts.Relation{Kind: facts.RelCalls, Target: m[1] + "." + m[2]})
+			}
+		}
+		if len(rels) > 0 {
+			out = append(out, facts.Fact{
+				Kind:      facts.KindFileRef,
+				Name:      rel,
+				File:      rel,
+				Line:      1,
+				Props:     map[string]any{"language": "python"},
+				Relations: rels,
+			})
+		}
+	}
+	return out
+}
 
 // Django class base sets used to classify models, views, and serializers.
 var (
@@ -197,7 +369,36 @@ var (
 	pyAbstractBases = map[string]bool{
 		"ABC": true, "ABCMeta": true, "Protocol": true,
 	}
+
+	// pyEnumBases mark a class as an enum. Enums are concrete value enumerations,
+	// not domain types, so package-metrics excludes them from N (mirrors the Kotlin
+	// enum handling) — otherwise a pure-enum package skews abstractness/distance.
+	pyEnumBases = map[string]bool{
+		"Enum": true, "IntEnum": true, "StrEnum": true,
+		"Flag": true, "IntFlag": true, "ReprEnum": true,
+	}
+
+	// pyDataHolderBases mark a class as a data holder (DTO / schema / record):
+	// Pydantic models/settings, typing.NamedTuple, and TypedDict. These are value
+	// carriers, the Python analogue of TypeScript structural interfaces — concrete
+	// BY DESIGN. package-metrics uses the "data_class" prop to keep such packages out
+	// of the "rigid — extract interfaces" off-main-sequence finding, which is not
+	// actionable for schema/model bundles (e.g. OpenAPI-generated Pydantic models).
+	// A base whose name ends in "BaseModel" is also treated as a data holder, which
+	// covers project-local Pydantic subclasses used as a common base (StrictBaseModel,
+	// <App>BaseModel) — see isDataHolderBase.
+	pyDataHolderBases = map[string]bool{
+		"BaseModel": true, "RootModel": true, "GenericModel": true,
+		"BaseSettings": true, "NamedTuple": true, "TypedDict": true,
+	}
 )
+
+// isDataHolderBase reports whether a base-class short name marks the subclass as a
+// data holder: an exact Pydantic/typing data base, or any "*BaseModel" name (the
+// idiomatic project-local Pydantic base, e.g. StrictBaseModel).
+func isDataHolderBase(last string) bool {
+	return pyDataHolderBases[last] || strings.HasSuffix(last, "BaseModel")
+}
 
 // applyDecoratorProps sets structural boolean props on a symbol based on a
 // decorator name. Only well-known structural decorators produce props; unknown
@@ -217,12 +418,28 @@ func applyDecoratorProps(props map[string]any, decoratorName string) {
 		props["class_method"] = true
 	case "abstractmethod":
 		props["abstract"] = true
+	case "dataclass":
+		// @dataclass / @dataclasses.dataclass / @pydantic.dataclasses.dataclass.
+		props["data_class"] = true
+	case "define", "frozen", "mutable", "attrs":
+		// attrs data classes: @attrs.define / @define / @frozen / @attr.attrs.
+		props["data_class"] = true
 	case "task":
 		props["task"] = true
+	case "command", "group":
+		// click/Typer CLI command or group (@cli.command, @app.group). The function
+		// is registered with and dispatched by the CLI framework, never called by
+		// name, so the dead-code detector treats it as an entry point.
+		props["cli_command"] = true
 	case "shared_task":
 		// shared_task is Celery-specific; bare @task is used by Airflow, Prefect, Luigi, etc.
 		props["task"] = true
 		props["framework"] = "celery"
+	}
+	// @attr.s is the legacy attrs data-class decorator; its last component "s" is
+	// too generic to switch on, so match the full "attr.s" path explicitly.
+	if last == "s" && strings.HasPrefix(decoratorName, "attr") {
+		props["data_class"] = true
 	}
 }
 

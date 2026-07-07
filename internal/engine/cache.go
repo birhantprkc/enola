@@ -162,7 +162,67 @@ import (
 // v77: Ruby extractor detects Gemfile-less repos via a loose .rb/shebang scan and
 // indexes extensionless Ruby executables. Bump so snapshots that cached an empty
 // (undetected) Ruby result re-extract instead of serving stale zero facts.
-const cacheVersion = "v77"
+// v78: Python extractor now emits call edges for ABSOLUTE intra-project imports
+// (previously only relative imports resolved, so functions reached via
+// `from pkg.mod import fn` had no incoming edge and read as dead code). A post-pass
+// (resolveCallTargets) rewrites the dotted targets to canonical slash symbol names
+// and drops stdlib/third-party edges; the extractor also emits KindFileRef edges for
+// module-level (top-level) calls and records decorator applications as uses. Bump so
+// cached Python snapshots re-extract with the new edges.
+// v79: Python extractor tracks more reference mechanisms — function-local (lazy)
+// imports are registered so calls through them resolve; functions/classes passed by
+// name as call arguments (Depends(fn), add_command(cmd)) emit reference edges;
+// parameter-default and decorator-call-argument expressions are walked (FastAPI
+// Depends(...) in signatures and route-decorator dependencies); and click/Typer
+// @command/@group functions are tagged cli_command. Reduces Python dead-code false
+// positives; bump so cached snapshots re-extract.
+// v80: Python extractor tracks three more reference mechanisms — FastAPI route
+// decorators declared with the path= keyword (and empty paths) now emit route facts
+// (so their handlers are rescued); pyproject.toml entry-points / console-scripts emit
+// reference edges to the registered module:function; and dotted-path string literals
+// (>=3 identifier segments) that name an internal symbol (lazy_load_command targets,
+// provider "class-name" metadata) emit reference edges. Reduces Python dead-code
+// false positives; bump so cached snapshots re-extract.
+// v81: Python extractor closes three more reference gaps — class-body statements are
+// walked for calls/value-refs (attrs/pydantic/SQLAlchemy field wiring like
+// factory=_helper(...) and default=Factory(fn)); same-module functions/classes passed
+// by name as a value are credited (via a per-module top-level-def index, excluding
+// shadowing params); and FastAPI route handlers declared with a non-literal/computed
+// path are tagged web_component=route_handler (framework entry points). Reduces Python
+// dead-code false positives; bump so cached snapshots re-extract.
+// v82: Python extractor closes the last registration gaps — functions decorated with a
+// framework-registration decorator (@compiles, @x.register singledispatch, @sig.connect,
+// @event.listens_for, Flask hooks) are marked used via a self file-ref edge; value
+// references now also resolve attribute args (register_error_handler(404, m.handler))
+// and dict/list/set/tuple values (dispatch tables like {"ds": ds_filter}). Reduces
+// Python dead-code false positives; bump so cached snapshots re-extract.
+// v83: complexity signals gain a new prop scaling_loop_depth (loop nesting counting only
+// input-scaling loops — literal/constant/range(<const>) iterables and infinite
+// while(true)/for{} event loops are discounted), emitted by the Python, TypeScript, and Go
+// extractors; the Python extractor also now emits io_direct/performs_io (transitive
+// DB/network/file I/O). Consumed by the enterprise performance analyzer to deflate the
+// O(n^k) tail and tighten call-in-loop precision; bump so cached snapshots re-extract.
+// v84: complexity signals gain calls_in_scaling_loop — the subset of calls_in_loop made
+// inside an input-scaling (unbounded) loop — emitted by the Python, TypeScript, and Go
+// extractors. Lets the performance analyzer treat a call in a bounded loop (literal /
+// range(<const>) / while(true)) as a fixed count, not an N+1; bump so cached snapshots
+// re-extract with the new signal.
+// v85: Python extractor emits two new structural props so package-metrics stops
+// mislabeling idiomatic-Python packages. (1) `enum` on Enum/IntEnum/StrEnum/Flag/IntFlag
+// subclasses (excluded from N like Kotlin enums) and `data_class` on DTO/schema/record
+// classes — @dataclass/@attrs-decorated, Pydantic BaseModel, NamedTuple, TypedDict —
+// so DTO/model packages (e.g. OpenAPI-generated Pydantic "datamodels") are no longer
+// flagged "rigid — extract interfaces". data_class covers Pydantic BaseModel, NamedTuple,
+// and TypedDict subclasses plus @dataclass/@attrs-decorated classes. (2) `abstract` now
+// also covers the duck-typed abstract pattern (a method whose whole body is
+// `raise NotImplementedError`), so abstractness (A) is meaningful for Python base classes
+// that don't use ABC. Bump so cached Python snapshots re-extract with the new props.
+// v86: Python data_class detection broadened to Pydantic RootModel/GenericModel/BaseSettings
+// and any "*BaseModel" subclass — covers project-local Pydantic bases (StrictBaseModel,
+// <App>BaseModel) used by hand-written schema packages, which v85 missed because BaseModel
+// wasn't a direct base (so those datamodels packages were still flagged "rigid"). Bump so
+// snapshots cached under v85 re-extract with the widened detection.
+const cacheVersion = "v86"
 
 // extractorCache holds per-extractor facts keyed by a content hash of the files
 // the extractor depends on. It is loaded from disk at the start of a snapshot and

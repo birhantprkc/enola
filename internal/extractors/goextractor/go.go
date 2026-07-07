@@ -316,12 +316,18 @@ func (e *GoExtractor) extractFunc(fset *token.FileSet, fn *ast.FuncDecl, relFile
 		symbolFact.Props["cyclomatic"] = m.cyclomatic
 		if m.loopDepth > 0 {
 			symbolFact.Props["loop_depth"] = m.loopDepth
+			// Emit the scaling depth (bounded loops discounted) alongside — even when 0 —
+			// so the consumer distinguishes "all loops bounded" from "signal absent".
+			symbolFact.Props["scaling_loop_depth"] = m.scalingLoopDepth
 		}
 		if m.loopCount > 0 {
 			symbolFact.Props["loop_count"] = m.loopCount
 		}
 		if len(m.callsInLoop) > 0 {
 			symbolFact.Props["calls_in_loop"] = m.callsInLoop
+		}
+		if len(m.callsInScalingLoop) > 0 {
+			symbolFact.Props["calls_in_scaling_loop"] = m.callsInScalingLoop
 		}
 		if m.recursiveSelf {
 			symbolFact.Props["recursive_self"] = true
@@ -416,12 +422,14 @@ type resolveCtx struct {
 // bodyMetrics holds the call list and the per-function complexity signals
 // derived from a single walk of a function body.
 type bodyMetrics struct {
-	calls         []string // resolved call targets, deduped, in source order
-	callsInLoop   []string // subset of calls invoked at loop nesting depth >= 1
-	loopDepth     int      // max nesting depth of for/range loops
-	loopCount     int      // total number of for/range loops
-	cyclomatic    int      // McCabe complexity (1 + decision points)
-	recursiveSelf bool     // body directly calls the enclosing function
+	calls              []string // resolved call targets, deduped, in source order
+	callsInLoop        []string // subset of calls invoked at loop nesting depth >= 1
+	callsInScalingLoop []string // subset of calls invoked at scaling (unbounded) nesting depth >= 1
+	loopDepth          int      // max nesting depth of for/range loops
+	scalingLoopDepth   int      // max nesting counting only unbounded (input-scaling) loops
+	loopCount          int      // total number of for/range loops
+	cyclomatic         int      // McCabe complexity (1 + decision points)
+	recursiveSelf      bool     // body directly calls the enclosing function
 }
 
 // analyzeBody walks a function body once and extracts both the call edges
@@ -438,7 +446,12 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 	decisions := 0
 	seen := make(map[string]bool)
 	inLoopSeen := make(map[string]bool)
+	inScalingSeen := make(map[string]bool)
 	var loopEnds []token.Pos // end positions of enclosing loops
+	// scalingEnds tracks only the enclosing loops that scale with input (bounded loops —
+	// `for {}` event loops and `range` over a composite literal — are excluded), so
+	// len(scalingEnds) is the current scaling nesting depth used for Big-O.
+	var scalingEnds []token.Pos
 
 	ast.Inspect(body, func(n ast.Node) bool {
 		if n == nil {
@@ -448,6 +461,9 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 		for len(loopEnds) > 0 && n.Pos() >= loopEnds[len(loopEnds)-1] {
 			loopEnds = loopEnds[:len(loopEnds)-1]
 		}
+		for len(scalingEnds) > 0 && n.Pos() >= scalingEnds[len(scalingEnds)-1] {
+			scalingEnds = scalingEnds[:len(scalingEnds)-1]
+		}
 		switch x := n.(type) {
 		case *ast.ForStmt:
 			m.loopCount++
@@ -456,12 +472,24 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 			if len(loopEnds) > m.loopDepth {
 				m.loopDepth = len(loopEnds)
 			}
+			if !goForBounded(x) {
+				scalingEnds = append(scalingEnds, x.End())
+				if len(scalingEnds) > m.scalingLoopDepth {
+					m.scalingLoopDepth = len(scalingEnds)
+				}
+			}
 		case *ast.RangeStmt:
 			m.loopCount++
 			decisions++
 			loopEnds = append(loopEnds, x.End())
 			if len(loopEnds) > m.loopDepth {
 				m.loopDepth = len(loopEnds)
+			}
+			if !goRangeBounded(x) {
+				scalingEnds = append(scalingEnds, x.End())
+				if len(scalingEnds) > m.scalingLoopDepth {
+					m.scalingLoopDepth = len(scalingEnds)
+				}
 			}
 		case *ast.IfStmt:
 			decisions++
@@ -494,6 +522,12 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 				inLoopSeen[resolved] = true
 				m.callsInLoop = append(m.callsInLoop, resolved)
 			}
+			// A call inside an input-scaling loop is an N+1 candidate; a call only ever in
+			// a bounded loop (`for {}` / range over a composite literal) is not.
+			if len(scalingEnds) > 0 && !inScalingSeen[resolved] {
+				inScalingSeen[resolved] = true
+				m.callsInScalingLoop = append(m.callsInScalingLoop, resolved)
+			}
 			if resolved == selfName {
 				m.recursiveSelf = true
 			}
@@ -502,6 +536,21 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 	})
 	m.cyclomatic = 1 + decisions
 	return m
+}
+
+// goForBounded reports whether a for-statement runs a fixed number of times regardless
+// of input: a bare `for { }` infinite loop is driven by break/return/events, not data
+// size, so it does not add a factor of n to Big-O. (A `for i := 0; i < n; i++` with a
+// data-derived bound is treated as unbounded — its static bound is not evident here.)
+func goForBounded(x *ast.ForStmt) bool {
+	return x.Cond == nil && x.Init == nil && x.Post == nil
+}
+
+// goRangeBounded reports whether a range loop iterates a fixed-size composite literal
+// (`for _, x := range []T{a, b, c}` / a map literal) — a constant count, not input-scaling.
+func goRangeBounded(x *ast.RangeStmt) bool {
+	_, ok := x.X.(*ast.CompositeLit)
+	return ok
 }
 
 // flattenSelector converts a (potentially deep) selector chain to a left-to-right

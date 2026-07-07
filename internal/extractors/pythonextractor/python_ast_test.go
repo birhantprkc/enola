@@ -345,6 +345,110 @@ class Concrete:
 	}
 }
 
+// TestAST_DataClassAndEnumProps verifies enum classes and DTO/schema classes get
+// the structural props package-metrics relies on: `enum` (excluded from N like
+// Kotlin enums) and `data_class` (a value carrier, not a "rigid" abstraction).
+func TestAST_DataClassAndEnumProps(t *testing.T) {
+	src := `
+from dataclasses import dataclass
+from enum import Enum, IntEnum
+from typing import NamedTuple, TypedDict
+from pydantic import BaseModel, RootModel
+import attrs
+
+class Color(Enum):
+    RED = 1
+
+class Level(IntEnum):
+    LOW = 1
+
+@dataclass
+class Point:
+    x: int
+    y: int
+
+@attrs.define
+class Box:
+    w: int
+
+class UserModel(BaseModel):
+    name: str
+
+# Project-local Pydantic base (StrictBaseModel(BaseModel)): matched by the
+# "*BaseModel" suffix rule even though BaseModel isn't a direct base here.
+class VariableResponse(StrictBaseModel):
+    key: str
+
+class XComSlice(RootModel):
+    root: list
+
+class Pair(NamedTuple):
+    a: int
+    b: int
+
+class Config(TypedDict):
+    debug: bool
+
+class Plain:
+    def do(self):
+        return 1
+`
+	idx := byName(astExtract(t, "svc.py", src, false))
+
+	for _, name := range []string{"svc.Color", "svc.Level"} {
+		if idx[name].Props["enum"] != true {
+			t.Errorf("%s: enum = %v, want true", name, idx[name].Props["enum"])
+		}
+	}
+	for _, name := range []string{"svc.Point", "svc.Box", "svc.UserModel", "svc.VariableResponse", "svc.XComSlice", "svc.Pair", "svc.Config"} {
+		if idx[name].Props["data_class"] != true {
+			t.Errorf("%s: data_class = %v, want true", name, idx[name].Props["data_class"])
+		}
+	}
+	if p := idx["svc.Plain"]; p.Props["data_class"] == true || p.Props["enum"] == true {
+		t.Errorf("svc.Plain should be a plain class (no enum/data_class props): %v", p.Props)
+	}
+}
+
+// TestAST_InformalAbstractDetection verifies the idiomatic duck-typed abstract
+// pattern — a method whose whole body is `raise NotImplementedError` (optionally
+// after a docstring) — marks a class abstract, while conservative bare `...`/`pass`
+// stub bodies do NOT.
+func TestAST_InformalAbstractDetection(t *testing.T) {
+	src := `
+class BaseOperator:
+    """Base."""
+    def execute(self, context):
+        raise NotImplementedError()
+
+class BaseHook:
+    def get_conn(self):
+        """Return a connection."""
+        raise NotImplementedError
+
+class StubOnly:
+    def maybe(self):
+        ...
+
+class Concrete:
+    def execute(self, context):
+        return 1
+`
+	idx := byName(astExtract(t, "svc.py", src, false))
+
+	for _, name := range []string{"svc.BaseOperator", "svc.BaseHook"} {
+		if idx[name].Props["abstract"] != true {
+			t.Errorf("%s: abstract = %v, want true (raise NotImplementedError)", name, idx[name].Props["abstract"])
+		}
+	}
+	if idx["svc.StubOnly"].Props["abstract"] == true {
+		t.Error("svc.StubOnly (bare ... body) should NOT be abstract")
+	}
+	if idx["svc.Concrete"].Props["abstract"] == true {
+		t.Error("svc.Concrete should not be abstract")
+	}
+}
+
 // TestAST_ExportedProp verifies the leading-underscore export convention.
 func TestAST_ExportedProp(t *testing.T) {
 	src := `
@@ -615,5 +719,457 @@ class ConcreteImpl(MyInterface):
 	}
 	if impl.isAbstract {
 		t.Error("ConcreteImpl: expected isAbstract=false")
+	}
+}
+
+// firstOfKind returns the first fact of the given kind, or a zero fact.
+func firstOfKind(ff []facts.Fact, kind string) (facts.Fact, bool) {
+	for _, f := range ff {
+		if f.Kind == kind {
+			return f, true
+		}
+	}
+	return facts.Fact{}, false
+}
+
+// --- Absolute-import call-edge emission (pre-resolution dotted targets) ---
+
+func TestAST_AbsoluteImportEmitsCallEdge(t *testing.T) {
+	src := `
+from airflow.api.common.airflow_health import get_airflow_health
+
+def get_health():
+    return get_airflow_health()
+`
+	result := astExtract(t, "monitor.py", src, false)
+	idx := byName(result)
+	fn, ok := idx["monitor.get_health"]
+	if !ok {
+		t.Fatalf("missing monitor.get_health; keys: %v", keys(idx))
+	}
+	calls := relsByKind(fn, facts.RelCalls)
+	want := "airflow.api.common.airflow_health.get_airflow_health"
+	found := false
+	for _, c := range calls {
+		if c == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("get_health: RelCalls = %v, want a call to %q (absolute import must emit an edge)", calls, want)
+	}
+}
+
+func TestAST_TopLevelCallEmitsFileRef(t *testing.T) {
+	src := `
+from airflow.api_fastapi.app import cached_app
+
+app = cached_app(apps="all")
+`
+	result := astExtract(t, "main.py", src, false)
+	fr, ok := firstOfKind(result, facts.KindFileRef)
+	if !ok {
+		t.Fatal("expected a KindFileRef fact for the module-level cached_app() call, got none")
+	}
+	calls := relsByKind(fr, facts.RelCalls)
+	want := "airflow.api_fastapi.app.cached_app"
+	found := false
+	for _, c := range calls {
+		if c == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("file_ref: RelCalls = %v, want %q", calls, want)
+	}
+}
+
+func TestAST_DecoratorEmitsRef(t *testing.T) {
+	src := `
+from airflow.utils.session import provide_session
+
+@provide_session
+def do_work(session=None):
+    pass
+`
+	result := astExtract(t, "svc.py", src, false)
+	fr, ok := firstOfKind(result, facts.KindFileRef)
+	if !ok {
+		t.Fatal("expected a KindFileRef fact for the @provide_session decorator, got none")
+	}
+	calls := relsByKind(fr, facts.RelCalls)
+	want := "airflow.utils.session.provide_session"
+	found := false
+	for _, c := range calls {
+		if c == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("file_ref: RelCalls = %v, want a decorator use of %q", calls, want)
+	}
+}
+
+// --- Pass 2: lazy imports, value-refs, param defaults, decorator args ---
+
+func TestAST_LazyImportInsideFunctionResolves(t *testing.T) {
+	src := `
+def load():
+    from airflow import plugins_manager
+    return plugins_manager.get_priority_weight_strategy_plugins()
+`
+	result := astExtract(t, "svc.py", src, false)
+	fn := byName(result)["svc.load"]
+	calls := relsByKind(fn, facts.RelCalls)
+	want := "airflow.plugins_manager.get_priority_weight_strategy_plugins"
+	found := false
+	for _, c := range calls {
+		if c == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("load: RelCalls = %v, want a call to %q via the function-local import", calls, want)
+	}
+}
+
+func TestAST_CallArgumentValueRefEmitsEdge(t *testing.T) {
+	src := `
+from airflow.auth.utils import parse_login_body
+
+def register():
+    return Depends(parse_login_body)
+`
+	result := astExtract(t, "svc.py", src, false)
+	fn := byName(result)["svc.register"]
+	calls := relsByKind(fn, facts.RelCalls)
+	want := "airflow.auth.utils.parse_login_body"
+	found := false
+	for _, c := range calls {
+		if c == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("register: RelCalls = %v, want a value-ref edge to %q", calls, want)
+	}
+}
+
+func TestAST_ParameterDefaultCallEmitsEdge(t *testing.T) {
+	src := `
+from airflow.auth.utils import parse_login_body
+
+def handler(body = Depends(parse_login_body)):
+    pass
+`
+	result := astExtract(t, "svc.py", src, false)
+	fn := byName(result)["svc.handler"]
+	calls := relsByKind(fn, facts.RelCalls)
+	want := "airflow.auth.utils.parse_login_body"
+	found := false
+	for _, c := range calls {
+		if c == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("handler: RelCalls (incl. param defaults) = %v, want %q", calls, want)
+	}
+}
+
+func TestAST_DecoratorArgumentCallEmitsFileRef(t *testing.T) {
+	src := `
+from airflow.security import requires_access_asset
+
+@router.get("/x", dependencies=[Depends(requires_access_asset(method="GET"))])
+def endpoint():
+    pass
+`
+	result := astExtract(t, "routes.py", src, false)
+	fr, ok := firstOfKind(result, facts.KindFileRef)
+	if !ok {
+		t.Fatal("expected a KindFileRef fact for the decorator-argument call, got none")
+	}
+	calls := relsByKind(fr, facts.RelCalls)
+	want := "airflow.security.requires_access_asset"
+	found := false
+	for _, c := range calls {
+		if c == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("file_ref: RelCalls = %v, want the decorator-arg factory call %q", calls, want)
+	}
+}
+
+func TestAST_ClickCommandTagged(t *testing.T) {
+	src := `
+import click
+
+@click.command()
+def build():
+    pass
+
+@click.group()
+def cli():
+    pass
+
+def plain():
+    pass
+`
+	result := astExtract(t, "commands.py", src, false)
+	idx := byName(result)
+	for _, name := range []string{"commands.build", "commands.cli"} {
+		fn, ok := idx[name]
+		if !ok {
+			t.Fatalf("missing %q; keys: %v", name, keys(idx))
+		}
+		if fn.Props["cli_command"] != true {
+			t.Errorf("%s: cli_command = %v, want true", name, fn.Props["cli_command"])
+		}
+	}
+	if idx["commands.plain"].Props["cli_command"] == true {
+		t.Error("commands.plain: cli_command should be unset for a non-click function")
+	}
+}
+
+func TestAST_DottedStringLiteralEmitsRef(t *testing.T) {
+	src := `
+def register():
+    return lazy_load_command("airflow.cli.commands.asset_command.asset_list")
+
+MESSAGE = "just a plain message"
+TWO = "airflow.models"
+`
+	result := astExtract(t, "cli_config.py", src, false)
+	// The dotted 4-segment string inside register() is a reference edge on the owner.
+	fn := byName(result)["cli_config.register"]
+	calls := relsByKind(fn, facts.RelCalls)
+	want := "airflow.cli.commands.asset_command.asset_list"
+	found := false
+	for _, c := range calls {
+		if c == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("register: RelCalls = %v, want a dotted-string ref to %q", calls, want)
+	}
+	// The plain message and the 2-segment string must not produce edges anywhere.
+	for _, f := range result {
+		for _, r := range f.Relations {
+			if r.Target == "just a plain message" || r.Target == "airflow.models" {
+				t.Errorf("unexpected edge from non-qualifying string: %q", r.Target)
+			}
+		}
+	}
+}
+
+// --- Pass 4: class-body wiring, same-module value-refs, route-handler tag ---
+
+// astExtractIdx runs the index pass over src, then extracts with that index so
+// moduleDefs-based same-module value-ref resolution is exercised.
+func astExtractIdx(t *testing.T, filename, src string) []facts.Fact {
+	t.Helper()
+	idx := &pySymbolIndex{classes: make(map[string]*pyClassInfo), moduleDefs: make(map[string]map[string]bool)}
+	buildFileIndex([]byte(src), filename, idx)
+	finalizeImplMap(idx)
+	return extractFileAST([]byte(src), filename, false, idx)
+}
+
+func TestAST_ClassBodyCallAndValueRefEmitEdges(t *testing.T) {
+	src := `
+def _conf_list_factory(section, key):
+    return None
+
+def _generate_kid(self):
+    return "kid"
+
+class Signer:
+    algo = _conf_list_factory("api_auth", "jwt_algorithm")
+    kid = attrs.field(default=attrs.Factory(_generate_kid, takes_self=True))
+`
+	result := astExtractIdx(t, "tokens.py", src)
+	cls := byName(result)["tokens.Signer"]
+	calls := relsByKind(cls, facts.RelCalls)
+	for _, want := range []string{"tokens._conf_list_factory", "tokens._generate_kid"} {
+		found := false
+		for _, c := range calls {
+			if c == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("Signer class body: RelCalls = %v, want an edge to %q", calls, want)
+		}
+	}
+}
+
+func TestAST_SameModuleValueRef(t *testing.T) {
+	src := `
+def custom_show_warning(message):
+    pass
+
+def replace_showwarning(fn):
+    pass
+
+original = replace_showwarning(custom_show_warning)
+`
+	result := astExtractIdx(t, "settings.py", src)
+	// The module-level call's arg (a same-module function) must be credited.
+	var all []string
+	for _, f := range result {
+		all = append(all, relsByKind(f, facts.RelCalls)...)
+	}
+	found := false
+	for _, c := range all {
+		if c == "settings.custom_show_warning" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a same-module value-ref edge to settings.custom_show_warning; got %v", all)
+	}
+}
+
+func TestAST_ParamPassedAsValue_NoFalseEdge(t *testing.T) {
+	// Regression guard: a parameter/local passed by value must NOT be credited as a
+	// same-module symbol, even if a same-named top-level def exists.
+	src := `
+def user_id():
+    return 1
+
+def get_user(user_id):
+    return lookup(user_id)
+`
+	result := astExtractIdx(t, "svc.py", src)
+	fn := byName(result)["svc.get_user"]
+	for _, c := range relsByKind(fn, facts.RelCalls) {
+		if c == "svc.user_id" {
+			t.Errorf("param user_id was wrongly credited as a ref to the same-named function svc.user_id")
+		}
+	}
+}
+
+func TestAST_ComputedPathRouteHandlerTagged(t *testing.T) {
+	src := `
+@task_instances_router.get(
+    task_instances_prefix + "/{task_id}/listMapped",
+    dependencies=[Depends(requires_access_dag(method="GET"))],
+)
+def get_mapped_task_instances(dag_id):
+    pass
+`
+	result := astExtractIdx(t, "routes/task_instances.py", src)
+	fn := byName(result)["routes/task_instances.get_mapped_task_instances"]
+	if fn.Props["web_component"] != "route_handler" {
+		t.Errorf("computed-path handler: web_component = %v, want route_handler", fn.Props["web_component"])
+	}
+}
+
+// --- Pass 5: registration decorators, attribute/collection value-refs ---
+
+func TestAST_RegistrationDecoratorsMarkUsed(t *testing.T) {
+	src := `
+@compiles(JSONExtract, "postgresql")
+def compile_postgres(element, compiler, **kw):
+    pass
+
+@handle_event_submit.register
+def _(event, **kw):
+    pass
+
+@worker_ready.connect
+def on_worker_ready(*args, **kwargs):
+    pass
+
+@event.listens_for(User.__table__, "after_create")
+def _restore_idx(table, conn, **kw):
+    pass
+`
+	result := astExtractIdx(t, "reg.py", src)
+	fr, ok := firstOfKind(result, facts.KindFileRef)
+	if !ok {
+		t.Fatal("expected a KindFileRef fact for registration-decorated functions")
+	}
+	targets := map[string]bool{}
+	for _, r := range relsByKind(fr, facts.RelCalls) {
+		targets[r] = true
+	}
+	for _, want := range []string{"reg.compile_postgres", "reg._", "reg.on_worker_ready", "reg._restore_idx"} {
+		if !targets[want] {
+			t.Errorf("missing registration self-edge to %q; got %v", want, targets)
+		}
+	}
+}
+
+func TestAST_AttributeArgValueRef(t *testing.T) {
+	src := `
+from airflow.providers.fab.www import views
+
+def init_app(app):
+    app.register_error_handler(404, views.not_found)
+`
+	result := astExtractIdx(t, "init_views.py", src)
+	fn := byName(result)["init_views.init_app"]
+	calls := relsByKind(fn, facts.RelCalls)
+	want := "airflow.providers.fab.www.views.not_found"
+	found := false
+	for _, c := range calls {
+		if c == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("init_app: RelCalls = %v, want attribute value-ref to %q", calls, want)
+	}
+}
+
+func TestAST_DictValueRef(t *testing.T) {
+	src := `
+def ds_filter(v):
+    return v
+
+def ts_filter(v):
+    return v
+
+FILTERS = {
+    "ds": ds_filter,
+    "ts": ts_filter,
+}
+`
+	result := astExtractIdx(t, "templater.py", src)
+	var all []string
+	for _, f := range result {
+		all = append(all, relsByKind(f, facts.RelCalls)...)
+	}
+	for _, want := range []string{"templater.ds_filter", "templater.ts_filter"} {
+		found := false
+		for _, c := range all {
+			if c == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected dict-value ref to %q; got %v", want, all)
+		}
+	}
+}
+
+func TestAST_ListOfLocalsNoFalseRef(t *testing.T) {
+	// A list of local variables must not produce edges (valueRefTarget resolves only
+	// imported / same-module def / same-class names).
+	src := `
+def build(a, b):
+    items = [a, b]
+    return items
+`
+	result := astExtractIdx(t, "svc.py", src)
+	fn := byName(result)["svc.build"]
+	for _, c := range relsByKind(fn, facts.RelCalls) {
+		if c == "svc.a" || c == "svc.b" {
+			t.Errorf("local var wrongly credited as a ref: %q", c)
+		}
 	}
 }

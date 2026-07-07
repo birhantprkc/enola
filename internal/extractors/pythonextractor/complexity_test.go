@@ -207,3 +207,131 @@ def check(a, b):
 		t.Errorf("calls_in_loop should be omitted, got %v", f.Props["calls_in_loop"])
 	}
 }
+
+func TestPyComplexity_ScalingLoopDepth_BoundedInnerDiscounted(t *testing.T) {
+	src := `
+def process(items):
+    for x in items:
+        for y in (1, 2, 3):
+            consume(x, y)
+
+def consume(x, y):
+    pass
+`
+	idx := byName(astExtract(t, "svc.py", src, false))
+	f := idx["svc.process"]
+	if got := cxIntProp(t, f, "loop_depth"); got != 2 {
+		t.Errorf("loop_depth = %d, want 2", got)
+	}
+	// Inner loop iterates a literal tuple → bounded → only the outer loop scales.
+	if got := cxIntProp(t, f, "scaling_loop_depth"); got != 1 {
+		t.Errorf("scaling_loop_depth = %d, want 1", got)
+	}
+}
+
+func TestPyComplexity_ScalingLoopDepth_FullyBounded(t *testing.T) {
+	src := `
+def build():
+    for x in [1, 2]:
+        for y in range(3):
+            emit(x, y)
+
+def emit(x, y):
+    pass
+`
+	f := byName(astExtract(t, "svc.py", src, false))["svc.build"]
+	if got := cxIntProp(t, f, "loop_depth"); got != 2 {
+		t.Errorf("loop_depth = %d, want 2", got)
+	}
+	if _, present := f.Props["scaling_loop_depth"]; !present {
+		t.Fatalf("scaling_loop_depth must be emitted (as 0) when loops exist")
+	}
+	if got := cxIntProp(t, f, "scaling_loop_depth"); got != 0 {
+		t.Errorf("scaling_loop_depth = %d, want 0 (all loops bounded)", got)
+	}
+}
+
+func TestPyComplexity_ScalingLoopDepth_WhileTrueBounded(t *testing.T) {
+	src := `
+def poll():
+    while True:
+        step()
+
+def step():
+    pass
+`
+	f := byName(astExtract(t, "svc.py", src, false))["svc.poll"]
+	if got := cxIntProp(t, f, "scaling_loop_depth"); got != 0 {
+		t.Errorf("while True scaling_loop_depth = %d, want 0", got)
+	}
+}
+
+func TestPyComplexity_IODirect(t *testing.T) {
+	src := `
+def load(session, q):
+    session.execute(q)
+
+def fetch(url):
+    requests.get(url)
+
+def pure(a, b):
+    return a + b
+`
+	idx := byName(astExtract(t, "svc.py", src, false))
+	if v, _ := idx["svc.load"].Props["io_direct"].(bool); !v {
+		t.Errorf("session.execute must set io_direct")
+	}
+	if v, _ := idx["svc.fetch"].Props["io_direct"].(bool); !v {
+		t.Errorf("requests.get must set io_direct")
+	}
+	if _, present := idx["svc.pure"].Props["io_direct"]; present {
+		t.Errorf("pure function must not set io_direct")
+	}
+}
+
+func TestPyComputePerformsIO_Transitive(t *testing.T) {
+	// outer → wrapper → (requests.get). outer performs I/O transitively.
+	fs := []facts.Fact{
+		{Kind: facts.KindSymbol, Name: "m.outer", Relations: []facts.Relation{{Kind: facts.RelCalls, Target: "m.wrapper"}}},
+		{Kind: facts.KindSymbol, Name: "m.wrapper", Props: map[string]any{"io_direct": true}},
+		{Kind: facts.KindSymbol, Name: "m.pure"},
+	}
+	computePyPerformsIO(fs)
+	if v, _ := fs[0].Props["performs_io"].(bool); !v {
+		t.Errorf("outer must be flagged performs_io transitively")
+	}
+	if v, _ := fs[1].Props["performs_io"].(bool); !v {
+		t.Errorf("wrapper must be flagged performs_io")
+	}
+	if _, present := fs[2].Props["performs_io"]; present {
+		t.Errorf("pure must not be flagged performs_io")
+	}
+}
+
+func TestPyComplexity_CallsInScalingLoop_BoundedExcluded(t *testing.T) {
+	src := `
+def process(items):
+    for c in (A, B):
+        setup(c)
+    for x in items:
+        consume(x)
+
+def setup(c):
+    pass
+
+def consume(x):
+    pass
+`
+	f := byName(astExtract(t, "svc.py", src, false))["svc.process"]
+	inLoop := cxStrSlice(f, "calls_in_loop")
+	if !cxContains(inLoop, "svc.setup") || !cxContains(inLoop, "svc.consume") {
+		t.Errorf("calls_in_loop = %v, want both setup and consume", inLoop)
+	}
+	scaling := cxStrSlice(f, "calls_in_scaling_loop")
+	if !cxContains(scaling, "svc.consume") {
+		t.Errorf("calls_in_scaling_loop = %v, want consume (unbounded loop)", scaling)
+	}
+	if cxContains(scaling, "svc.setup") {
+		t.Errorf("calls_in_scaling_loop = %v, must NOT contain setup (bounded literal-tuple loop)", scaling)
+	}
+}
