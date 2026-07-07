@@ -31,6 +31,15 @@ Cursor (add to `mcp.json`):
 }
 ```
 
+GitHub Copilot / VS Code (add to `.vscode/mcp.json`):
+```json
+{
+  "servers": {
+    "enola": { "command": "enola" }
+  }
+}
+```
+
 **3. Ask it to map your project**
 
 > "Generate an architectural snapshot of /path/to/my/project"
@@ -182,6 +191,21 @@ When you do pass a config, its `repo:` is only the *default* repository — you 
   }
 }
 ```
+
+**GitHub Copilot (VS Code)** — add enola to `.vscode/mcp.json` in your workspace (or your user-level MCP config via **MCP: Open User Configuration**). Note the top-level key is `servers` (not `mcpServers`), and the config path in `args` is optional — drop it to use defaults:
+
+```json
+{
+  "servers": {
+    "enola": {
+      "command": "enola",
+      "args": ["/path/to/enola/mcp-arch.yaml"]
+    }
+  }
+}
+```
+
+Or add it from the command line: `code --add-mcp "{\"name\":\"enola\",\"command\":\"enola\"}"`. Then open a project and ask Copilot to generate a snapshot.
 
 ### Use it
 
