@@ -66,6 +66,7 @@ type edge struct {
 type httpCoverage struct {
 	detected int
 	resolved int
+	external int // detected call sites to a hardcoded external host — not an internal blind spot
 }
 
 func (e *edge) note(via string) {
@@ -138,33 +139,58 @@ type routeRef struct {
 	fullPath string // the complete normalized server path this ref was indexed from
 }
 
-func linkHTTP(all []facts.Fact, edges map[string]*edge, cov map[string]*httpCoverage) {
-	// Index server routes by normalized path + method.
+// indexServerRoutes builds the suffix+method -> server route index the HTTP linker
+// matches client calls against: every trailing-segment suffix of every server
+// route's normalized path(s), keyed by routeKey. Shared by linkHTTP and
+// UnmatchedClientRouteKeys so both resolve a client call identically. serverPaths
+// already returns normalized paths; fullPath records which full path a suffix came
+// from, so a match can tell a full-path hit from a fragment hit.
+func indexServerRoutes(all []facts.Fact) map[string][]routeRef {
 	server := map[string][]routeRef{}
 	for _, f := range all {
-		if f.Kind != facts.KindRoute || f.Repo == "" {
-			continue
-		}
-		if roleOf(f) == "client" {
+		if f.Kind != facts.KindRoute || f.Repo == "" || roleOf(f) == "client" {
 			continue
 		}
 		method := normalizeMethod(propString(f, "method"))
 		if method == "" {
 			continue
 		}
-		// Index every trailing-segment suffix of each server path, so a client
-		// that calls a base-relative subpath ("settings/x") still matches a
-		// server serving the full path ("/api/settings/x"). serverPaths already
-		// returns normalized paths; fullPath records which full path a suffix
-		// came from, so a match can tell a full-path hit from a fragment hit.
 		for _, p := range serverPaths(f) {
 			ref := routeRef{repo: f.Repo, method: method, path: f.Name, fullPath: p}
 			for _, suf := range pathSuffixes(p) {
-				key := routeKey(suf, method)
-				server[key] = append(server[key], ref)
+				server[routeKey(suf, method)] = append(server[routeKey(suf, method)], ref)
 			}
 		}
 	}
+	return server
+}
+
+// indexServerPathSuffixes returns the set of server route path-suffixes ignoring
+// method — the method-agnostic counterpart to indexServerRoutes. It lets the
+// unmatched-client pass tell "the endpoint exists but we have the wrong verb"
+// (method_mismatch) from "no server route serves this path at all" (path_unknown).
+func indexServerPathSuffixes(all []facts.Fact) map[string]bool {
+	set := map[string]bool{}
+	for _, f := range all {
+		if f.Kind != facts.KindRoute || f.Repo == "" || roleOf(f) == "client" {
+			continue
+		}
+		if normalizeMethod(propString(f, "method")) == "" {
+			continue
+		}
+		for _, p := range serverPaths(f) {
+			for _, suf := range pathSuffixes(p) {
+				set[suf] = true
+			}
+		}
+	}
+	return set
+}
+
+func linkHTTP(all []facts.Fact, edges map[string]*edge, cov map[string]*httpCoverage) {
+	// Index server routes by normalized path-suffix + method (shared with the
+	// unmatched-client pass so verdicts stay in lockstep).
+	server := indexServerRoutes(all)
 
 	// Match client routes against the server index.
 	for _, f := range all {
@@ -176,6 +202,13 @@ func linkHTTP(all []facts.Fact, edges map[string]*edge, cov map[string]*httpCove
 		// (no method, generic path) and call sites with no matching server both fall
 		// into unresolved (detected - resolved) — the blind spot the report exposes.
 		covFor(cov, f.Repo).detected++
+		// A call to a hardcoded external host (e.g. a third-party API) can never
+		// resolve to a loaded repo, so bucket it separately instead of leaving it in
+		// unresolved — otherwise it reads as an internal blind spot it is not.
+		if isExternalClient(f) {
+			covFor(cov, f.Repo).external++
+			continue
+		}
 		method := normalizeMethod(propString(f, "method"))
 		if method == "" {
 			continue
@@ -412,6 +445,67 @@ func UnmatchedServerRouteKeys(all []facts.Fact) map[string]bool {
 		unmatched[id] = true
 	}
 	return unmatched
+}
+
+// UnmatchedClientRouteKeys returns the identity (see RouteIdentity) of every client
+// route the cross-repo HTTP linker could not resolve to a loaded server route,
+// mapped to a short reason: "no_method" (the call site carried no usable verb),
+// "generic_path" (a sub-2-segment path the matcher deliberately skips), or
+// "no_match" (no server route shares a >=2-segment suffix + method). It mirrors
+// linkHTTP's exact resolution steps, so the set is precisely the client calls that
+// fell into the unresolved coverage count — the queryable counterpart to the
+// aggregate edge_coverage numbers. External calls (hardcoded third-party hosts) are
+// expected non-matches and are omitted. Returns nil for single-repo snapshots.
+func UnmatchedClientRouteKeys(all []facts.Fact) map[string]string {
+	if len(repoLabelLookup(all)) < 2 {
+		return nil
+	}
+	server := indexServerRoutes(all)
+	serverSuffixes := indexServerPathSuffixes(all)
+	unmatched := map[string]string{}
+	for _, f := range all {
+		if f.Kind != facts.KindRoute || f.Repo == "" || roleOf(f) != "client" {
+			continue
+		}
+		if isExternalClient(f) {
+			continue // a hardcoded external host is an expected non-match, not a blind spot
+		}
+		id := RouteIdentity(f)
+		method := normalizeMethod(propString(f, "method"))
+		if method == "" {
+			unmatched[id] = "no_method"
+			continue
+		}
+		np := normalizePath(f.Name)
+		if isGenericPath(np) {
+			unmatched[id] = "generic_path"
+			continue
+		}
+		cp := canonicalLeadingSlash(np)
+		matches, _ := lookupClientMatches(server, cp, method)
+		if provider, _ := pickProvider(f, matches); provider == "" {
+			// Distinguish "a server serves this path but not this verb" from "no
+			// server serves this path at all", so the residual is self-triaging.
+			if clientPathHasServer(serverSuffixes, cp) {
+				unmatched[id] = "method_mismatch"
+			} else {
+				unmatched[id] = "path_unknown"
+			}
+		}
+	}
+	return unmatched
+}
+
+// clientPathHasServer reports whether any of a client path's trailing-segment
+// suffixes matches a server route path suffix regardless of verb (mirrors
+// lookupClientMatches' suffix generation, minus the method filter).
+func clientPathHasServer(serverSuffixes map[string]bool, clientPath string) bool {
+	for _, suf := range pathSuffixes(clientPath) {
+		if serverSuffixes[suf] {
+			return true
+		}
+	}
+	return false
 }
 
 // repoFromIdentity extracts the repo label from a route identity key (see
@@ -831,7 +925,8 @@ func materialize(edges map[string]*edge, allRepos []string, cov map[string]*http
 				"edge_type":  "http_client",
 				"detected":   c.detected,
 				"resolved":   c.resolved,
-				"unresolved": c.detected - c.resolved,
+				"external":   c.external,
+				"unresolved": c.detected - c.resolved - c.external,
 			}}
 		}
 		out = append(out, facts.Fact{
@@ -849,6 +944,17 @@ func materialize(edges map[string]*edge, allRepos []string, cov map[string]*http
 // --- small helpers ---
 
 func roleOf(f facts.Fact) string { return propString(f, "role") }
+
+// isExternalClient reports whether a client route targets a hardcoded external host
+// (tagged external=true by the extractor). Tolerates the bool surviving a JSON
+// round-trip as a bool literal.
+func isExternalClient(f facts.Fact) bool {
+	if f.Props == nil {
+		return false
+	}
+	v, _ := f.Props["external"].(bool)
+	return v
+}
 
 func propString(f facts.Fact, key string) string {
 	if f.Props == nil {

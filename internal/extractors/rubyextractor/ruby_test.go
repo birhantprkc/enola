@@ -821,6 +821,138 @@ end
 	}
 }
 
+// TestRoutes_SymbolPathArg: `get :sym` inside a collection block is emitted (symbol
+// path arg), and a `to:` handler string is not mistaken for the path.
+func TestRoutes_SymbolPathArg(t *testing.T) {
+	src := `Rails.application.routes.draw do
+  resource :registration_helper, only: [] do
+    collection do
+      get :cities_by_zip
+      post :valid_attributes
+    end
+  end
+  get :standalone, to: 'foo#bar'
+end
+`
+	routes := routeMethods(parseRouteFileAST([]byte(src), "config/routes.rb"))
+	if !routes["/registration_helper/cities_by_zip"]["GET"] {
+		t.Errorf("symbol collection route missing; got %v", routes)
+	}
+	if !routes["/registration_helper/valid_attributes"]["POST"] {
+		t.Errorf("symbol collection POST missing; got %v", routes)
+	}
+	if !routes["/standalone"]["GET"] {
+		t.Errorf("symbol path with to: should be /standalone; got %v", routes)
+	}
+	// The handler string must not become a route path.
+	if _, bad := routes["/foo#bar"]; bad {
+		t.Errorf("to: handler leaked into route path: %v", routes)
+	}
+}
+
+// TestRoutes_ScopeBareSymbolPrefix: `scope :users` adds a /users path prefix; a
+// keyword-only `scope module:` adds none.
+func TestRoutes_ScopeBareSymbolPrefix(t *testing.T) {
+	src := `Rails.application.routes.draw do
+  scope :users do
+    post 'email_sign_in', to: 'magic_link#create'
+  end
+  scope module: :api do
+    get 'ping'
+  end
+end
+`
+	routes := routeMethods(parseRouteFileAST([]byte(src), "config/routes.rb"))
+	if !routes["/users/email_sign_in"]["POST"] {
+		t.Errorf("scope :users prefix missing; got %v", routes)
+	}
+	if !routes["/ping"]["GET"] {
+		t.Errorf("scope module: should not add a path prefix; got %v", routes)
+	}
+}
+
+// TestRoutes_ResourcePathOverride: `resource ..., path:` overrides the URL segment
+// while nesting param stays derived from the resource name.
+func TestRoutes_ResourcePathOverride(t *testing.T) {
+	src := `Rails.application.routes.draw do
+  resource :static_page, only: [:show], path: 'nebenpage'
+  resources :photos, path: 'images' do
+    resources :comments, only: [:index]
+  end
+end
+`
+	routes := routeMethods(parseRouteFileAST([]byte(src), "config/routes.rb"))
+	if !routes["/nebenpage"]["GET"] {
+		t.Errorf("resource path: override missing /nebenpage; got %v", routes)
+	}
+	if _, bad := routes["/static_page"]; bad {
+		t.Errorf("un-overridden /static_page must not be emitted: %v", routes)
+	}
+	if !routes["/images/:photo_id/comments"]["GET"] {
+		t.Errorf("nested route should use path segment + name-derived param; got %v", routes)
+	}
+}
+
+// TestRoutes_ResourcesUpdatePutAndPatch: a resources/resource update action serves
+// both PATCH and PUT (Rails routes both verbs to update), so both are emitted.
+func TestRoutes_ResourcesUpdatePutAndPatch(t *testing.T) {
+	src := `Rails.application.routes.draw do
+  resources :widgets, only: [:update]
+  resource :profile, only: [:update]
+end
+`
+	routes := routeMethods(parseRouteFileAST([]byte(src), "config/routes.rb"))
+	for _, m := range []string{"PATCH", "PUT"} {
+		if !routes["/widgets/:id"][m] {
+			t.Errorf("resources update missing %s; got %v", m, routes["/widgets/:id"])
+		}
+		if !routes["/profile"][m] {
+			t.Errorf("singular resource update missing %s; got %v", m, routes["/profile"])
+		}
+	}
+}
+
+// TestRoutes_MatchViaVerbs: `match ... via:` emits one route per listed verb
+// (array or single symbol), and nothing when via: is absent.
+func TestRoutes_MatchViaVerbs(t *testing.T) {
+	src := `Rails.application.routes.draw do
+  match 'search', to: 'search#index', via: [:get, :post]
+  match 'ping', via: :get
+end
+`
+	routes := routeMethods(parseRouteFileAST([]byte(src), "config/routes.rb"))
+	search := routes["/search"]
+	for _, m := range []string{"GET", "POST"} {
+		if !search[m] {
+			t.Errorf("match via: missing %s for /search; got %v", m, search)
+		}
+	}
+	if !routes["/ping"]["GET"] {
+		t.Errorf("match via: :get missing GET for /ping; got %v", routes["/ping"])
+	}
+}
+
+// TestRoutes_ScopePathKeyword: a `scope path:`/`namespace path:` keyword sets the
+// URL prefix (independently of module:).
+func TestRoutes_ScopePathKeyword(t *testing.T) {
+	src := `Rails.application.routes.draw do
+  scope path: 'api', module: :api do
+    get 'health'
+  end
+  namespace :admin, path: 'administration' do
+    get 'dashboard'
+  end
+end
+`
+	routes := routeMethods(parseRouteFileAST([]byte(src), "config/routes.rb"))
+	if !routes["/api/health"]["GET"] {
+		t.Errorf("scope path: 'api' should prefix child route; got %v", routes)
+	}
+	if !routes["/administration/dashboard"]["GET"] {
+		t.Errorf("namespace path: override should apply; got %v", routes)
+	}
+}
+
 // TestRoutes_NestedPluralResources: a plural `resources` nested in a plural
 // `resources` nests under the parent member id.
 func TestRoutes_NestedPluralResources(t *testing.T) {

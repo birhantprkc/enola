@@ -229,7 +229,27 @@ import (
 // v88: Python extractor now emits gRPC client-role routes (source=python-grpc-client) for
 // stub.Method(...) call sites, detected from source. New facts, so cached Python snapshots must
 // re-extract to pick them up.
-const cacheVersion = "v88"
+// v89: Swift HTTP-client extractor widens method inference (symmetric scan window + enum/
+// .rawValue/Alamofire .method forms) and tags calls to hardcoded absolute hosts with
+// external=true + host. Changes route methods and props, so cached Swift snapshots must
+// re-extract.
+// v90: Kotlin Retrofit extractor tags absolute-URL annotations external=true + host; Ruby
+// route extractor adds `match ... via:` verbs and reads `scope`/`namespace path:` keyword
+// prefixes. New/changed route facts, so cached Kotlin and Ruby snapshots must re-extract.
+// v91: Ruby route extractor emits both PATCH and PUT for the resources/resource update
+// action (Rails routes both verbs to update), so a client calling PUT resolves. New route
+// facts, so cached Ruby snapshots must re-extract.
+// v92: Ruby route extractor handles symbol path args (`get :cities_by_zip`), a bare-symbol
+// `scope :users` path prefix, and the `resource(s) ..., path:` segment override. New/
+// corrected route paths, so cached Ruby snapshots must re-extract.
+// v93: Swift endpoint extractor's switchReturns now collects case labels that wrap across
+// multiple lines, so a `case .a,\n .b: return .post` maps every label (not just the first)
+// — correcting HTTP methods that previously defaulted to GET. Cached Swift snapshots must
+// re-extract.
+// v94: Swift endpoint extractor reads a single-value method property (`var method:
+// HTTPMethod { return .post }`, no switch) and applies its lone verb to every case, instead
+// of defaulting to GET. Cached Swift snapshots must re-extract.
+const cacheVersion = "v94"
 
 // extractorCache holds per-extractor facts keyed by a content hash of the files
 // the extractor depends on. It is loaded from disk at the start of a snapshot and

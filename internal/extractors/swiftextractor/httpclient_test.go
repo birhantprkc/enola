@@ -296,6 +296,171 @@ final class EntitlementAPIService {
 	}
 }
 
+// TestSwitchReturns_MultiLineCaseLabels verifies that a case-label list wrapping
+// across several lines maps EVERY label to the clause's return value, not just the
+// labels on the `case` line (the bug that defaulted continuation-line cases to GET).
+func TestSwitchReturns_MultiLineCaseLabels(t *testing.T) {
+	body := `
+      case .alpha, .beta,
+           .gamma,
+           .delta, .epsilon:
+         return .post
+      case .zeta:
+         return .get
+      default:
+         return .put
+      `
+	got := switchReturns(body, swiftReturnEnumCase)
+	for _, lbl := range []string{"alpha", "beta", "gamma", "delta", "epsilon"} {
+		if got[lbl] != "post" {
+			t.Errorf("label %q: got %q, want post (multi-line case)", lbl, got[lbl])
+		}
+	}
+	if got["zeta"] != "get" {
+		t.Errorf("single-line case zeta: got %q, want get", got["zeta"])
+	}
+	if got[swiftDefaultLabel] != "put" {
+		t.Errorf("default: got %q, want put", got[swiftDefaultLabel])
+	}
+}
+
+// TestExtractEndpointFacts_MultiLineMethodCase verifies the end-to-end effect: an
+// endpoint whose method switch places a case on a continuation line gets its real
+// verb (POST), not the GET default.
+func TestExtractEndpointFacts_MultiLineMethodCase(t *testing.T) {
+	src := `extension APIService.Generic: APIEndpoint {
+   var urlPathComponent: String {
+      switch self {
+      case .stats: return "profile/counter_stats.json"
+      case .magicToken: return "magic_token.json"
+      }
+   }
+   var method: HTTPMethod {
+      switch self {
+      case .stats:
+         return .get
+      case .forgotPassword,
+           .magicToken:
+         return .post
+      }
+   }
+}
+`
+	byName := map[string]string{}
+	for _, f := range extractEndpointFacts([]byte(src), "Sources/Core/APIService.Generic.swift", "Sources/Core", "") {
+		byName[f.Name] = f.Props["method"].(string)
+	}
+	if byName["magic_token.json"] != "POST" {
+		t.Errorf("magic_token: want POST from continuation-line case, got %q (%+v)", byName["magic_token.json"], byName)
+	}
+	if byName["profile/counter_stats.json"] != "GET" {
+		t.Errorf("stats: want GET, got %q", byName["profile/counter_stats.json"])
+	}
+}
+
+// TestExtractEndpointFacts_ConstantMethod verifies that a single-value method
+// property (`var method: HTTPMethod { return .post }`, no switch) applies its verb to
+// the endpoint's routes instead of defaulting to GET.
+func TestExtractEndpointFacts_ConstantMethod(t *testing.T) {
+	src := `extension APIService.Tracking: APIEndpoint {
+   var urlPathComponent: String {
+      switch self {
+      case .hoodMessage: return "hood_message_trackings.json"
+      }
+   }
+   var method: HTTPMethod {
+      return .post
+   }
+}
+`
+	ff := extractEndpointFacts([]byte(src), "Sources/Core/APIService.Tracking.swift", "Sources/Core", "")
+	if len(ff) != 1 {
+		t.Fatalf("expected 1 route, got %d: %+v", len(ff), ff)
+	}
+	if ff[0].Props["method"] != "POST" {
+		t.Errorf("constant method property: want POST, got %q", ff[0].Props["method"])
+	}
+}
+
+// TestMethodNear_BeforeAndEnumForms verifies the widened method inference: a verb
+// set on the request BEFORE the path line is found (symmetric window), and enum/
+// member forms (HTTPMethod.delete.rawValue, Alamofire .put) map to the verb instead
+// of silently defaulting to GET.
+func TestMethodNear_BeforeAndEnumForms(t *testing.T) {
+	src := `import Foundation
+
+final class OrdersAPIService {
+    func remove(id: Int) async throws {
+        var request = URLRequest(url: URL(string: "placeholder")!)
+        request.httpMethod = HTTPMethod.delete.rawValue
+        request.url = baseURL.appendingPathComponent("orders/\(id)/remove")
+        _ = try await send(request)
+    }
+    func replace(id: Int) async throws {
+        var request = URLRequest(url: baseURL.appendingPathComponent("orders/\(id)/replace"))
+        request.method = .put
+        _ = try await send(request)
+    }
+}
+`
+	byName := map[string]string{}
+	for _, f := range extractURLSessionFacts([]byte(src), "Data/Network/OrdersAPIService.swift") {
+		byName[f.Name] = f.Props["method"].(string)
+		if _, ok := f.Props["external"]; ok {
+			t.Errorf("%s should not be external (injected base URL): %+v", f.Name, f.Props)
+		}
+	}
+	if byName["orders/{}/remove"] != "DELETE" {
+		t.Errorf("remove: want DELETE from enum form set before the path, got %q (%+v)", byName["orders/{}/remove"], byName)
+	}
+	if byName["orders/{}/replace"] != "PUT" {
+		t.Errorf("replace: want PUT from .put form, got %q (%+v)", byName["orders/{}/replace"], byName)
+	}
+}
+
+// TestExtractEndpointFacts_ExternalHost verifies that a client whose base URL is a
+// hardcoded absolute host (the APIService.Jira idiom) is tagged external + host, so
+// the linker buckets it out of the internal unresolved count.
+func TestExtractEndpointFacts_ExternalHost(t *testing.T) {
+	src := `import Foundation
+
+extension APIService.Jira: ImageUploadEndpoint {
+    public var urlString: String {
+        return "https://jira.service.com/\(urlPathComponent)"
+    }
+    public var urlPathComponent: String {
+        switch self {
+        case .createIssue:
+            return "rest/api/2/issue"
+        case .addAttachment:
+            return "rest/api/2/issue/attachments"
+        }
+    }
+    public var method: HTTPMethod {
+        switch self {
+        case .createIssue, .addAttachment:
+            return .post
+        }
+    }
+}
+`
+	ff := extractEndpointFacts([]byte(src), "Sources/Core/3P/APIService.Jira.swift", "Sources/Core", "")
+	if len(ff) == 0 {
+		t.Fatalf("expected endpoint routes, got none")
+	}
+	for _, f := range ff {
+		if ext, _ := f.Props["external"].(bool); !ext {
+			t.Errorf("%s: want external=true, got %+v", f.Name, f.Props)
+		}
+		if f.Props["host"] != "jira.service.com" {
+			t.Errorf("%s: want host jira.service.com, got %v", f.Name, f.Props["host"])
+		}
+		if f.Props["method"] != "POST" {
+			t.Errorf("%s: want POST, got %v", f.Name, f.Props["method"])
+		}
+	}
+}
+
 // TestExtractURLSessionFacts_NonNetworkFileSkipped verifies the file-level gate:
 // a source that never references URLSession/URLRequest (e.g. a PDF exporter using
 // appendingPathComponent for file I/O) emits no client routes.

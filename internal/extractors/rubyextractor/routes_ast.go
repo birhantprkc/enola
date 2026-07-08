@@ -80,7 +80,9 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 
 	switch method {
 	case "get", "post", "put", "patch", "delete":
-		path := firstStringArg(args, rw.src)
+		// Accept both a string path ('cities_by_zip') and a bare symbol (:cities_by_zip);
+		// the positional helper also avoids picking up a `to:` handler string.
+		path := firstPositionalPath(args, rw.src)
 		if path == "" {
 			return
 		}
@@ -130,7 +132,13 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 				parentMember = "/:" + p
 			}
 		}
-		segment := parentMember + "/" + name
+		// `path:` overrides the URL segment while the resource name still drives the
+		// props and the nested member param (Rails derives `:name_id` from the name).
+		segmentName := name
+		if p := pairString(args, "path", rw.src); p != "" {
+			segmentName = strings.Trim(p, "/")
+		}
+		segment := parentMember + "/" + segmentName
 		resourcePath := prefix + segment
 
 		actions := restfulActions(only, except)
@@ -155,21 +163,71 @@ func (rw *routeWalker) handleCall(call *sitter.Node, stack []routeScope) {
 			rw.walk(body, append(stack, routeScope{pathPrefix: segment, memberParam: childMember}))
 		}
 
+	case "match":
+		// `match 'x', via: [:get, :post]` maps one path to several verbs; emit one
+		// route per listed verb. Without a `via:` the verb set is ambiguous (older
+		// Rails defaulted to all), so emit nothing rather than guess.
+		path := firstPositionalPath(args, rw.src)
+		if path == "" {
+			return
+		}
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
+		handler := pairString(args, "to", rw.src)
+		for _, v := range symbolValues(findPairValue(args, "via", rw.src), rw.src) {
+			verb := strings.ToUpper(v)
+			if verb == "" || verb == "ALL" {
+				continue // via: :all matches every verb — not a concrete route
+			}
+			props := map[string]any{
+				"method":    verb,
+				"framework": "rails",
+				"language":  "ruby",
+			}
+			if handler != "" {
+				props["handler"] = handler
+			}
+			rw.emit(prefix+path, line(call), props)
+		}
+
 	case "namespace":
 		name := firstSymbolArg(args, rw.src)
 		if name == "" || body == nil {
 			return
 		}
-		rw.walk(body, append(stack, routeScope{pathPrefix: "/" + name, module: name}))
+		// `path:` overrides the URL segment (module stays the symbol name), e.g.
+		// `namespace :admin, path: 'administration'`.
+		pathSeg := "/" + name
+		if p := pairString(args, "path", rw.src); p != "" {
+			if !strings.HasPrefix(p, "/") {
+				p = "/" + p
+			}
+			pathSeg = p
+		}
+		rw.walk(body, append(stack, routeScope{pathPrefix: pathSeg, module: name}))
 
 	case "scope":
+		// module: and path: are independent — a scope may set either or both. Read a
+		// positional string path or a `path:` keyword for the URL prefix, and `module:`
+		// for the controller namespace.
 		ns := routeScope{}
-		if path := firstStringArg(args, rw.src); path != "" {
+		path := firstStringArg(args, rw.src)
+		if path == "" {
+			path = pairString(args, "path", rw.src)
+		}
+		if path == "" {
+			// A bare positional symbol is a path prefix: `scope :users` == `scope
+			// path: 'users'`. (module: is a keyword pair, so it is not read here.)
+			path = firstSymbolArg(args, rw.src)
+		}
+		if path != "" {
 			if !strings.HasPrefix(path, "/") {
 				path = "/" + path
 			}
 			ns.pathPrefix = path
-		} else if mod := pairSymbol(args, "module", rw.src); mod != "" {
+		}
+		if mod := pairSymbol(args, "module", rw.src); mod != "" {
 			ns.module = mod
 		}
 		if body != nil {
@@ -264,6 +322,25 @@ func pairSymbols(args *sitter.Node, key string, src []byte) map[string]bool {
 	for i := uint(0); i < v.ChildCount(); i++ {
 		if v.Child(i).Kind() == "simple_symbol" {
 			out[strings.TrimPrefix(rubyText(v.Child(i), src), ":")] = true
+		}
+	}
+	return out
+}
+
+// symbolValues returns the symbol names of a value node that is either a single
+// `:sym` or an array `[:a, :b]` — handling both shapes `via:` takes (pairSymbols
+// only reads the array form).
+func symbolValues(v *sitter.Node, src []byte) []string {
+	if v == nil {
+		return nil
+	}
+	if v.Kind() == "simple_symbol" {
+		return []string{strings.TrimPrefix(rubyText(v, src), ":")}
+	}
+	var out []string
+	for i := uint(0); i < v.ChildCount(); i++ {
+		if v.Child(i).Kind() == "simple_symbol" {
+			out = append(out, strings.TrimPrefix(rubyText(v.Child(i), src), ":"))
 		}
 	}
 	return out
