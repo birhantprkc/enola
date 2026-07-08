@@ -77,6 +77,97 @@ func TestExplain_DetectsGodClass(t *testing.T) {
 	}
 }
 
+// TestExplain_DedupReopenedSymbol: a constant reopened across many files (Ruby
+// STI/concerns, monkey-patched framework namespaces) yields one symbol fact per
+// file, all sharing a Name. Fan-in is keyed by name, so each produced an identical
+// insight — the RailsAdmin::Config::Actions ×50 flood. Report the name once.
+func TestExplain_DedupReopenedSymbol(t *testing.T) {
+	store := makeStore("core.Hub", manyCallers(12), nil)
+	// Simulate the same constant reopened in 4 more files.
+	for i := 0; i < 4; i++ {
+		store.Add(facts.Fact{Kind: facts.KindSymbol, Name: "core.Hub", File: fmt.Sprintf("reopen/%d.go", i)})
+	}
+	store.BuildGraph()
+
+	insights, err := New().Explain(context.Background(), store)
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	if len(insights) != 1 {
+		t.Fatalf("reopened symbol should yield 1 insight, got %d: %+v", len(insights), insights)
+	}
+}
+
+// TestExplain_RubyBaseClassExcluded: a Rails framework base class (.rb) with high
+// fan-in-via-inheritance is not reported as a god class, while a same-fan-in domain
+// class is. Guards the base-class exclusion.
+func TestExplain_RubyBaseClassExcluded(t *testing.T) {
+	s := facts.NewStore()
+	s.Add(facts.Fact{Kind: facts.KindSymbol, Name: "ApplicationRecord", File: "app/models/application_record.rb"})
+	s.Add(facts.Fact{Kind: facts.KindSymbol, Name: "User", File: "app/models/user.rb"})
+	for i := 0; i < 12; i++ {
+		// Each caller subclasses ApplicationRecord and also references User.
+		s.Add(facts.Fact{
+			Kind: facts.KindSymbol, Name: fmt.Sprintf("app/models/m%d.Model", i),
+			File:      fmt.Sprintf("app/models/m%d.rb", i),
+			Relations: []facts.Relation{{Kind: facts.RelImplements, Target: "ApplicationRecord"}, {Kind: facts.RelCalls, Target: "User"}},
+		})
+	}
+	s.BuildGraph()
+
+	insights, err := New().Explain(context.Background(), s)
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	for _, in := range insights {
+		if strings.Contains(in.Title, "ApplicationRecord") {
+			t.Errorf("framework base class should be excluded from god-class: %q", in.Title)
+		}
+	}
+	foundUser := false
+	for _, in := range insights {
+		if strings.Contains(in.Title, "User") {
+			foundUser = true
+		}
+	}
+	if !foundUser {
+		t.Errorf("real domain hotspot User should still be reported; got %v", func() []string {
+			out := make([]string, len(insights))
+			for i, in := range insights {
+				out[i] = in.Title
+			}
+			return out
+		}())
+	}
+}
+
+// TestExplain_CapsInsightCount: no more than maxInsights findings are emitted even
+// when many distinct symbols exceed the outlier threshold.
+func TestExplain_CapsInsightCount(t *testing.T) {
+	s := facts.NewStore()
+	// 40 distinct hubs, each with 12 dependents -> all well above the floor.
+	for h := 0; h < 40; h++ {
+		hub := fmt.Sprintf("core.Hub%d", h)
+		s.Add(facts.Fact{Kind: facts.KindSymbol, Name: hub, File: fmt.Sprintf("core/hub%d.go", h)})
+		for i := 0; i < 12; i++ {
+			s.Add(facts.Fact{
+				Kind: facts.KindSymbol, Name: fmt.Sprintf("caller%d_%d.Fn", h, i),
+				File:      fmt.Sprintf("callers/%d_%d.go", h, i),
+				Relations: []facts.Relation{{Kind: facts.RelCalls, Target: hub}},
+			})
+		}
+	}
+	s.BuildGraph()
+
+	insights, err := New().Explain(context.Background(), s)
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	if len(insights) > maxInsights {
+		t.Errorf("insight count not capped: got %d, want <= %d", len(insights), maxInsights)
+	}
+}
+
 func TestExplain_BelowFloor(t *testing.T) {
 	// Hub has only 5 dependents — below minFanIn even if it's the max.
 	store := makeStore("core.Hub", manyCallers(5), nil)

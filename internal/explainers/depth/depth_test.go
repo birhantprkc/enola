@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/enola-labs/enola/internal/explainers/common"
 	"github.com/enola-labs/enola/internal/facts"
 )
 
@@ -220,6 +221,93 @@ func TestExplain_SelfImportDoesNotAddDepth(t *testing.T) {
 	}
 	if !strings.Contains(insights[0].Title, "depth 5") {
 		t.Errorf("self-import should not add depth; want depth 5, got %q", insights[0].Title)
+	}
+}
+
+// oversizedRing builds one big SCC of OversizedClusterModules+3 modules named
+// prefix+NN, returning the module list, the dep map, and the ring members.
+func oversizedRing(prefix string) ([]string, map[string][]string, []string) {
+	n := common.OversizedClusterModules + 3
+	ring := make([]string, n)
+	deps := map[string][]string{}
+	for i := 0; i < n; i++ {
+		ring[i] = fmt.Sprintf("%s%02d", prefix, i)
+	}
+	for i := 0; i < n; i++ {
+		deps[ring[i]] = []string{ring[(i+1)%n]}
+	}
+	return append([]string(nil), ring...), deps, ring
+}
+
+// TestExplain_OversizedClusterNotDeep: a large autoload cluster with a short tail
+// hanging off it produces no deep-chain finding — the cluster is a weight-0 sink, so
+// it neither counts toward depth nor lets a chain thread through it.
+func TestExplain_OversizedClusterNotDeep(t *testing.T) {
+	mods, deps, ring := oversizedRing("c/m")
+	// A short 2-module tail hanging off the cluster: c/m00 -> t/t0 -> t/t1.
+	mods = append(mods, "t/t0", "t/t1")
+	deps[ring[0]] = append(deps[ring[0]], "t/t0")
+	deps["t/t0"] = []string{"t/t1"}
+
+	insights, err := New().Explain(context.Background(), makeStore(mods, deps))
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	if len(insights) != 0 {
+		t.Fatalf("oversized cluster should not produce a deep-chain finding, got %d: %v", len(insights), titles(insights))
+	}
+}
+
+// TestExplain_ClusterIsDepthSink: genuine layering ABOVE a cluster still fires (the
+// cluster contributes nothing but the real layers count), while shallow layering
+// into a cluster does not — proving depth is earned only outside the cluster.
+func TestExplain_ClusterIsDepthSink(t *testing.T) {
+	mods, deps, ring := oversizedRing("k/m")
+	// 5 genuine layers a0->a1->a2->a3->a4, then a4 imports into the cluster.
+	for i := 0; i < 5; i++ {
+		mods = append(mods, fmt.Sprintf("a/l%d", i))
+	}
+	for i := 0; i < 4; i++ {
+		deps[fmt.Sprintf("a/l%d", i)] = []string{fmt.Sprintf("a/l%d", i+1)}
+	}
+	deps["a/l4"] = []string{ring[0]}
+	// 3 shallow layers b0->b1->b2, then b2 imports into the cluster.
+	for i := 0; i < 3; i++ {
+		mods = append(mods, fmt.Sprintf("b/l%d", i))
+	}
+	deps["b/l0"] = []string{"b/l1"}
+	deps["b/l1"] = []string{"b/l2"}
+	deps["b/l2"] = []string{ring[0]}
+
+	insights, err := New().Explain(context.Background(), makeStore(mods, deps))
+	if err != nil {
+		t.Fatalf("Explain: %v", err)
+	}
+	byMod := map[string]facts.Insight{}
+	for _, in := range insights {
+		for _, ev := range in.Evidence {
+			// first evidence fact is the chain head
+			byMod[ev.Fact] = in
+			break
+		}
+	}
+	// a/l0 has 5 real layers into the cluster -> reported at depth 5, and the chain
+	// must NOT include any cluster member.
+	aIn, ok := byMod["a/l0"]
+	if !ok {
+		t.Fatalf("5-layer chain above the cluster should be reported; got %v", titles(insights))
+	}
+	if !strings.Contains(aIn.Title, "depth 5") {
+		t.Errorf("a/l0 should be depth 5 (cluster contributes 0), got %q", aIn.Title)
+	}
+	for _, ev := range aIn.Evidence {
+		if strings.HasPrefix(ev.Fact, "k/m") {
+			t.Errorf("cluster member %q must not appear in the chain", ev.Fact)
+		}
+	}
+	// b/l0 has only 3 layers into the cluster -> below minDepth -> not reported.
+	if _, ok := byMod["b/l0"]; ok {
+		t.Errorf("3-layer chain into the cluster should be suppressed; got %v", titles(insights))
 	}
 }
 
