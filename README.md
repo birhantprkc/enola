@@ -104,9 +104,13 @@ For the full mental model and internals, see **[ARCHITECTURE.md](ARCHITECTURE.md
 
 ## Who it's for
 
-- **Anyone pairing with an AI coding agent** — Claude Code, Cursor, Copilot, Opencode, or any MCP-compatible tool.
+Everyone above the keyboard needs the same thing enola produces: a structural map of the system that's *actually correct*. Because the graph is deterministic and derived from source, an agent can turn it into an always-accurate architecture diagram on demand — a mermaid module graph, a cross-repo dependency map — and it matches the code every time, and again next quarter, byte for byte. (enola doesn't draw the diagram; it hands your agent the facts to draw it from, so the picture is never the stale one on the wiki.)
+
+- **Developers pairing with an AI coding agent** — Claude Code, Cursor, Copilot, Opencode, or any MCP-compatible tool. The agent starts from your real structure instead of re-guessing it every task.
 - **Teams working across multiple repos** — a backend, a web frontend, a mobile app. enola links them into one cross-repo graph so an agent can follow a call from the web client all the way into the service that answers it. And because that's a real graph rather than a fixed set of features, questions you'd otherwise reach for a dedicated tool to answer become plain queries over it — *which of the backend's endpoints does no client app call?* among them, a cleanup shortlist derived from the same client→server links (verify against callers outside the snapshot — cron jobs, webhooks, third-party consumers — before deleting).
 - **Anyone about to refactor** — and wanting to know the blast radius *before* touching code.
+- **Architects** — the structural view you usually maintain by hand, computed from the code instead of a diagram that drifts out of date: dependency cycles, layer violations, call-graph hotspots, cross-repo coupling, and dependency depth — plus a module/dependency diagram an agent regenerates from the current commit, so the picture stays honest.
+- **Engineering leaders — CTOs, VPs, and managers** — a trustworthy picture of a codebase's shape for planning, onboarding, and risk. Deterministic signals (cycles, hotspots, coupling) instead of gut feel, a new-hire tour or a deck diagram that matches reality, and a map that's reproducible run to run — so two people looking at it see the same thing.
 
 ---
 
