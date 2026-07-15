@@ -434,7 +434,40 @@ import (
 // carries scanned_plugin=true (consumed by the enterprise dead-code detector as an
 // entry point). Both are new/changed facts, so cached Java snapshots must re-extract
 // (GAP-JV-08, new/60).
-const cacheVersion = "v113"
+// v114: adds the Rust extractor — fn/struct/enum/trait/type/const/static symbols;
+// impl/trait "implements" edges attached via a post-pass; use-based dependency facts
+// classified internal/external/stdlib; cyclomatic complexity; Axum route facts; and
+// RelCalls/RelInstantiates edges covering calls inside a macro invocation's token_tree
+// (bail!/format!/matches! arguments, and an ordinary call embedded in any attribute
+// macro, e.g. thiserror's #[error("{}", helper(x))]), a function passed by name as a
+// value (call argument, struct field, &f, nested inside a macro argument like
+// vec![Box::new(f)], or a local fn declared earlier in the same body), serde/clap/merge
+// attribute strings and scoped paths (default, skip_serializing_if, value_parser,
+// strategy), an unprefixed `use foo::bar;` where foo is a body-less `mod foo;` in the
+// same file/mod scope (classified internal instead of external), calls/references made
+// in macro content with no enclosing symbol (a macro_rules! template body, or an
+// item-level macro invocation standing in for a whole function — recorded on a file_ref
+// fact instead of dropped), a scoped associated-function call (Type::new(),
+// some_mod::Type::from(x)), Type::Variant (bare value or match pattern), and a bare
+// capitalized identifier used as a plain value (unit struct argument/let-binding) — the
+// last three all recorded as RelInstantiates for Type, the dominant Rust construction
+// idioms beyond a struct literal. Drop::drop and Future::poll are tagged override
+// (compiler/runtime-invoked, never called by name), mirroring Kotlin/Swift's `override`
+// handling. Rust is a new FileOwner, so its arrival also reshuffles which files count as
+// "shared" for every other cached extractor's key in a mixed-language repo. Cached
+// snapshots of any repo containing Rust files must re-extract.
+// v115: Rust recognizes a #[test]/#[tokio::test]/#[wasm_bindgen_test] fn wherever it
+// lives — a plain tests.rs file, an un-gated mod tests {} — not just inside a
+// #[cfg(test)] module; it gets no symbol fact, and its calls into production code are
+// credited via a file_ref/test_ref fact instead of counted as dead production code.
+// Also records a function referenced bare inside an array literal (a `&[f, g]`
+// dispatch table) as used, and resolves the schemars crate's
+// #[schemars(schema_with = "fn")] attribute string (bare or crate::-qualified)
+// like serde's default/skip_serializing_if. Fixes a latent bug where
+// self.method() was silently dropped (no edge at all) whenever method wasn't
+// a sibling of the immediately enclosing impl block — e.g. a type with
+// several impl blocks, or a trait's own default method.
+const cacheVersion = "v115"
 
 // extractorCache holds per-extractor facts keyed by a content hash of the files
 // the extractor depends on. It is loaded from disk at the start of a snapshot and
