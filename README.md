@@ -62,6 +62,23 @@ The result is the difference between *vibe coding* — prompt, hope, fix — and
 
 > enola is a **first step**, not a replacement. It runs *before* your agent explores, so it knows where to look and what connects to what. It doesn't replace grep, file reading, or code search — it makes them precise.
 
+### Isn't this just another AST parser?
+
+Fair question — plenty of tools parse an AST. enola does too. But parsing is the *entry point*, not the product: it's **stage 2 of an 8-stage pipeline** ([ARCHITECTURE.md → The pipeline](ARCHITECTURE.md#the-pipeline)). A tree-sitter grammar or an LSP hands you a syntax tree per file; enola treats that as raw material and resolves it into a queryable graph across your whole system.
+
+| A plain AST / tree-sitter / LSP tool gives you… | enola gives you… |
+|--------------------------------------------------|------------------|
+| a syntax tree, one file at a time | a typed, directed graph resolved **across files, languages, and repos** |
+| `foo.bar()` as a call to an unknown token | `foo.bar()` **resolved to the exact declaring symbol** — through dispatch, inheritance, and imports |
+| edges exactly as written in source | edges made **semantically complete** — synthetic `has_method`, module→import bridges, cross-repo links |
+| "find where this text appears" | "**what transitively depends on this?**" — answered by graph traversal, with accurate totals |
+| no way to tell a leaf from a blind spot | a genuine **leaf service told apart from a coverage gap** |
+| text you re-grep and re-infer every session | a **byte-identical, content-fingerprinted** snapshot |
+
+The gap a parser can't cross is *resolution*. A parser sees `foo.bar()` as tokens; enola resolves it to the symbol that actually declares `bar`, across every dispatch mechanism real code uses — Ruby `send`/`public_send`, Swift inherited-method chains, Kotlin callable references, Python absolute-import call edges, Java fully-qualified-name indexing — and then links per-repo graphs so a web client's HTTP or gRPC call resolves all the way to the backend route that serves it. That's why `traverse`, `impact_analysis`, and `find_path` return the *exact* dependent set instead of grep hits: the graph builder adds edges to make traversals *"semantically complete rather than literally what each parser emitted."*
+
+And it holds itself to that standard. enola reproduces its output **to the byte** — the snapshot ID is a content fingerprint, not a random UUID — and a large share of its engineering goes into catching what a naive parser gets subtly wrong: two apps that merely *name* the same type aren't fused into a false dependency, and a service with unresolved outbound calls is reported as a coverage gap, not a phantom leaf. The graph is *derived, never guessed*; run it twice on the same commit and it's identical, byte for byte ([ARCHITECTURE.md → Determinism](ARCHITECTURE.md#determinism--incremental-updates)).
+
 ---
 
 ## What it is
@@ -78,6 +95,8 @@ The **kinds** (the nodes):
 - **service** — a whole repository (used when you analyze several at once)
 
 The **relations** (the edges) connect them: *declares*, *imports*, *calls*, *implements*, *depends_on*, and more. Because the edges are typed and directed, the graph is *queryable*, not merely searchable — you compute over it. On top of it, enola builds a small set of tools your agent can call to answer real structural questions with exact answers.
+
+Getting to that graph is where the pipeline earns its keep. AST parsing is one stage; the rest is what makes the result queryable: **parse → normalize into the typed fact model → link across repos (with 2+ loaded) → build a bidirectional graph index with synthetic edges → run deterministic explainers → emit a provenance receipt** ([ARCHITECTURE.md → The pipeline](ARCHITECTURE.md#the-pipeline)). The explainers are **real graph algorithms, not regex heuristics** — Tarjan's SCC for dependency cycles, cycle-safe longest-path for dependency depth, statistical (mean + 2σ) outlier tests for god-classes, hotspots, and complexity — and each finding carries a confidence score, where `1.0` means a structural fact and anything below is a flagged heuristic ([ARCHITECTURE.md → Insights (explainers)](ARCHITECTURE.md#insights-explainers)).
 
 For the full mental model and internals, see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
