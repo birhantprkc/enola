@@ -2075,7 +2075,7 @@ func keysMM(m map[string]map[string]bool) []string {
 }
 
 // The Rails hash-rocket route form `get 'path' => 'ctrl#action'` (path as the
-// string key) is extracted — including with an optional segment, as nebenan uses.
+// string key) is extracted — including with an optional segment, as company uses.
 func TestRoutes_HashRocketPath(t *testing.T) {
 	src := `Rails.application.routes.draw do
   namespace :v2 do
