@@ -719,7 +719,40 @@ import (
 // name re-exported from two modules in one package stays dotted rather than bind
 // arbitrarily. This is a GRAPH fix, not a dead-code one — the orphans explainer's
 // short-name matching already treated these symbols as used.
-const cacheVersion = "v137"
+// v138: two more Python call-target resolution fixes, both about targets that were
+// wrong or retained rather than merely unresolved.
+//
+// (a) Suffix matching and the internal-root gate accepted ANY directory name at
+// any depth, so an internal dir sharing a name with a third-party package captured
+// its imports — a repo with ".../databases/relational/sqlalchemy" and
+// "cognee/alembic" resolved plain `import sqlalchemy` internally, marking those
+// dependencies source:internal and keeping ~500 third-party call edges as
+// first-party. Both now apply Python's actual rule: a directory is a top-level
+// package only if its parent is not itself one (no __init__.py). With no package
+// information the rule cannot fire, so callers that do not track __init__.py keep
+// the historical permissive behaviour.
+//
+// (b) resolveAbsolute drops trailing segments on failure, which is right for an
+// import but wrong for a call target: "pkg.mod.Cls.method" resolved to pkg/mod and
+// then kept only the last segment, yielding "pkg/mod.method" — not a dangling
+// target but a WRONG one, pointing at whatever else bore that name. Resolution now
+// walks the module/symbol split point leftwards with an EXACT module lookup, so the
+// class segment moves into the symbol part. A multi-segment symbol part is only
+// accepted if it names a symbol the snapshot actually has; unconfirmed candidates
+// stay dotted rather than minting a plausible-but-wrong edge.
+// v139: two new signals that let the dead-code detector drop findings it can never
+// act on. Facts from a file carrying a codegen banner ("DO NOT EDIT", "generated
+// by", "@generated" — matched against the file head, so it works for any generator
+// and any language) gain generated=true; a generator emits a whole API surface
+// regardless of how much the project calls, so its unreferenced half is guaranteed
+// noise. Python functions registered with a framework by decorator (FastAPI
+// @app.exception_handler/@app.middleware/@app.on_event/@router.websocket, Modal
+// @app.local_entrypoint and — gated on the file importing modal, since the names
+// alone are far too generic — @app.function/@app.cls) gain
+// framework_registered=true, the same treatment click/Typer commands already got.
+// Facts are flagged, never dropped: callers of generated code must still resolve,
+// so only the dead-code judgement changes.
+const cacheVersion = "v139"
 
 // extractorCache holds per-extractor facts keyed by a content hash of the files
 // the extractor depends on. It is loaded from disk at the start of a snapshot and
