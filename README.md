@@ -681,6 +681,10 @@ Running servers register themselves under `~/.enola/instances/`; a record is rem
 
 Apache License 2.0 - see [`LICENSE`](LICENSE).
 
+**What that gets you: all of the above.** This repository is the whole engine, not a trial edition. Every extractor and every language ships here (Go, TypeScript/JavaScript/Vue/Svelte, Python, Java, Kotlin, Ruby, PHP, Swift, Rust, C/C++, gRPC/Protobuf, OpenAPI), along with the cross-repo linker, all 13 MCP tools, all 10 explainers (cycles, layers, cross-repo, coverage, unused-routes, god-class, hotspots, dependency-depth, exported-surface, complexity-outliers), baselines and `diff_snapshot`, snapshot receipts, the `--explain` report and the localhost dashboard. Nothing above is gated, metered, or degraded without a key - there is no license check anywhere in this repository, and no snapshot, fact, or usage counter leaves your machine. (The only outbound request enola makes is to GitHub's release API, and only when you explicitly run `enola upgrade`.)
+
+A separate commercial product, enola-enterprise, adds further analyzers *on top of* this engine - it imports these packages rather than replacing them. That's a different repository; it takes nothing away from this one.
+
 ## Acknowledgements
 
 enola bundles third-party components under their own licenses; see [`NOTICE`](NOTICE). Swift parsing uses the [tree-sitter-swift](https://github.com/alex-pinkus/tree-sitter-swift) grammar by Alex Pinkus (MIT), vendored under [`internal/extractors/swiftextractor/grammar/`](internal/extractors/swiftextractor/grammar/).
