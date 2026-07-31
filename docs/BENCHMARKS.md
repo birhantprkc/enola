@@ -395,10 +395,6 @@ enola coverage cluster.yaml
 
 ---
 
-Building this benchmark also turned up seven defects in enola itself, all since fixed;
-[DEFECTS_FOUND.md](../DEFECTS_FOUND.md) is the record, and the only place their status
-is tracked.
-
 Per-language extraction detail: **[docs/extraction/](extraction/README.md)** ·
 Commands and flags: **[docs/CLI.md](CLI.md)** ·
 How the engine works: **[ARCHITECTURE.md](../ARCHITECTURE.md)**
