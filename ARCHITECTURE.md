@@ -171,6 +171,8 @@ Three plugin roles drive the middle of the pipeline — **extractors** (source �
 
 ## Insights (explainers)
 
+*Why these exist and what a finding is worth once you have it: **[docs/EXPLAINERS.md](docs/EXPLAINERS.md)**. This section is the reference.*
+
 Explainers turn raw facts into architectural observations. Each insight carries a **confidence** score: `1.0` means it's a structural fact, below `1.0` means it's a heuristic. Every insight is also tagged with the explainer that produced it (`Insight.Source`), and the whole set is retrievable through the **`query_insights`** tool — filter by `explainer`, `repo`, or `min_confidence` — so an agent fetches a finding directly instead of re-deriving it from raw facts or scraping it out of `explore depth=2` / `.enola/insights.json`.
 
 - **Cycles** ([`internal/explainers/cycles`](internal/explainers/cycles/cycles.go)) — finds cyclic module dependencies using **Tarjan's strongly-connected-components algorithm**. A cycle either exists in the import graph or it doesn't, so these land at confidence `1.0`, with every module in the cycle listed as evidence.

@@ -233,5 +233,6 @@ maintenance keeps destroying. It is easier to keep it.
 ---
 
 Measured numbers: **[docs/BENCHMARKS.md](BENCHMARKS.md)** ·
+What the findings are for: **[docs/EXPLAINERS.md](EXPLAINERS.md)** ·
 Commands and flags: **[docs/CLI.md](CLI.md)** ·
 How the engine works: **[ARCHITECTURE.md](../ARCHITECTURE.md)**
