@@ -193,6 +193,7 @@ so — but the mechanism is the argument, and the mechanism is the delta.
 ---
 
 Measured numbers: **[docs/BENCHMARKS.md](BENCHMARKS.md)** ·
+What the words mean: **[docs/GLOSSARY.md](GLOSSARY.md)** ·
 Why the graph is a snapshot: **[docs/SNAPSHOTS.md](SNAPSHOTS.md)** ·
 Commands and flags: **[docs/CLI.md](CLI.md)** ·
 How the engine works: **[ARCHITECTURE.md](../ARCHITECTURE.md)**

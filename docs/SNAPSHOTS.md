@@ -34,8 +34,8 @@ document is those consequences in order.
 
 That it delivers the verdict it claims to is measured in
 [BENCHMARKS.md § 2](BENCHMARKS.md#2-delta-precision--the-ratchet): across twelve repositories
-carrying **1,192 pre-existing findings**, an injected dependency cycle was reported as exactly one
-regression, and not one of the 1,192 was repeated.
+carrying **974 pre-existing findings**, an injected dependency cycle was reported as exactly one
+regression, and not one of the 974 was repeated.
 
 ## So the unit is a value, and it is named by its contents
 
@@ -52,7 +52,7 @@ treat a matching ID as proof rather than as a coincidence.
 
 Determinism is the precondition for that, not the payoff. Measured:
 [38 of 38 repositories produced a byte-identical `snapshot_id` and a byte-identical `facts.jsonl`
-across three runs each — 114 runs, 4,211,113 facts, zero drift](BENCHMARKS.md#1-reproducibility).
+across three runs each — 114 runs, 4,211,133 facts, zero drift](BENCHMARKS.md#1-reproducibility).
 Cold first and then warm, deliberately, because the thing worth testing is that a cached run and a
 from-scratch run agree rather than that one code path repeats itself.
 
@@ -233,6 +233,7 @@ maintenance keeps destroying. It is easier to keep it.
 ---
 
 Measured numbers: **[docs/BENCHMARKS.md](BENCHMARKS.md)** ·
+What the words mean: **[docs/GLOSSARY.md](GLOSSARY.md)** ·
 What the findings are for: **[docs/EXPLAINERS.md](EXPLAINERS.md)** ·
 Commands and flags: **[docs/CLI.md](CLI.md)** ·
 How the engine works: **[ARCHITECTURE.md](../ARCHITECTURE.md)**

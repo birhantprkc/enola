@@ -119,7 +119,7 @@ enola check --warn-only          # report everything, fail nothing
 
 ## How it works
 
-Not a language model, and not embeddings. enola parses your source with tree-sitter and language-specific extractors, normalizes it into a typed fact model, links it into a directed graph, and runs real graph algorithms over it — Tarjan's SCC for cycles, cycle-safe longest-path for dependency depth, mean+2σ outlier tests for the statistical findings.
+Not a language model, and not embeddings. enola parses your source with tree-sitter and language-specific extractors, normalizes it into a typed fact model, links it into a directed graph, and runs real graph algorithms over it — Tarjan's SCC to find groups of modules that can all reach each other (a cycle), cycle-safe longest-path for the deepest import chain, and mean+2σ outlier tests to flag what sits two standard deviations above your own repository's average for the statistical findings. Terms enola uses in its own output are defined in **[docs/GLOSSARY.md](docs/GLOSSARY.md)**.
 
 That means the same commit yields the same answer, every time — measured, not asserted: across 38 open-source repositories indexed three times each, all 38 produced a byte-identical snapshot ID and a byte-identical fact file, over 4.2 million facts with zero parse errors ([BENCHMARKS.md](docs/BENCHMARKS.md)). Every snapshot carries a **receipt**: enola's version, the git ref and whether the tree was dirty, the extractors used, and a snapshot ID that's a `sha256` fingerprint of the facts rather than a random UUID. Before trusting a comparison, enola checks the two snapshots were even built the same way — a different extractor set or changed ignore rules makes a diff meaningless, and it says so instead of reporting churn as if it were your change.
 
@@ -177,6 +177,7 @@ Framework- and platform-specific detection for each language is described in **[
 - **[docs/CLI.md](docs/CLI.md)** - setup, every command and flag, the exit codes, and the `--explain` report.
 - **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** - reproducibility, delta precision, cross-repo coverage and scale, measured on 38 public repositories.
 - **[docs/SNAPSHOTS.md](docs/SNAPSHOTS.md)** - why enola computes a graph on demand and keeps it as an addressable snapshot rather than maintaining one continuously-updated graph - and where the opposite choice is the right one.
+- **[docs/GLOSSARY.md](docs/GLOSSARY.md)** - the words enola uses in its own output - finding, baseline, receipt, coverage gap, incidental shift - defined in one place.
 - **[docs/EXPLAINERS.md](docs/EXPLAINERS.md)** - what the ten explainers compute, why a derived finding you can trust is still not a verdict, and how a delta turns 24,012 findings about a corpus into the one that is about your change.
 - **[docs/extraction/](docs/extraction/)** - per language, what specific code produces which facts, from committed fixtures - and what each extractor deliberately does not resolve.
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** - the concept, the fact model, the pipeline, the MCP tool reference, and the value model.

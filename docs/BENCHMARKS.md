@@ -409,6 +409,7 @@ enola coverage cluster.yaml
 ---
 
 Per-language extraction detail: **[docs/extraction/](extraction/README.md)** ·
+What the words mean: **[docs/GLOSSARY.md](GLOSSARY.md)** ·
 Commands and flags: **[docs/CLI.md](CLI.md)** ·
 Why the graph is a snapshot: **[docs/SNAPSHOTS.md](SNAPSHOTS.md)** ·
 What the findings are for: **[docs/EXPLAINERS.md](EXPLAINERS.md)** ·
