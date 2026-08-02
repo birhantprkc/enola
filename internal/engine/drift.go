@@ -98,10 +98,10 @@ func (d Drift) Summary(maxPaths int) string {
 //
 // This re-reads and re-hashes every walked file, which costs roughly the walk+hash
 // stages of a snapshot. That is why it is an on-demand call for the tools that are
-// ABOUT to make a claim about the change (diff_snapshot,
-// validate_architecture_change) rather than part of the per-tool-call freshness
-// banner: the banner is a cheap proactive nudge, this is an exact answer at a
-// decision point.
+// ABOUT to make a claim about the change — diff_snapshot, and anything else computing
+// its own delta — rather than part of the per-tool-call freshness banner: the banner is
+// a cheap proactive nudge, this is an exact answer at a decision point. See
+// internal/drift for the shared caller.
 //
 // The snapshot's recorded hashes cover the repo that snapshot indexed. In multi-repo
 // (append) mode that is the most recently indexed repo, so a caller asking about a
