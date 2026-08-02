@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/enola-labs/enola/internal/config"
+	"github.com/enola-labs/enola/internal/diff"
+	"github.com/enola-labs/enola/internal/drift"
 	"github.com/enola-labs/enola/internal/engine"
 	"github.com/enola-labs/enola/internal/explainers/complexity"
 	"github.com/enola-labs/enola/internal/explainers/coverage"
@@ -155,6 +157,17 @@ func (e *Engine) OutputDir(repoPath string) string {
 // snapshot.meta.json) from dir into an in-memory Snapshot for diffing.
 func LoadSnapshotDir(dir string) (*facts.Snapshot, error) {
 	return engine.LoadSnapshotDir(dir)
+}
+
+// AddDriftWarning appends a comparability caveat to d when repoPath's working tree no
+// longer matches the snapshot eng holds. rerunTool names the tool to call again.
+//
+// Exported because every tool that computes its OWN delta needs this caveat, and they do
+// not all live in this module. A consumer that builds a diff the server never sees is not
+// covered by the server's own call, so the check has to be reachable from outside. See
+// internal/drift for why the implementation lives a layer down.
+func AddDriftWarning(d *diff.SnapshotDiff, eng *Engine, repoPath, rerunTool string) {
+	drift.AddWarning(d, eng, repoPath, rerunTool)
 }
 
 // ResolveBaselineDir maps a baseline selector to the directory holding that snapshot's
