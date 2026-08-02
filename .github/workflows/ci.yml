@@ -130,7 +130,7 @@ jobs:
 
           # Advisory: report, never block. Delete this line to make the gate enforcing —
           # the exit code above is already the verdict.
-          exit 0
+          # exit 0
 
       - name: Upload the verdict
         if: always()
