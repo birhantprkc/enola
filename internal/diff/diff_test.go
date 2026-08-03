@@ -586,6 +586,43 @@ func TestCompute_IdenticalFindingsStayEmpty(t *testing.T) {
 //
 // The delta looks authoritative and the only signal is a timestamp on line 3 that the
 // reader has to diff in their head.
+// Two builds reporting the SAME enola version can still extract differently, because
+// version.Version is the constant "dev" until a release sets it — which makes every locally
+// built binary indistinguishable from every other by version alone.
+//
+// Nothing else in the receipt moves either: same config, same globs, same extractor set. So
+// before ExtractorVersion was compared, a change to an EXTRACTOR was graded as a change to
+// the CODE, comparably and with no caveat. That is not hypothetical: enola's own fix for a
+// fabricated-fact bug removed 21 facts, and the gate reported it as a confident deletion.
+func TestCompareMeta_SameVersionDifferentExtractionIsNotComparable(t *testing.T) {
+	meta := func(extractorVersion string) facts.SnapshotMeta {
+		return facts.SnapshotMeta{
+			RepoPath: "/repo", EnolaVersion: "dev", ExtractorVersion: extractorVersion,
+			GeneratedAt: "2026-08-03T10:00:00Z", Extractors: []string{"go"},
+		}
+	}
+
+	c := compareMeta(meta("v146"), meta("v147"))
+	if c.Comparable {
+		t.Error("a build whose extractors changed must not be graded against one whose did not")
+	}
+	if !c.HasKind(WarnVersionMismatch) {
+		t.Errorf("want a version-mismatch warning, got kinds %v", c.Kinds)
+	}
+
+	// The ordinary case stays quiet, or the warning is worthless.
+	if same := compareMeta(meta("v147"), meta("v147")); !same.Comparable {
+		t.Errorf("two identical builds must compare cleanly, got %v", same.Warnings)
+	}
+
+	// And a snapshot taken before the field existed must not be treated as a mismatch:
+	// unknown is not the same as different, and inventing a caveat from absent data would
+	// decline every diff against an older baseline.
+	if old := compareMeta(meta(""), meta("v147")); !old.Comparable {
+		t.Errorf("an older baseline with no recorded extractor version must not be rejected: %v", old.Warnings)
+	}
+}
+
 func TestCompareMeta_StaleBaselineWarns(t *testing.T) {
 	meta := func(ts string) facts.SnapshotMeta {
 		return facts.SnapshotMeta{
@@ -717,5 +754,42 @@ func TestCompareMeta_SameSecondIsNotInverted(t *testing.T) {
 	}
 	if !same.Comparable {
 		t.Errorf("identical timestamps must be comparable, got warnings: %v", same.Warnings)
+	}
+}
+
+// A caveat that fires on most rows is one readers learn to skip.
+//
+// Comparability spans a spectrum: at one end "these are different repositories", at the
+// other "these two snapshots are four days apart". Treating the whole spectrum as
+// "incomparable" was fine for a pinned baseline and wrong for a TIMELINE, where revisions
+// months apart are the normal shape — sampling a repository by release tag marked 57 of 80
+// revisions suspect purely on elapsed time, drowning the three that meant a rebuild.
+func TestComparability_InvalidatesDeltaSeparatesRebuildsFromElapsedTime(t *testing.T) {
+	for kind, want := range map[WarningKind]bool{
+		WarnDifferentRepo:   true,
+		WarnVersionMismatch: true,
+		WarnExtractorSet:    true,
+		WarnIgnoreGlobs:     true,
+		WarnInvertedPair:    true,
+		WarnUnclassified:    true,
+		// Advisory: the fact delta stands, it just also contains the repo's own drift or
+		// a finding misattribution.
+		WarnStaleBaseline: false,
+		WarnPreReceipt:    false,
+		WarnExplainerSet:  false,
+	} {
+		c := Comparability{Kinds: []WarningKind{kind}}
+		if got := c.InvalidatesDelta(); got != want {
+			t.Errorf("%s: InvalidatesDelta() = %v, want %v", kind, got, want)
+		}
+	}
+
+	if (Comparability{Comparable: true}).InvalidatesDelta() {
+		t.Error("a clean comparison invalidates nothing")
+	}
+	// A mixture: one blocking kind is enough.
+	mixed := Comparability{Kinds: []WarningKind{WarnStaleBaseline, WarnExtractorSet}}
+	if !mixed.InvalidatesDelta() {
+		t.Error("a real mismatch alongside an advisory one must still invalidate")
 	}
 }
