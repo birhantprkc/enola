@@ -39,6 +39,15 @@ import (
 	"github.com/enola-labs/enola/internal/extractors/swiftextractor"
 	"github.com/enola-labs/enola/internal/extractors/tsextractor"
 	"github.com/enola-labs/enola/internal/facts"
+	"github.com/enola-labs/enola/internal/linkers/binders/grpcclientfqn"
+	"github.com/enola-labs/enola/internal/linkers/binders/grpcimpl"
+	"github.com/enola-labs/enola/internal/linkers/binders/httphandler"
+	"github.com/enola-labs/enola/internal/linkers/binders/unmatchedroutes"
+	httpsignal "github.com/enola-labs/enola/internal/linkers/crossrepo/signals/http"
+	importsignal "github.com/enola-labs/enola/internal/linkers/crossrepo/signals/imports"
+	kafkasignal "github.com/enola-labs/enola/internal/linkers/crossrepo/signals/kafka"
+	sharedcodesignal "github.com/enola-labs/enola/internal/linkers/crossrepo/signals/sharedcode"
+	"github.com/enola-labs/enola/internal/linkers/vocab"
 	"github.com/enola-labs/enola/internal/renderers/llmcontext"
 	"github.com/enola-labs/enola/internal/server"
 	"github.com/enola-labs/enola/pkg/plugin"
@@ -370,6 +379,30 @@ func NewEngine(opts Options) (*Engine, *config.Config, error) {
 	eng.RegisterExtractor(swiftextractor.New())
 	eng.RegisterExtractor(rubyextractor.New())
 	eng.RegisterExtractor(rustextractor.New())
+
+	// Resolve the linking vocabulary once and hand it to everything that matches under
+	// it, so the signals and the unmatched-route binder cannot disagree about what
+	// counts as a generic path. An invalid overlay is reported and the defaults used;
+	// the same fallback the engine applies, kept here so it is visible at wiring time.
+	linkVocab, err := cfg.LinkingVocab()
+	if err != nil {
+		log.Printf("[bootstrap] invalid linking vocabulary, using defaults: %v", err)
+		linkVocab = vocab.Default()
+	}
+
+	// Register all OSS binders. Stage() decides when each runs relative to cross-repo
+	// linking, so the order here is presentation only — see plugin.Binder.
+	eng.RegisterBinder(grpcclientfqn.New())
+	eng.RegisterBinder(grpcimpl.New())
+	eng.RegisterBinder(httphandler.New())
+	eng.RegisterBinder(unmatchedroutes.New(linkVocab))
+
+	// Register all OSS cross-repo signals. Phase() decides when each runs, so the
+	// order here is presentation only — see plugin.CrossRepoSignal.
+	eng.RegisterCrossRepoSignal(httpsignal.New(linkVocab))
+	eng.RegisterCrossRepoSignal(importsignal.New())
+	eng.RegisterCrossRepoSignal(kafkasignal.New(linkVocab))
+	eng.RegisterCrossRepoSignal(sharedcodesignal.New(linkVocab))
 
 	// Register all OSS explainers
 	eng.RegisterExplainer(cycles.New())
