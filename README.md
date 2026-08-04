@@ -64,6 +64,12 @@ New coupling (5):
 
 This example uses two packages for readability. On a 68,000-fact repository carrying 268 pre-existing findings, enola behaves the same way: it reports the one thing the change introduced, not the other 268.
 
+The whole loop, on this repository, unedited — a helper is added, the check fails on the cycle it closed, the diff shows what has to change, and the same command lets it through once it's fixed:
+
+![enola check on its own repository: a helper added to pkg/facts closes a dependency cycle, enola fails the change, the diff replaces the import with an injected interface, and the re-run passes](docs/images/story2-gate.gif)
+
+<sub>121 findings already in this repository. The check names the one the change added — and `&& echo` never fires while the gate is red.</sub>
+
 ## Set it up
 
 Three commands.

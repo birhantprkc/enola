@@ -246,7 +246,7 @@ The argument is a **repository** when it is a directory and a **config file** wh
 
 Every finding carries a confidence score, and it means something exact: `1.0` is a structural fact — in practice a dependency cycle, the one thing enola computes rather than infers — while anything below is a flagged heuristic for you to review (a god class is a statistical fan-in outlier, not a rule, so it tops out below `1.0` however extreme it gets). The analyses are computed by graph algorithms - Tarjan's SCC, which finds groups of modules that can all reach each other, for cycles; longest-path for the deepest import chain; and mean+2σ outlier tests, which flag what sits two standard deviations above your own repository's average, for the rest - so the same commit yields the same report. The vocabulary here is defined in **[docs/GLOSSARY.md](GLOSSARY.md)**.
 
-Here's the actual report for [Apache Airflow](https://github.com/apache/airflow) - a large polyglot codebase (Python, TypeScript, Java and gRPC in one tree) analyzed in a single pass: **136,859 facts, 510,000+ resolved edges, in about 6 seconds** on a laptop (extraction parses files in parallel across cores). Nothing here was written by a model.
+Here's the actual report for [Apache Airflow](https://github.com/apache/airflow) - a large polyglot codebase (Python, TypeScript, Java and gRPC in one tree) analyzed in a single pass: **68,161 facts, 175,000+ resolved edges, in under 8 seconds** on a laptop (extraction parses files in parallel across cores). Nothing here was written by a model.
 
 ```
 ════════════════════════════════════════════════════════════
@@ -254,87 +254,87 @@ Here's the actual report for [Apache Airflow](https://github.com/apache/airflow)
 ════════════════════════════════════════════════════════════
 
 Overview
-  Generated:           2026-07-25T20:22:17Z
-  Analysis time:       5.845487583s
+  Generated:           2026-08-04T19:34:16Z
+  Analysis time:       7.73310575s
   Languages:           python, typescript, java, grpc
-  Total facts:         136859
+  Total facts:         68161
 
 Architectural kinds
-  module                   2563
-  symbol                  68496
-  route                    6876
-  storage                    64
-  dependency              53765
+  module                   1261
+  symbol                  31083
+  route                     463
+  storage                    63
+  dependency              30771
 
 Relations
-  declares                68764
-  imports                 53765
-  calls                  200204
-  implements               4909
-  instantiates           183505
+  declares                31352
+  imports                 30771
+  calls                   79630
+  implements               4353
+  instantiates            29078
   injects                     1
   has_method                  2
 
 Symbol breakdown
-  method                  43730
-  function                13384
-  class                    9047
-  type                     1454
-  variable                  801
-  interface                  60
+  method                  15730
+  function                 7870
+  class                    4556
+  type                     1927
+  variable                  808
+  interface                 172
   struct                     10
   enum                        6
   constant                    4
 
 API & data surface
-  routes                   6876
-    PATCH                  6475
-    GET                     258
+  routes                    463
+    GET                     265
     POST                     76
+    PATCH                    55
     DELETE                   46
     PUT                      20
     HEAD                      1
-  storage                    64
+  storage                    63
 
 Dependencies
-  internal                27383
-  stdlib                  13952
-  external                12429
+  internal                11619
+  external                10948
+  stdlib                   8203
   unclassified                1
 
 Architecture
   Pattern:             (none detected)
-  cyclic dependencies        24
+  cyclic dependencies        23
   layer violations            0
 
 Impact analysis (hotspots)
-  coupled modules          1024
-    high criticality        632
-    medium criticality      392
+  coupled modules           477
+    high criticality        319
+    medium criticality      158
   Top hotspots (by coupling):
     module                            fan-in  fan-out crit     blast radius
-    airflow-core/src/airflow/models     2257      507 high     1452
-    devel-common/src/tests_common/t…    1592      266 high     698
-    airflow-core/src/airflow/utils      1588      201 high     1429
-    providers/common/compat/src/air…    1708       26 high     1301
-    task-sdk/src/airflow/sdk            1554       73 high     1452
-    airflow-core/src/airflow            1416      112 high     1454
-    providers/common/compat/tests/u…    1100        0 high     1423
-    providers/amazon/tests/system/a…       1      879 high     1
+    providers/common/compat/src/air…    1147       26 high     626
+    airflow-core/src/airflow/models      780      344 high     756
+    airflow-core/src/airflow             803      104 high     756
+    airflow-core/src/airflow/utils       752      145 high     756
+    task-sdk/src/airflow/sdk             740       73 high     755
+    task-sdk/src/airflow/sdk/defini…     167      194 high     650
+    providers/google/src/airflow/pr…      18      337 high     44
+    task-sdk/src/airflow/sdk/execut…     186      166 high     755
 
 Code health
   god classes (high fan-in)     25
-    dev/breeze/src/airflow_breeze/utils/console… 407 dependents
-    airflow-core/src/airflow/utils/session.crea… 382 dependents
-    providers/amazon/src/airflow/providers/amaz… 225 dependents
-    dev/breeze/src/airflow_breeze/utils/run_uti… 200 dependents
-    airflow-core/src/airflow/utils/helpers.prun… 181 dependents
-  call-graph hotspots       132
-    task-sdk/src/airflow/sdk/execution_time/tas… fan-in 118 / out 37
-    providers/hashicorp/src/airflow/providers/h… fan-in 79 / out 42
-    providers/fab/src/airflow/providers/fab/aut… fan-in 28 / out 103
-    airflow-core/src/airflow/providers_manager.… fan-in 13 / out 176
-    airflow-core/src/airflow/utils/session.crea… fan-in 382 / out 5
+    dev/breeze/src/airflow_breeze/utils/console… 409 dependents
+    providers/google/src/airflow/providers/goog… 339 dependents
+    providers/amazon/src/airflow/providers/amaz… 224 dependents
+    dev/breeze/src/airflow_breeze/utils/run_uti… 199 dependents
+    airflow-core/src/airflow/utils/helpers.prun… 175 dependents
+  call-graph hotspots       173
+    providers/google/src/airflow/providers/goog… fan-in 339 / out 5
+    task-sdk/src/airflow/sdk/bases/operator.Bas… fan-in 14 / out 101
+    dev/breeze/src/airflow_breeze/utils/run_uti… fan-in 199 / out 7
+    providers/google/src/airflow/providers/goog… fan-in 116 / out 12
+    airflow-core/src/airflow/serialization/seri… fan-in 16 / out 65
   deep dependency chains     10
     providers/common/ai/src/airflow/providers/c… depth 8
     providers/common/ai/src/airflow/providers/c… depth 8
@@ -344,15 +344,15 @@ Code health
   large public surfaces      20
     task-sdk/src/airflow/sdk/execution_time/com… 120/133 (90%)
     task-sdk/src/airflow/sdk/definitions/mapped… 100/111 (90%)
-    airflow-ctl/src/airflowctl/api/operations    92/98 (94%)
+    airflow-ctl/src/airflowctl/api/operations    94/101 (93%)
     providers/google/src/airflow/providers/goog… 67/72 (93%)
     dev/breeze/src/airflow_breeze/utils/packages 62/68 (91%)
   complexity outliers        15
-    airflow-core/src/airflow/jobs/scheduler_job… complexity 72
+    airflow-core/src/airflow/jobs/scheduler_job… complexity 66
     task-sdk/src/airflow/sdk/execution_time/sup… complexity 63
     airflow-core/src/airflow/ui/src/pages/DagsL… complexity 55
     airflow-core/src/airflow/ui/src/hooks.useDa… complexity 53
-    dev/breeze/src/airflow_breeze/commands/ci_c… complexity 52
+    airflow-core/src/airflow/api_fastapi/core_a… complexity 52
 ```
 
 No artifacts are written; `.enola/` is not touched. For a persistent snapshot with agent-readable output, use `--generate` or the MCP server.
