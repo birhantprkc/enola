@@ -94,15 +94,50 @@ func searchTSRoot(dir string, depth, maxDepth int) (string, bool) {
 // hasTSMarkers returns true if the directory looks like a project root this
 // extractor should handle (TypeScript, or a JS framework it also parses).
 func hasTSMarkers(dir string) bool {
-	// tsconfig.json (standard) or tsconfig.base.json (Nx monorepo)
-	for _, name := range []string{"tsconfig.json", "tsconfig.base.json"} {
+	// tsconfig.json (standard), tsconfig.base.json (Nx monorepo), or a Deno
+	// project's config — Deno ships TypeScript with no package.json at all
+	// (deno.json/deno.jsonc, import_map.json), so a Deno Slack app or service
+	// was undetectable by every package.json rule below.
+	for _, name := range []string{"tsconfig.json", "tsconfig.base.json",
+		"deno.json", "deno.jsonc", "import_map.json"} {
 		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
 			return true
 		}
 	}
 
-	for _, pkg := range []string{"typescript", "vue", "react", "svelte", "next", "nuxt", "ember-source"} {
+	// @hotwired/stimulus marks the plain-JavaScript Rails frontend: a Hotwire
+	// app has no tsconfig and none of the TS-ecosystem dependencies, yet ships
+	// hundreds of production controllers this extractor parses natively — on one
+	// Rails 8 app, 350+ files were invisible until this marker.
+	for _, pkg := range []string{"typescript", "vue", "react", "svelte", "next", "nuxt", "ember-source",
+		"@hotwired/stimulus", "@hotwired/turbo-rails"} {
 		if hasPkgDependency(dir, pkg) {
+			return true
+		}
+	}
+	// A dependency-free plain-JavaScript package is still a JavaScript project:
+	// a Node CLI with zero deps declares itself structurally (bin, main,
+	// exports, type, workspaces, or any dependency map). Only a bare
+	// name-holding stub — a marker file, not a package — stays undetected.
+	return packageJSONDeclaresPackage(dir)
+}
+
+func packageJSONDeclaresPackage(dir string) bool {
+	data, err := os.ReadFile(filepath.Join(dir, "package.json"))
+	if err != nil {
+		return false
+	}
+	var p map[string]any
+	if err := json.Unmarshal(data, &p); err != nil {
+		return false
+	}
+	for _, key := range []string{"bin", "main", "exports", "type", "workspaces"} {
+		if _, ok := p[key]; ok {
+			return true
+		}
+	}
+	for _, key := range []string{"dependencies", "devDependencies"} {
+		if deps, ok := p[key].(map[string]any); ok && len(deps) > 0 {
 			return true
 		}
 	}
@@ -186,6 +221,12 @@ func (e *TSExtractor) Extract(ctx context.Context, repoPath string, files []stri
 	// call graph into performs_io, so wrapper-hidden network/file I/O is visible to the
 	// enterprise performance analyzer. Mirrors the Swift extractor's computePerformsIO.
 	computeTSPerformsIO(allFacts)
+
+	// Engine-relative routes compose onto their mount point here, where every
+	// mount in the repo is visible; a per-file pass cannot see both sides.
+	if isEmber {
+		composeEngineMounts(allFacts)
+	}
 
 	// Prisma models live in schema.prisma — a separate DSL, so tree-sitter never sees it.
 	// Read it off-glob, the same way package.json and tsconfig.json already are.
@@ -362,6 +403,11 @@ func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, i
 	}
 	if isEmber && isEmberRouterFile(relFile) {
 		result = append(result, extractEmberRoutes(root, src, relFile)...)
+	}
+	if isEmber {
+		if engine, ok := isEmberEngineRoutesFile(relFile); ok {
+			result = append(result, extractEmberEngineRoutes(root, src, relFile, engine)...)
+		}
 	}
 
 	// Detect Vue Router configuration files
@@ -1885,13 +1931,30 @@ func (e *TSExtractor) collectTSFileRefs(root *sitter.Node, ctx *extractCtx, alia
 // future glob check agree.
 var tsTestSuffixes = []string{".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx"}
 
+// emberTestSuffixes are Ember's hyphenated test suffixes, valid ONLY under a
+// tests/ directory segment — ember-cli generates and qunit discovers
+// tests/**/*-test.*, but a bare hyphenated suffix outside tests/ can collide
+// with production code (an experimentation util named ab-test.ts). Mirrors
+// config.Default().TestGlobs' "**/tests/**/*-test.*" entries.
+var emberTestSuffixes = []string{"-test.ts", "-test.js", "-test.gts", "-test.gjs"}
+
 // isTSTestFile reports whether a repo-relative path is a TypeScript test/spec file.
-// The convention reserves these dotted suffixes for tests, so — like Go's *_test.go
-// — no production file can legally collide.
+// The dotted convention reserves its suffixes everywhere, so — like Go's
+// *_test.go — no production file can legally collide; the Ember convention is
+// reserved only inside tests/, so the directory is demanded there.
 func isTSTestFile(relFile string) bool {
 	for _, suffix := range tsTestSuffixes {
 		if strings.HasSuffix(relFile, suffix) {
 			return true
+		}
+	}
+	for _, suffix := range emberTestSuffixes {
+		if strings.HasSuffix(relFile, suffix) {
+			for _, seg := range strings.Split(filepath.ToSlash(relFile), "/") {
+				if seg == "tests" {
+					return true
+				}
+			}
 		}
 	}
 	return false

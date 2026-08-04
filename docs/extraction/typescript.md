@@ -169,7 +169,24 @@ file and one plausible symbol required, anything ambiguous skipped and counted i
 ```
 
 Lookups anchor to the `app/` tree — Ember's own resolver rule — across
-`components/`, `helpers/` and `modifiers/`; a lookalike path elsewhere cannot
+`components/`, `helpers/`, `modifiers/` and pods (`pods/<name>/component`),
+with the classic `app/templates/components/` split recognized too — layouts
+are candidate fragments, never a per-repo mode, so a mid-migration app
+resolves all its vintages at once. A declaration-less re-export stub (a v1
+addon's `app/`-tree publish, or any barrel) is chased to the file it
+republishes, so `lib/<addon>/` components resolve into the host namespace;
+engine templates (`lib/<engine>/addon/`) resolve in their own isolated tree.
+Container-resolved classes (adapters, serializers, transforms, initializers,
+routes, controllers) carry `framework_registered`, so the dead-code detector
+stops flagging live singletons; `@attr('type')` binds a model to its
+app-defined transform. `this.mount('shop')` becomes an `engine_mount` route
+and the engine's own `buildRoutes` map composes onto it when the mount is
+unique. Contextual components join two recorded literals — a yield-hash entry
+(`(hash Item=(component "card-item"))`, or a strict-mode imported identifier)
+and a block-param consumption (`<Card as |card|> … <card.Item/>`). File-local
+single-assignment string constants fold into name arguments (derivation, not
+inference), and irreducibly dynamic sites are counted with capped samples
+(`ember_dynamic_count`/`_samples`) — visible, never guessed; a lookalike path elsewhere cannot
 shadow the real file, and a co-located template is one component with its class,
 not an ambiguity. A component template with no co-located class is a
 template-only component and synthesizes its component symbol. A **route
@@ -189,14 +206,34 @@ route  /my-account                 app/router.ts:11  ember_route_name=account
 ```
 
 These carry `type=page`, `framework=ember` — UI routes in the same sense as Nuxt
-pages and SvelteKit routes, never HTTP contracts. An ember-data `Model` subclass
+pages and SvelteKit routes, never HTTP contracts (page-type routes are excluded
+from cross-repo HTTP matching and can never surface as "unused routes").
+`resetNamespace: true` is honored as the router defines it: the route *name*
+restarts at that segment while the URL path keeps nesting. Each route gains a
+`handled_by` edge to the route class its dot-name resolves to (`catalog.book` →
+`app/routes/catalog/book.*`), and both a template's
+`<LinkTo @route="catalog.book">` and a literal
+`router.transitionTo('catalog.book')` / `replaceWith` in code become navigation
+edges to the route fact (the implicit `.index` child resolves to its parent), so
+the route graph answers "what implements this route" and "what navigates to it".
+
+Ember's test tree stays out of the production graph: `tests/**/*-test.{js,ts,gjs,gts}`
+is ignored for indexing and collected for reference-only `test_ref` extraction,
+exactly like the dotted `.test.ts` convention — the hyphenated suffix is only
+reserved *inside* `tests/`, so the directory is demanded (a production
+`ab-test.ts` keeps its facts). An ember-data `Model` subclass
 additionally emits a storage companion (`storage_kind=model`,
 `framework=ember-data`, `table` holding the dasherized model name), the same
 shape ActiveRecord models get in the Ruby extractor — and its
 `@belongsTo`/`@hasMany` fields become `depends_on` edges to the storage facts of
 the models they name (`ember_relationships` records the declared set; a bare
 `@hasMany` is skipped, since recovering a singular model name from a plural
-field would be a guess).
+field would be a guess). The rest of the per-model quartet joins the graph:
+classes under `adapters/`, `serializers/` and `transforms/` carry
+`ember_data_role` and bind `depends_on` to the model their file base names (the
+reserved `application` base is the app-wide fallback and names none). Container
+lookups with a literal `service:` key — `owner.lookup('service:current')` —
+merge into the same injection pipeline as `@service` fields.
 
 ## Storage — three ORMs, one shape
 

@@ -1,9 +1,16 @@
 repo: "."
 ignore:
   # Dependencies and tooling
-  - "vendor/**"
-  - "node_modules/**"
-  - ".git/**"
+  # Any-depth forms: a monorepo's sub-app carries its own node_modules/dist,
+  # and root-anchored globs let a nested tree straight into the graph (a
+  # production monolith's sub-app node_modules contributed ~880k facts).
+  - "**/vendor/**"
+  - "**/node_modules/**"
+  - "**/.git/**"
+  - "**/dist/**"
+  - "**/build/**"
+  - "**/tmp/**"
+  - "**/public/assets/**"
   - ".enola/**"
   # Go reserves testdata/ for fixtures and never compiles it. Fixture repos are
   # miniature codebases, so indexing them injects their routes and client call
@@ -30,6 +37,14 @@ ignore:
   - "**/*.test.tsx"
   - "**/*.spec.ts"
   - "**/*.spec.tsx"
+  # Ember's convention is a HYPHENATED suffix under tests/ (ember-cli generates
+  # and qunit discovers tests/**/*-test.*). The directory is demanded for the
+  # same reason as Ruby's below: a bare "**/*-test.ts" also swallows production
+  # code that merely ends in the token (an experimentation util named ab-test.ts).
+  - "**/tests/**/*-test.js"
+  - "**/tests/**/*-test.ts"
+  - "**/tests/**/*-test.gjs"
+  - "**/tests/**/*-test.gts"
   # Ruby has no co-located test convention (RSpec requires spec/, Minitest
   # defaults to test/), so these demand the directory as well as the filename: a
   # bare "**/*_test.rb" also swallows production code that merely ends in the

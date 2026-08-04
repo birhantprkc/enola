@@ -958,7 +958,39 @@ import (
 // routes and ActiveRecord models already get. Before this, a .gts/.gjs/.hbs file
 // produced no facts at all: an Ember app's component architecture was invisible
 // while its plain-.ts half made the graph look populated.
-const cacheVersion = "v148"
+// v149: Ember routes become first-class graph citizens, and Ember's test tree
+// stops reading as production code. Router.map composition honors resetNamespace
+// (the route NAME restarts at the segment while the URL path keeps nesting — on
+// one production router this was the difference between 12 and 406 of 510
+// routes binding); each router-map route gains a handled_by edge to the route
+// class its dot-name resolves to; `<LinkTo @route=…>` names and literal
+// `transitionTo`/`replaceWith` arguments become navigation edges to route
+// facts, with the implicit `.index` child resolving to its parent. Page-type UI
+// routes (Ember, Nuxt, SvelteKit, Next pages, Vue router configs) are excluded
+// from cross-repo HTTP server indexing — a browser navigation URL is not a
+// served endpoint, and indexing one manufactured false unused-route findings.
+// tests/**/*-test.{js,ts,gjs,gts} joins the default ignore + test globs: the
+// hyphenated suffix is ember-cli's reserved convention INSIDE tests/, and
+// without the entry an app's acceptance suite indexed as production symbols
+// (the directory is demanded because a bare *-test.ts also swallows an
+// experimentation util named ab-test.ts — the Ruby _test.rb precedent).
+// v150: the ember-complete-coverage epic lands in one pass. Container-resolved
+// role classes (adapters, serializers, transforms, initializers, routes,
+// controllers) gain framework_registered so live singletons stop reading as
+// dead code — the Python v139 precedent applied to Ember's container.
+// @attr('type') binds models to their app-defined transforms; literal
+// {{component "x"}}/(helper …)/(modifier …) forms resolve as typed
+// invocations; loading/error substate and index templates find their parent
+// routes. V1 addon publishes resolve by chasing the recorded re-export stubs
+// (which also resolves barrels everywhere); engines compose this.mount with
+// their buildRoutes maps when the mount is unique, and engine templates
+// resolve in their own isolated tree. Contextual components join two recorded
+// literals — a yield-hash entry and a block-param consumption. Pods and the
+// classic templates/components split join the candidate fragments (layouts
+// are fragments, never a mode). File-local single-assignment string constants
+// fold into name arguments (derivation, not inference), and irreducibly
+// dynamic sites are counted with capped samples — visible, never guessed.
+const cacheVersion = "v150"
 
 // extractorCache holds per-extractor facts keyed by a content hash of the files
 // the extractor depends on. It is loaded from disk at the start of a snapshot and
