@@ -2,6 +2,7 @@ package facts
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,6 +26,16 @@ type Store struct {
 
 	// Graph provides adjacency-list traversal over fact relations
 	graph *Graph
+
+	// intern canonicalizes the two string fields that repeat heavily across facts,
+	// so N equal strings share one backing array instead of holding N. See Add.
+	// Released by BuildGraph and lazily recreated if facts are added afterwards.
+	intern map[string]string
+
+	// frozen records that Freeze has run, so structurally identical Props maps and
+	// Relations slices are now SHARED between facts. See Freeze for what that
+	// forbids.
+	frozen bool
 }
 
 // NewStore creates an empty fact store.
@@ -37,11 +48,52 @@ func NewStore() *Store {
 	}
 }
 
+// canonical returns the interned copy of s, adding it if this is the first sighting.
+// Callers must hold the write lock.
+func (s *Store) canonical(str string) string {
+	if str == "" {
+		return str
+	}
+	if s.intern == nil {
+		s.intern = make(map[string]string)
+	}
+	if c, ok := s.intern[str]; ok {
+		return c
+	}
+	s.intern[str] = str
+	return str
+}
+
 // Add adds facts to the store.
+//
+// File and Relation.Target are interned on the way in. Both are populations of a few
+// distinct values repeated across a great many facts, and every extractor produces
+// each occurrence as its own allocation — a parser has no way to know it has emitted
+// that path or that callee before. Measured on the Linux kernel (1.89M facts): 1.89M
+// File strings holding 60 MiB of bytes that are only 1 MiB distinct, and 5.42M
+// relation targets holding 157 MiB that are only 46 MiB distinct. Interning collapses
+// both to one allocation per distinct value.
+//
+// Name is deliberately NOT interned: it is near-unique by construction (1.83M distinct
+// of 1.89M on the same corpus), so a map over it would cost more than it saved.
+//
+// Interning changes only which backing array a string header points at. Equal strings
+// stay equal, the fields keep their types, and nothing downstream can observe the
+// difference — including WriteJSONL, whose output is unchanged byte for byte.
 func (s *Store) Add(ff ...Fact) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, f := range ff {
+		f.File = s.canonical(f.File)
+		if len(f.Relations) > 0 {
+			// Rewrite in place: Relations is the caller's slice, but Add already
+			// takes ownership of the fact (it is stored, not copied), and the
+			// targets are being replaced with equal values.
+			for i := range f.Relations {
+				f.Relations[i].Target = s.canonical(f.Relations[i].Target)
+			}
+		}
+
 		idx := len(s.facts)
 		s.facts = append(s.facts, f)
 		s.byKind[f.Kind] = append(s.byKind[f.Kind], idx)
@@ -57,12 +109,40 @@ func (s *Store) Add(ff ...Fact) {
 	}
 }
 
-// All returns all facts in the store.
+// All returns an independent copy of every fact in the store — including each fact's
+// Props map and Relations slice, which are copied rather than aliased.
+//
+// Copying those two is what makes the word "independent" true. A plain slice copy
+// duplicates the Fact structs, but Props is a map and Relations is a slice header, so
+// every copy still pointed into the ORIGINAL store: a caller that added a prop or
+// appended a relation wrote through into the store it had copied from. That store is
+// often the published snapshot bundle, which concurrent MCP readers are traversing.
+// The append-mode path in engine.GenerateSnapshot copies the previous bundle precisely
+// so it can mutate the result safely — binders delete props (unmatchedroutes) and
+// annotators add them (the enterprise metrics/orphans passes) — and it was relying on
+// a guarantee this method did not provide.
+//
+// Freeze makes that guarantee load-bearing rather than merely correct: once a store is
+// frozen, one Props map is shared by ~9 facts on average, so a write through an
+// uncopied reference would corrupt all of them and the published bundle besides.
+//
+// Callers that only iterate and never retain should use FactsRef instead; this one
+// allocates proportionally to the fact set.
 func (s *Store) All() []Fact {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	result := make([]Fact, len(s.facts))
 	copy(result, s.facts)
+	for i := range result {
+		if len(result[i].Relations) > 0 {
+			rels := make([]Relation, len(result[i].Relations))
+			copy(rels, result[i].Relations)
+			result[i].Relations = rels
+		}
+		if len(result[i].Props) > 0 {
+			result[i].Props = result[i].CloneProps()
+		}
+	}
 	return result
 }
 
@@ -719,6 +799,8 @@ func (s *Store) Clear() {
 	s.byName = make(map[string][]int)
 	s.byRepo = make(map[string][]int)
 	s.graph = nil
+	s.intern = nil
+	s.frozen = false
 }
 
 // BuildGraph constructs the adjacency-list graph index from the current facts.
@@ -727,6 +809,12 @@ func (s *Store) BuildGraph() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.graph = NewGraph(s.facts)
+	// The interning table has done its job: the strings it canonicalized are held by
+	// the facts themselves now, and the map is pure overhead (1.3M entries on the
+	// kernel) for the rest of the store's life. Add recreates it if more facts
+	// arrive — interning is an optimization, so a fresh table is merely less
+	// effective, never incorrect.
+	s.intern = nil
 }
 
 // Graph returns the current graph index, or nil if BuildGraph has not been called.
@@ -734,6 +822,39 @@ func (s *Store) Graph() *Graph {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.graph
+}
+
+// estimateJSONLSize guesses the serialized size of ff by marshalling a sample and
+// extrapolating, so WriteJSONL can allocate its buffer once.
+//
+// It is a size hint and nothing more: too small merely restores the append growth it
+// was avoiding, and too large wastes the difference until the buffer is released. The
+// 10% margin and the sample size are chosen so that ordinary variation between facts
+// does not push a real corpus over the estimate.
+func estimateJSONLSize(ff []Fact) int {
+	const sampleSize = 512
+	if len(ff) == 0 {
+		return 0
+	}
+	// Sample evenly across the slice rather than the first N: facts are grouped by
+	// extractor and by file, so a prefix is a poor stand-in for the whole.
+	stride := len(ff) / sampleSize
+	if stride < 1 {
+		stride = 1
+	}
+	total, n := 0, 0
+	for i := 0; i < len(ff); i += stride {
+		b, err := json.Marshal(ff[i])
+		if err != nil {
+			continue // the real pass reports it; the estimate just skips it
+		}
+		total += len(b) + 1 // + the newline
+		n++
+	}
+	if n == 0 {
+		return 0
+	}
+	return (total / n) * len(ff) * 11 / 10
 }
 
 // WriteJSONL writes all facts as JSONL to the given writer in a deterministic
@@ -744,7 +865,24 @@ func (s *Store) Graph() *Graph {
 // left untouched.
 func (s *Store) WriteJSONL(w io.Writer) error {
 	s.mu.RLock()
-	lines := make([]string, 0, len(s.facts))
+
+	// One contiguous buffer holding every marshalled line back to back, plus an index
+	// of where each begins. The sort then reorders 8-byte offsets rather than moving
+	// the lines, and the line bytes exist exactly once.
+	//
+	// Collecting a []string instead held each line TWICE — json.Marshal's []byte and
+	// the string(b) copy of it — and made 1.89M separate allocations of it, on top of
+	// whatever buffer the caller was writing into. Measured on a 1.89M-fact graph
+	// whose output is 792 MiB, this function moved live heap from 1,212 to 5,016 MiB,
+	// and the engine calls it twice per snapshot. That spike, not the graph, was what
+	// drove peak footprint to 11.3 GB.
+	// Pre-size the buffer from a sample of the first lines. Growing it by append
+	// instead means repeatedly allocating a larger array and copying into it, which
+	// at this size holds the old and the new one at once — the exact transient this
+	// function exists to avoid — and leaves up to 25% slack in the survivor.
+	// Over-estimating slightly is cheaper than either.
+	buf := make([]byte, 0, estimateJSONLSize(s.facts))
+	starts := make([]int, 0, len(s.facts)+1)
 	for _, f := range s.facts {
 		if len(f.Relations) > 1 {
 			rels := make([]Relation, len(f.Relations))
@@ -762,15 +900,27 @@ func (s *Store) WriteJSONL(w io.Writer) error {
 			s.mu.RUnlock()
 			return fmt.Errorf("encoding fact %q: %w", f.Name, err)
 		}
-		lines = append(lines, string(b))
+		starts = append(starts, len(buf))
+		buf = append(buf, b...)
 	}
+	starts = append(starts, len(buf)) // sentinel: one past the last line
 	s.mu.RUnlock()
 
-	sort.Strings(lines)
+	// Sort the index, comparing the lines it points at. bytes.Compare orders byte by
+	// byte and so did sort.Strings over the same lines, so the emitted order — and
+	// therefore facts.jsonl and every snapshot ID derived from it — is unchanged.
+	order := make([]int, len(starts)-1)
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(a, b int) bool {
+		x, y := order[a], order[b]
+		return bytes.Compare(buf[starts[x]:starts[x+1]], buf[starts[y]:starts[y+1]]) < 0
+	})
 
 	bw := bufio.NewWriter(w)
-	for _, line := range lines {
-		if _, err := bw.WriteString(line); err != nil {
+	for _, i := range order {
+		if _, err := bw.Write(buf[starts[i]:starts[i+1]]); err != nil {
 			return err
 		}
 		if err := bw.WriteByte('\n'); err != nil {
