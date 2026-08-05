@@ -994,7 +994,52 @@ import (
 // are fragments, never a mode). File-local single-assignment string constants
 // fold into name arguments (derivation, not inference), and irreducibly
 // dynamic sites are counted with capped samples — visible, never guessed.
-const cacheVersion = "v150"
+// v151: the deterministic-coverage epic, part 1 — GraphQL contracts, React
+// Navigation, Sequel. graphql-ruby root-type `field` declarations and client
+// gql-tagged/.graphql operations emit route facts named by root field
+// (`Query.pageViews`, type=graphql), joined cross-repo by a new directional
+// signal on the exact name — the HTTP linker's shape for GraphQL — while
+// staying out of HTTP path matching the way gRPC does; schema COPIES on the
+// client side (type-definition blocks, codegen inputs) deliberately emit
+// nothing. React Navigation screen registrations become page routes handled_by
+// their imported components, and literal navigate()/push() calls become
+// navigation edges from the enclosing symbol (the Ember router mechanism,
+// text-scanned because React Native writes JSX in .js). Sequel::Model classes
+// emit the ActiveRecord companion storage shape, the literal dataset argument
+// winning as the physical table. Part 2, same version (unreleased): two new
+// extractors. hcl reads Terraform with an exact block scanner — blocks become
+// symbols addressed as Terraform addresses them, references (prefixed,
+// declared-set bare addresses, depends_on lists) become depends_on edges, and
+// a module block's literal local source draws the directory dependency, remote
+// sources marked external. ansible walks the repository itself (YAML is
+// ignore-globbed — the OpenAPI self-walk precedent): plays depend on the roles
+// they list, import_role/include_role literal names draw role-to-role edges,
+// and .j2 templates are counted without ever being rendered.
+// v152: the deterministic-coverage epic, part 3 — the seams the estate probe
+// found dark. GraphQL operation documents activate the TypeScript extractor on
+// their own (a Swift/Kotlin Apollo repo carries .graphql documents and no
+// package.json; the machinery no-ops without TS files and schema copies stay
+// inert). Ruby operation-string literals — a quoted literal or heredoc body
+// opening with an operation head — emit client-role graphql routes through the
+// shared gqlscan grammar, so a Rails service calling a sibling's GraphQL API
+// joins the same cross-repo signal as a JS client; Ruby's own block syntax
+// (`query { |x| … }`) can never match, and graphql/ trees plus root-type files
+// are excluded as server side. Append mode discards a prior state whose
+// extractor_version differs from this constant instead of carrying it: the
+// retroactive-tagging migration would bulk-claim a stale cross-version union
+// under one repo's label, manufacturing facts no repo's source states.
+// v153: literal derivation folding. One shared helper (litfold) owns the
+// bounded derivation set — a file-local single-assignment constant (a name
+// assigned twice folds nothing), a wrapper call's single "/"-rooted string
+// argument, and an interpolation-headed template whose tail is a "/"-rooted
+// literal. Applied at the HTTP-client scans: fetch/makeRequest with a bare
+// identifier argument resolves through the single-assignment store; Ruby
+// client calls admit connection.post(build_url("/pageview")); lowercase verb
+// calls admit `${base}/path` templates (the base-URL half formerly recorded
+// as GAP-TS-06), with cleanTSPath resolving or stripping the base as before.
+// Folded routes carry a descriptive `derived` prop naming the form. One step
+// only, never evaluation; derived and inline literals join identically.
+const cacheVersion = "v153"
 
 // extractorCache holds per-extractor facts keyed by a content hash of the files
 // the extractor depends on. It is loaded from disk at the start of a snapshot and

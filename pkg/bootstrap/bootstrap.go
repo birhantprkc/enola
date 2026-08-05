@@ -26,9 +26,11 @@ import (
 	"github.com/enola-labs/enola/internal/explainers/layers"
 	"github.com/enola-labs/enola/internal/explainers/surface"
 	"github.com/enola-labs/enola/internal/explainers/unusedroutes"
+	"github.com/enola-labs/enola/internal/extractors/ansibleextractor"
 	"github.com/enola-labs/enola/internal/extractors/cppextractor"
 	"github.com/enola-labs/enola/internal/extractors/goextractor"
 	"github.com/enola-labs/enola/internal/extractors/grpcextractor"
+	"github.com/enola-labs/enola/internal/extractors/hclextractor"
 	"github.com/enola-labs/enola/internal/extractors/javaextractor"
 	"github.com/enola-labs/enola/internal/extractors/kotlinextractor"
 	"github.com/enola-labs/enola/internal/extractors/openapiextractor"
@@ -44,6 +46,7 @@ import (
 	"github.com/enola-labs/enola/internal/linkers/binders/grpcimpl"
 	"github.com/enola-labs/enola/internal/linkers/binders/httphandler"
 	"github.com/enola-labs/enola/internal/linkers/binders/unmatchedroutes"
+	graphqlsignal "github.com/enola-labs/enola/internal/linkers/crossrepo/signals/graphqlsig"
 	httpsignal "github.com/enola-labs/enola/internal/linkers/crossrepo/signals/http"
 	importsignal "github.com/enola-labs/enola/internal/linkers/crossrepo/signals/imports"
 	kafkasignal "github.com/enola-labs/enola/internal/linkers/crossrepo/signals/kafka"
@@ -371,6 +374,8 @@ func NewEngine(opts Options) (*Engine, *config.Config, error) {
 	eng.RegisterExtractor(cppextractor.New())
 	eng.RegisterExtractor(goextractor.New())
 	eng.RegisterExtractor(grpcextractor.New())
+	eng.RegisterExtractor(hclextractor.New())
+	eng.RegisterExtractor(ansibleextractor.New())
 	eng.RegisterExtractor(javaextractor.New())
 	eng.RegisterExtractor(kotlinextractor.New())
 	eng.RegisterExtractor(openapiextractor.New())
@@ -404,6 +409,7 @@ func NewEngine(opts Options) (*Engine, *config.Config, error) {
 	eng.RegisterCrossRepoSignal(httpsignal.New(linkVocab))
 	eng.RegisterCrossRepoSignal(importsignal.New())
 	eng.RegisterCrossRepoSignal(kafkasignal.New(linkVocab))
+	eng.RegisterCrossRepoSignal(graphqlsignal.New())
 	eng.RegisterCrossRepoSignal(sharedcodesignal.New(linkVocab))
 
 	// Register all OSS explainers

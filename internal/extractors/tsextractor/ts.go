@@ -31,8 +31,10 @@ func (e *TSExtractor) Name() string {
 // Detect returns true if the repository (or one of its immediate subdirectories
 // in the case of a monorepo) contains TypeScript markers.
 func (e *TSExtractor) Detect(repoPath string) (bool, error) {
-	_, found := findTSRoot(repoPath)
-	return found, nil
+	if _, found := findTSRoot(repoPath); found {
+		return true, nil
+	}
+	return detectGraphQLDocs(repoPath), nil
 }
 
 // findTSRoot returns the directory that is the TypeScript project root, along
@@ -154,6 +156,7 @@ func (e *TSExtractor) Extract(ctx context.Context, repoPath string, files []stri
 	isNuxt := detectNuxt(repoPath)
 	isSvelteKit := detectSvelteKit(repoPath)
 	isEmber := detectEmber(repoPath)
+	isReactNav := detectReactNavigation(repoPath)
 	// ORM detection is gated on the package.json dependency, exactly as Vue/Nuxt are, so
 	// a class coincidentally decorated @Entity models nothing in a repo without TypeORM.
 	isTypeORM, isDrizzle, isPrisma := detectORMs(repoPath)
@@ -201,7 +204,7 @@ func (e *TSExtractor) Extract(ctx context.Context, repoPath string, files []stri
 			return nil
 		}
 		aliases := aliasesForDir(aliasRoots, filepath.Dir(relFile))
-		return e.extractFile(src, relFile, isNextJS, isVue, isNuxt, isSvelteKit, isEmber, orms, aliases, knownFiles, grpcStubs)
+		return e.extractFile(src, relFile, isNextJS, isVue, isNuxt, isSvelteKit, isEmber, isReactNav, orms, aliases, knownFiles, grpcStubs)
 	})
 
 	// Group files by directory for module detection. Files that produced no
@@ -275,12 +278,18 @@ type extractCtx struct {
 	knownFiles  map[string]bool // repo-relative (slash) paths of all indexed TS/JS files
 }
 
-func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, isNuxt, isSvelteKit, isEmber bool, orms ormFlags, aliases map[string]string, knownFiles map[string]bool, grpcStubs *grpcStubIndex) []facts.Fact {
+func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, isNuxt, isSvelteKit, isEmber, isReactNav bool, orms ormFlags, aliases map[string]string, knownFiles map[string]bool, grpcStubs *grpcStubIndex) []facts.Fact {
 	if isVueFile(relFile) {
 		return e.extractVueSFC(src, relFile, isNuxt, aliases)
 	}
 	if isSvelteFile(relFile) {
 		return e.extractSvelteSFC(src, relFile, isSvelteKit, aliases)
+	}
+	if isGraphQLDocFile(relFile) {
+		if facts.IsTestPath(relFile) {
+			return nil
+		}
+		return extractGraphQLClientOps(string(src), relFile, facts.RouteSourceGraphQLOperation)
 	}
 	if isHbsFile(relFile) {
 		// Handlebars is only modeled where Ember's resolver gives the names
@@ -320,6 +329,7 @@ func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, i
 	// resolving test-ness here rather than with a local suffix list is deliberate —
 	// the copies that predated it had drifted apart in both directions.
 	if !facts.IsTestPath(relFile) {
+		result = append(result, extractGraphQLTagFacts(src, relFile)...)
 		result = append(result, extractHTTPClientFacts(src, relFile)...)
 		// Call-registered server routes (Express/Fastify/Hono/Koa). Same test-path
 		// gate: an e2e suite that spins up its own app would otherwise contribute
@@ -400,6 +410,10 @@ func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, i
 	// binder, and emit the router map's page routes.
 	if isEmberFile || isEmber {
 		result = emberEnrich(result, root, src, relFile, aliases, emberSegments)
+	}
+	if isReactNav && !facts.IsTestPath(relFile) {
+		result = append(result, extractReactNavScreens(root, src, relFile, aliases)...)
+		result = attachReactNavLinks(result, root, src, relFile)
 	}
 	if isEmber && isEmberRouterFile(relFile) {
 		result = append(result, extractEmberRoutes(root, src, relFile)...)
@@ -1071,7 +1085,7 @@ func detectNextJSAt(dir string) bool {
 func isTypeScriptFile(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	return ext == ".ts" || ext == ".tsx" || ext == ".vue" || ext == ".js" || ext == ".jsx" || ext == ".svelte" ||
-		ext == ".gts" || ext == ".gjs" || ext == ".hbs"
+		ext == ".gts" || ext == ".gjs" || ext == ".hbs" || ext == ".graphql" || ext == ".gql"
 }
 
 // minifiedLineThreshold is the line length above which a file is treated as
