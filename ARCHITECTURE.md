@@ -193,7 +193,7 @@ The contract is narrow, and each clause pays for itself:
 Gated exactly like `Explain`: an explainer excluded by config annotates nothing.
 
 - **Cycles** ([`internal/explainers/cycles`](internal/explainers/cycles/cycles.go)) — finds cyclic module dependencies using **Tarjan's strongly-connected-components algorithm**. A cycle either exists in the import graph or it doesn't, so these land at confidence `1.0`, with every module in the cycle listed as evidence.
-- **Layers** ([`internal/explainers/layers`](internal/explainers/layers/layers.go)) — recognizes common architectural shapes by matching module paths against nine known taxonomies: **hexagonal** (application / port / adapter / domain / …), **Go-standard** (cmd / internal / pkg / api), **Next.js** (pages / components / hooks / lib / api / …), **rails-mvc**, **django**, **spring-layered**, **android-clean**, **ios-clean** and **ember-octane** (routes / controllers / templates over components / helpers / modifiers over services / models over utils). Most are gated on a detected framework or language, so only one is ever reported: the most specific match wins, and ties break on confidence. Confidence is computed from how much of the codebase matches — capped below `1.0`, because a directory-name match is a well-supported guess and never a proof. Test modules are excluded from that measurement (a build file's `module_role` outranks what a path looks like), so a test source set cannot vote on the architecture. It also flags **layer violations** — an inner layer importing an outer one — as lower-confidence heuristic warnings.
+- **Layers** ([`internal/explainers/layers`](internal/explainers/layers/layers.go)) — recognizes common architectural shapes by matching module paths against nine known taxonomies: **hexagonal** (application / port / adapter / domain / …), **Go-standard** (cmd / internal / pkg / api), **Next.js** (pages / components / hooks / lib / api / …), **rails-mvc**, **django**, **spring-layered**, **android-clean**, **ios-clean** and **ember-octane** (routes / controllers / templates over components / helpers / modifiers over services / models over utils). Most are gated on a detected framework or language, so only one is ever reported: the most specific match wins, and ties break on confidence. Confidence is computed from how much of the codebase matches — capped below `1.0`, because a directory-name match is a well-supported guess and never a proof. Test modules are excluded from that measurement (a build file's `module_role` outranks what a path looks like), so a test source set cannot vote on the architecture. It also flags **layer violations** — an inner layer importing an outer one — as lower-confidence heuristic warnings. A repo that **declares** its layer order (intent facts from `enola-intent.yaml` or a cluster config's `intent:` block) is additionally verdicted against its declaration: the declared pattern lands at confidence `1.0` and its violations are proof-class, reported *alongside* the recognised pattern rather than replacing it. Recognition is snapshot-wide — a pattern's confidence is `matchCount / len(modules)` over every non-test module in the snapshot, and `dominantLanguage` gates which taxonomies are even considered — so it cannot be suppressed for one repo without moving the score, and possibly the reported pattern, for the repos that declared nothing.
 - **Cross-repo** ([`internal/explainers/crossrepo`](internal/explainers/crossrepo/crossrepo.go)) — summarizes the cross-repo edges found by the linker. Returns nothing for a single-repo snapshot.
 - **Coverage** ([`internal/explainers/coverage`](internal/explainers/coverage/coverage.go)) — turns the per-service `edge_coverage` counts the linker records into **coverage-gap** insights: a service with no resolved outbound edges but unresolved outbound call sites is flagged as a blind spot ("appears isolated but…"), distinct from one that is genuinely a leaf. Distinguishes absence of edges from a gap in coverage. Returns nothing for a single-repo snapshot. Surfaced programmatically by the `coverage_report` tool.
 - **Unused-routes** ([`internal/explainers/unusedroutes`](internal/explainers/unusedroutes/unusedroutes.go)) — the **server-side inverse** of the cross-repo HTTP linker: it rolls up the `route` facts that *no loaded client calls* (tagged `unmatched_by_clients` during linking — see [Finding unused endpoints](#finding-unused-endpoints)) into one candidate-cleanup insight per service. Deliberately conservative: it only considers repos that actually serve a cross-repo client (an HTTP *provider* — never a frontend's own page routes), skips low-signal generic paths (`/health`, single-segment), and biases toward false negatives. Each insight carries the mandatory caveat that candidates are unused *by the loaded clients only* — consumers outside the snapshot (admin scripts, cron, webhooks, third-party clients, deep links) don't appear, so verify before deleting. Confidence `0.6` (a candidate to review, not a verdict). Returns nothing for a single-repo snapshot.
@@ -201,6 +201,7 @@ Gated exactly like `Explain`: an explainer excluded by config annotates nothing.
 - **Hotspots** ([`internal/explainers/hotspots`](internal/explainers/hotspots/hotspots.go)) — flags call-graph **pinch points** (symbols with both high fan-in and high fan-out, scored `fanIn × fanOut`). A cheap degree-centrality proxy for betweenness — chokepoints most call chains pass through.
 - **Dependency-depth** ([`internal/explainers/depth`](internal/explainers/depth/depth.go)) — flags modules whose **longest transitive import chain** is unusually long (cycle-safe longest-path over the module graph). Deep modules are slow to grasp and widen rebuild/retest impact.
 - **Exported-surface** ([`internal/explainers/surface`](internal/explainers/surface/surface.go)) — flags **large public surfaces**: sizeable modules that export almost all their symbols, so they encapsulate little. Because "public is the default" in Go and Ruby (so a raw ratio test floods), it skips mock/test/generated packages, requires a meaningful size and a near-total export ratio, and reports only the **top N worst offenders** (largest public surface first) rather than every match — a digestible shortlist for a visibility review, not a list of definite defects.
+- **Intent** ([`internal/explainers/intentcheck`](internal/explainers/intentcheck/intentcheck.go)) — verdicts **declared architectural intent** against the measured graph. Declarations compile into `intent` facts at snapshot time; this explainer diffs each declaring repo's consumed-seam declarations against the measured cross-repo edges: an **unexpected seam** or a **mis-via** (right target, wrong mechanism) is set difference between stated and measured and lands at confidence `1.0`; a **missing intended seam** is capped at `0.8`, because the absent edge can be drift or an extraction miss. Repos without declarations are unasked; a declared seam whose counterparty is absent from the graph is skipped, never failed. Cluster-over-file overrides surface as informational notices. Pages can also declare themselves as **knowledge nodes** (`page:` — type, status, scope, and typed relations to other pages); the explainer verdicts **dangling relations** — an edge to a page absent from the compiled set — at capped confidence, since the target may be deleted or merely not opted in. Composes with `enola check --fail-on=intent`.
 - **Complexity-outliers** ([`internal/explainers/complexity`](internal/explainers/complexity/complexity.go)) — flags functions/methods whose **cyclomatic complexity** is a statistical outlier, using the language-agnostic `cyclomatic` prop every extractor records.
 
 The shared module-graph construction and statistical-outlier helpers used by several of these live in [`internal/explainers/common`](internal/explainers/common/common.go).
@@ -459,7 +460,7 @@ One rule matters here: **the credit is persisted alongside the count**, not repr
 
 ## The tools
 
-enola is a stdio [MCP](https://modelcontextprotocol.io/) server. It exposes **thirteen tools** and no MCP resources — everything flows through tool calls. The tools defined in [`internal/server/server.go`](internal/server/server.go) are listed below, each leading with the question it answers.
+enola is a stdio [MCP](https://modelcontextprotocol.io/) server. It exposes **fourteen tools** and no MCP resources — everything flows through tool calls. The tools defined in [`internal/server/server.go`](internal/server/server.go) are listed below, each leading with the question it answers.
 
 > Most read tools share a **token-cost ladder** via `output_mode`: `summary` (smallest, aggregated counts) → `compact` (markdown, grouped) → `full` (raw JSON, can be large). Start with `summary` and escalate only when you need node-level detail. Most also accept `max_tokens` to hard-cap a response.
 
@@ -576,6 +577,20 @@ What makes it precise:
 - **Type rollup.** When the target is a type, the walk seeds from the type *plus its methods plus its constructor* (`NewType`), so it catches callers that reference the type only indirectly.
 - **Accurate totals.** `max_nodes` caps what's *shown*, not what's *counted* — the reported total dependent count reflects the true reachable set within `max_depth`.
 - **Cross-repo aware.** In multi-repo mode it reports which other repos contain a dependent.
+
+### `governing_intent` — "which decisions govern this code?"
+
+The reverse query between knowledge and code, answered directly. Where `impact_analysis` reports governing pages as a rider on the blast radius, this tool answers governance alone, in either direction:
+
+| Parameter | Description |
+|-----------|-------------|
+| `target` *(required)* | A fact name (exact), a file path (label-prefixed or repo-relative), or a compiled page path. |
+| `repo` | Repo label to disambiguate a file measured in more than one repo. |
+| `max_tokens` | Optional hard cap. |
+
+- **Code target.** Lists the knowledge pages whose declared anchors cover the target's file — each with its type, status, and outgoing relations, so the trail continues past the first hop (the page names what it is part of, depends on, or supersedes).
+- **Page target.** Lists the page's declared anchors with the measured coverage under each — files and facts — so an anchor nothing measures is visible rather than silent.
+- **Honest empty states.** A snapshot with no compiled pages answers *not asked* (the counterparty rule); a governed snapshot with no anchor on the target answers *asked, none governs*. The two never look the same.
 
 ### `coverage_report` — "which cross-repo edges did enola resolve, and which did it miss?"
 
@@ -874,6 +889,7 @@ extractors:
   - rust
   - hcl
   - ansible
+  - mdintent
 explainers:
   - cycles
   - layers
@@ -911,7 +927,7 @@ That derivation is load-bearing rather than tidy. A literal `.enola/**` agrees w
 | `repo` | Repository root path, relative to the **working directory** | `"."` |
 | `repos` | Ordered list of repository roots forming a multi-repo cluster; supersedes `repo`. One `--generate` run indexes them all (the first fresh, the rest appended), producing the service nodes and cross-repo edges a single-repo snapshot cannot have. Entries resolve relative to the **config file's own directory**, so a checked-in cluster config means the same thing wherever it is run from. Order is semantic; duplicates are dropped | *(unset)* |
 | `ignore` | Glob patterns for files/dirs to skip | vendor, node_modules, .git, tests, build dirs, minified JS (`*.min.js`/`*.bundle.js`), docs, config data, … |
-| `extractors` | Enabled extractors | `["cpp", "go", "grpc", "java", "kotlin", "openapi", "php", "python", "typescript", "swift", "ruby", "rust", "hcl", "ansible"]` |
+| `extractors` | Enabled extractors | `["cpp", "go", "grpc", "java", "kotlin", "openapi", "php", "python", "typescript", "swift", "ruby", "rust", "hcl", "ansible", "mdintent"]` |
 | `explainers` | Enabled explainers | `["cycles", "layers", "crossrepo", "coverage", "unused-routes", "god-class", "hotspots", "dependency-depth", "exported-surface", "complexity-outliers"]` |
 | `renderers` | Enabled renderers | `["llm_context"]` |
 | `output.dir` | Output directory for artifacts. Must name a **subdirectory of the repository** — it is joined to the repository path, so an absolute value would nest that whole path inside the repo rather than write where it says. An ignore glob is derived from it automatically (see below) | `".enola"` |

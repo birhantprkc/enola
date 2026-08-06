@@ -261,6 +261,9 @@ func extractHTTPClientFacts(src []byte, relFile string) []facts.Fact {
 		if derived != "" {
 			props["derived"] = derived
 		}
+		if h := tsBaseHint(rawPath); h != "" {
+			props["target_hint"] = h
+		}
 		out = append(out, facts.Fact{
 			Kind:      facts.KindRoute,
 			Name:      path,
@@ -489,6 +492,57 @@ func firstNonEmptyGroup(src []byte, m []int, groups ...int) string {
 // or returns ok=false when it is not a backend path (fully dynamic, external,
 // or empty). It strips a leading ${...} base-URL token, drops the query string,
 // and collapses interpolations to the {} placeholder.
+// tsBaseHint derives a provider hint from an interpolated base the resolver
+// could not fold — the trailing identifier of the interpolation, lowered, with
+// URL/host/base suffixes stripped: `${config.ACME_HOST}/mcp` hints
+// "acme". The hint is a literal the source states (an env/config name
+// that names the host), and it is what disambiguates a short path served by
+// more than one loaded repo.
+//
+// An identifier carrying NO base-URL suffix yields nothing, exactly as the Ruby
+// side's stripURLVarSuffix does: `${base}`, `${url}` and `${getRootUrl()}` name
+// no provider, and a hint that names no provider steers the matcher toward a
+// wrong edge — worse than no edge at all. A token that is not a plain
+// identifier (a call, a quoted lookup) is not a name either.
+func tsBaseHint(raw string) string {
+	p := strings.TrimSpace(raw)
+	if !strings.HasPrefix(p, "${") {
+		return ""
+	}
+	i := strings.IndexByte(p, '}')
+	if i < 0 {
+		return ""
+	}
+	token := p[2:i]
+	if dot := strings.LastIndexByte(token, '.'); dot >= 0 {
+		token = token[dot+1:]
+	}
+	token = strings.ToLower(strings.TrimSpace(token))
+	if !tsPlainIdentifier(token) {
+		return ""
+	}
+	for _, suf := range []string{"_host_url", "_base_url", "_api_url", "_host", "_url", "_base", "host", "url"} {
+		if t, ok := strings.CutSuffix(token, suf); ok && t != "" {
+			return strings.Trim(strings.ReplaceAll(t, "_", ""), "-")
+		}
+	}
+	return ""
+}
+
+// tsPlainIdentifier reports whether a token is a bare identifier — letters,
+// digits and underscores. `getrooturl()` and `env('baseurl')` are not.
+func tsPlainIdentifier(token string) bool {
+	if token == "" {
+		return false
+	}
+	for _, r := range token {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
+			return false
+		}
+	}
+	return true
+}
+
 func cleanTSPath(raw string, bases map[string]string) (string, bool) {
 	p := strings.TrimSpace(raw)
 	// A leading ${...} token is the base URL. Prefer to RESOLVE it against a

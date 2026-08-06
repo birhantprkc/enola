@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -25,6 +26,7 @@ import (
 	"github.com/enola-labs/enola/internal/explainers"
 	"github.com/enola-labs/enola/internal/extractors"
 	"github.com/enola-labs/enola/internal/facts"
+	"github.com/enola-labs/enola/internal/intent"
 	"github.com/enola-labs/enola/internal/linkers/binders"
 	"github.com/enola-labs/enola/internal/linkers/crossrepo"
 	"github.com/enola-labs/enola/internal/linkers/crossrepo/signals"
@@ -37,13 +39,19 @@ import (
 // snapshotBundle is the immutable, reader-visible snapshot state. GenerateSnapshot
 // builds a brand-new store off to the side and publishes a fresh bundle in a single
 // atomic swap; once published, none of its fields are ever mutated again. Readers
-// (Store/Snapshot/RepoPaths/ResolveFactFile) Load the current bundle lock-free and
-// use it for as long as they like — a concurrent regeneration builds a different
-// store and swaps the pointer, leaving the bundle an in-flight reader holds intact.
+// (Store/Snapshot/RepoPaths/Intent/ResolveFactFile) Load the current bundle
+// lock-free and use it for as long as they like — a concurrent regeneration
+// builds a different store and swaps the pointer, leaving the bundle an
+// in-flight reader holds intact.
 type snapshotBundle struct {
 	store     *facts.Store      // immutable once published
 	snapshot  *facts.Snapshot   // may be nil (no snapshot generated yet)
 	repoPaths map[string]string // repo label -> absolute path; immutable once published, may be nil
+	// intent is each repo's resolved declaration, label-keyed, immutable once
+	// published, may be nil. It rides the bundle rather than living beside it
+	// so a reader cannot observe a declaration that disagrees with the snapshot
+	// it is reading: both change in the same atomic swap, or neither does.
+	intent map[string]*intent.Declaration
 }
 
 // Engine orchestrates the snapshot generation pipeline.
@@ -62,8 +70,8 @@ type Engine struct {
 	// atomically once the build is complete. Never expose e.store to readers.
 	store *facts.Store
 
-	// current holds the published, immutable {store, snapshot, repoPaths} bundle.
-	// Readers Load it lock-free; GenerateSnapshot Stores a new bundle to publish.
+	// current holds the published, immutable {store, snapshot, repoPaths, intent}
+	// bundle. Readers Load it lock-free; GenerateSnapshot Stores a new bundle.
 	current atomic.Pointer[snapshotBundle]
 
 	// persistCache controls whether the per-extractor cache is written back to
@@ -147,6 +155,14 @@ func (e *Engine) Snapshot() *facts.Snapshot {
 	return e.current.Load().snapshot
 }
 
+// Intent returns the resolved intent declaration for a repo label, or nil when
+// the repo declares nothing. It reads the published bundle, so the declaration
+// it returns is the one the current snapshot was built from — the verdicts in
+// that snapshot are computed from the compiled intent facts, not from here.
+func (e *Engine) Intent(repoLabel string) *intent.Declaration {
+	return e.current.Load().intent[repoLabel]
+}
+
 // Config returns the engine config.
 func (e *Engine) Config() *config.Config {
 	return e.cfg
@@ -156,14 +172,14 @@ func (e *Engine) Config() *config.Config {
 // republishes the bundle preserving the current store and snapshot.
 func (e *Engine) SetRepoPaths(paths map[string]string) {
 	b := e.current.Load()
-	e.current.Store(&snapshotBundle{store: b.store, snapshot: b.snapshot, repoPaths: paths})
+	e.current.Store(&snapshotBundle{store: b.store, snapshot: b.snapshot, repoPaths: paths, intent: b.intent})
 }
 
 // SetSnapshot sets the snapshot (used in tests, and by AutoLoadSnapshot at
 // startup). It republishes the bundle preserving the current store and repoPaths.
 func (e *Engine) SetSnapshot(snap *facts.Snapshot) {
 	b := e.current.Load()
-	e.current.Store(&snapshotBundle{store: b.store, snapshot: snap, repoPaths: b.repoPaths})
+	e.current.Store(&snapshotBundle{store: b.store, snapshot: snap, repoPaths: b.repoPaths, intent: b.intent})
 }
 
 // RestoreFromDir rebuilds and publishes the snapshot bundle from a persisted
@@ -222,6 +238,10 @@ func (e *Engine) RestoreFromDir(dir string, repoPaths map[string]string, singleR
 	// then never mutated again, so a reader iterating snap.Facts sees a frozen array.
 	snap.Facts = work.FactsRef()
 
+	// intent is deliberately nil: a restore re-reads facts, not declaration files,
+	// so the parsed declarations are not known here. The compiled intent FACTS are
+	// in the restored store, which is what the explainer verdicts from; Intent()
+	// reports nothing until the next generate re-reads the files.
 	e.current.Store(&snapshotBundle{store: work, snapshot: snap, repoPaths: repoPaths})
 	log.Printf("[engine] restored %d facts, %d insights from %s", work.Count(), len(snap.Insights), dir)
 	return nil
@@ -285,6 +305,21 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 
 	repoLabel := filepath.Base(absRepo)
 
+	// Resolve this repo's declared intent: its own enola-intent.yaml, the
+	// cluster config's entry, or the cluster entry overriding the file
+	// wholesale (reported — an override must never be only implicit). An
+	// invalid declaration fails the snapshot: a declaration that cannot be
+	// trusted is worse than none, and silent skips are how vocabulary drift
+	// would creep back in.
+	fromFile, err := intent.LoadRepoFile(absRepo)
+	if err != nil {
+		return nil, err
+	}
+	resolved := intent.Resolve(fromFile, e.cfg.Intent[repoLabel])
+	if resolved != nil && resolved.Overridden {
+		log.Printf("[engine] intent for %q: cluster config overrides %s (wholesale)", repoLabel, intent.RepoFileName)
+	}
+
 	// Build into a BRAND-NEW store off to the side. The currently-published bundle
 	// (prev) is never mutated, so any in-flight reader keeps iterating a consistent,
 	// frozen snapshot while we regenerate. We publish the new store atomically at the
@@ -292,6 +327,10 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 	prev := e.current.Load()
 	work := facts.NewStore()
 	var workRepoPaths map[string]string
+	// Declarations accumulate exactly like repoPaths: carried forward from the
+	// published bundle in append mode, replaced wholesale otherwise, and handed
+	// to the swap at the end. Nothing is written into the published map.
+	workIntent := map[string]*intent.Declaration{}
 
 	// A prior state produced by a different extraction behaviour cannot be
 	// carried: its facts may be unlabeled (or labeled under different rules),
@@ -316,12 +355,24 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 		for k, v := range prev.repoPaths {
 			workRepoPaths[k] = v
 		}
+		for k, v := range prev.intent {
+			workIntent[k] = v
+		}
 		if prev.store != nil {
 			work.Add(prev.store.All()...)
 		}
 
 		// Track repo label -> absolute path for multi-repo resolution.
 		workRepoPaths[repoLabel] = absRepo
+	}
+	if resolved != nil {
+		workIntent[repoLabel] = resolved
+	} else {
+		// A repo that stopped declaring must stop being declared, including when
+		// its entry was carried forward from the previous bundle.
+		delete(workIntent, repoLabel)
+	}
+	if appendMode {
 
 		// Retroactively tag facts from a prior single-repo snapshot so they
 		// are filterable by repo alongside the newly appended facts.
@@ -388,6 +439,14 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 	// cached with the main extractors) and adds only KindTestRef facts, so a
 	// production symbol exercised solely by a test is not mis-reported as dead.
 	e.runTestRefExtractors(ctx, absRepo, testFiles, files)
+
+	// Compile this repo's resolved intent declaration into intent facts, inside
+	// the extraction window so SetRepoRange/TagRange treat declared facts
+	// exactly as measured ones — snapshots carry them, diffs track them, and
+	// the intent explainer reads them with no side channel.
+	if resolved != nil {
+		e.store.Add(intent.CompileFacts(resolved)...)
+	}
 
 	tExtract = time.Since(tStage)
 	newCount := e.store.Count()
@@ -532,7 +591,7 @@ func (e *Engine) GenerateSnapshot(ctx context.Context, repoPath string, appendMo
 
 	// Publish atomically. This single Store() is the linearization point: before it
 	// readers see the prior bundle, after it the new one — never a half-built store.
-	e.current.Store(&snapshotBundle{store: work, snapshot: snapshot, repoPaths: workRepoPaths})
+	e.current.Store(&snapshotBundle{store: work, snapshot: snapshot, repoPaths: workRepoPaths, intent: workIntent})
 	log.Printf("[engine] snapshot generated in %s", duration)
 	log.Printf("[engine] timings: walk=%s hash=%s extract=%s link=%s graph=%s explain=%s render=%s",
 		tWalk.Round(time.Millisecond), tHash.Round(time.Millisecond), tExtract.Round(time.Millisecond),
@@ -688,6 +747,14 @@ const skippedSampleCap = 20
 // extraction — see runTestRefExtractors), and a tally of what the ignore globs
 // dropped — ignored files, and pruned directories — for the snapshot receipt.
 func (e *Engine) walkRepo(repoPath string) (files, testFiles []string, skips walkSkips, err error) {
+	// A symlinked repo root walks as a single non-directory entry (WalkDir
+	// Lstats the root), silently yielding zero files. Resolve the ROOT only —
+	// symlinks inside the tree keep their non-followed semantics — so a config
+	// may alias a checkout (a stable clone under the repo's own label) and
+	// still extract. The label was already derived from the unresolved path.
+	if resolved, rerr := filepath.EvalSymlinks(repoPath); rerr == nil && resolved != repoPath {
+		repoPath = resolved
+	}
 	err = filepath.WalkDir(repoPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -818,6 +885,14 @@ func (e *Engine) runExtractors(ctx context.Context, repoPath string, files []str
 		tExt := time.Now()
 		extracted, err := ext.Extract(ctx, repoPath, files)
 		if err != nil {
+			// A fatal extractor error fails the snapshot rather than being recorded
+			// and stepped over. Declarations use it: an invalid one would otherwise
+			// remove every verdict computed from it while the run still reports
+			// success, which reads as "nothing to report" rather than "not asked".
+			var fatal *plugin.FatalError
+			if errors.As(err, &fatal) {
+				return nil, nil, nil, fmt.Errorf("extractor %s: %w", ext.Name(), fatal.Err)
+			}
 			log.Printf("[engine] extractor %s error: %v", ext.Name(), err)
 			parseErrs = append(parseErrs, facts.ParseError{Extractor: ext.Name(), Msg: err.Error()})
 			continue
@@ -1096,7 +1171,7 @@ func (e *Engine) WriteArtifacts(repoPath string) error {
 	if e.current.Load() == b {
 		snapCopy := *b.snapshot
 		snapCopy.Meta = meta
-		e.current.CompareAndSwap(b, &snapshotBundle{store: b.store, snapshot: &snapCopy, repoPaths: b.repoPaths})
+		e.current.CompareAndSwap(b, &snapshotBundle{store: b.store, snapshot: &snapCopy, repoPaths: b.repoPaths, intent: b.intent})
 	}
 
 	// Record this revision in the architecture history. Last, and non-fatal: it reads

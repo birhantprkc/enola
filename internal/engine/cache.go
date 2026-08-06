@@ -1048,7 +1048,102 @@ import (
 // consumers strip the arguments wherever the base name alone is meant, so
 // implements targets stay clean while sequelModelBase finally receives the
 // literal table.
-const cacheVersion = "v154"
+// v155: intent compilation. Declared architectural intent (enola-intent.yaml
+// per repo, or a cluster config's intent: block with wholesale reported
+// override) compiles into KindIntent facts inside the extraction window, so
+// snapshots carry declarations, diffs track them, and receipts fingerprint
+// them. A standard explainer named `intent` verdicts declared consumes
+// against measured cross-repo edges — unexpected-seam and mis-via at
+// confidence 1.0 (set difference between stated and measured), missing-seam
+// capped at 0.8 (absence may be an extraction miss), and an override notice
+// so a cluster-over-file override is never only in a log; repos without
+// declarations are unasked, and a declared seam without its counterparty in
+// the graph is skipped, never failed. The layers explainer builds declared
+// patterns per declaring repo at confidence 1.0 (outermost-first order,
+// exact-or-`prefix/**` globs) and runs its existing violation machinery over
+// them; heuristics keep every undeclared repo. Via kinds are contract
+// constants the signals and the intent parser share — shared_symbols
+// included, which the first vocabulary pass missed and the estate corpus
+// found by failing to declare a measured seam. Two matching refinements the
+// same shakedown earned: a stripped interpolated base carries a target hint
+// (its trailing identifier — `${config.BACKEND_HOST}/mcp` hints "backend"),
+// and a single-segment path accepts a hint whose normalized form EQUALS a
+// provider label as disambiguation — the source names the host, and two
+// loaded repos serving the same short path is exactly what the hint is for.
+// Substring hints stay rejected there.
+// v156: the unresolved residue triaged into named classes. Bare verbs inside a
+// plural resources block nest under the parent member id (Rails serves
+// `resources :steps do get :status end` at /steps/:step_id/status); explicit
+// on: :collection stays flat. A GraphQL self-match — a frontend querying its
+// own repo's schema — counts resolved coverage without drawing an edge, and
+// the unmatched-route pass skips GraphQL operations entirely (they are the
+// graphql signal's domain). A failed HTTP match whose host-derived target
+// hint resolves to no loaded repo classifies external (the source names where
+// the call goes, and it is not here); and a repo whose intent declaration
+// names exactly one http-client seam gets its remaining unmatched calls
+// attributed there — a new `declared` coverage bucket and an
+// attributed_by_intent reason, labeled, never resolved into an edge.
+// v157: the wiki is a source tree. A markdown page opting in with an
+// enola_intent: frontmatter key (namespaced so a wiki's own toolchain ignores
+// it) compiles directly into intent facts — seams and layers with an explicit
+// intent_owner (the page lives where the decision lives, not inside the repo
+// it governs), and CLAIMS: measurable statements (fact-count, seam) the
+// intent explainer verdicts every snapshot, failures proof-class. Fact
+// provenance is the page itself, so a verdict's evidence cites the decision
+// that declared the intent. The body is prose and is never parsed; an
+// invalid block fails the snapshot.
+// v158: the whole wiki compiles. An enola_intent block gains a `page:`
+// declaration — type, status, scope, affects, and typed relations to other
+// pages (depends-on, supersedes, superseded-by, part-of, relates-to) — so
+// every decision, spec and reference becomes a knowledge node with edges,
+// not just the pages that declare seams. The intent explainer verdicts
+// dangling relations at capped confidence (a missing target may be deleted
+// or merely not opted in), and a store carrying only page intent no longer
+// early-returns before claim and relation verdicts run.
+// v159: Typhoeus joins the Ruby client matchers — direct verb calls, and a
+// request-wrapper derivation for the sink-behind-a-private-method shape
+// (`Typhoeus::Request.new("#{base}#{path}", method: :get)` inside
+// `def make_request(path:, …)`, rooted path literals threaded from same-file
+// call sites; single-sink rule, literal verb required, env-var base hints the
+// provider). And `object-storage` joins the via vocabulary: a bucket-mediated
+// export/import handoff is declarable intent even though no linker measures
+// it yet.
+// v160: page declarations gain origin — a closed channel vocabulary (slack,
+// langfuse, notion, github, web, repo, other) naming WHERE the declared
+// knowledge came from, compiled onto the page node's props so receipts
+// fingerprint provenance and any explainer can key on it. An unknown channel
+// fails the snapshot with the vocabulary named.
+// v161: page declarations gain anchors — repo + repo-relative path pinning a
+// page to the code it is about, compiled as anchor intent facts and joined
+// against the measured graph (exact file or directory prefix, in both the
+// label-prefixed and repo-relative file forms). A miss is a dangling-anchor
+// finding at capped confidence only when the repo measures files of that
+// kind; an absent repo, or a file kind no measured fact carries (READMEs,
+// manifests, docs), is unasked — a 60-repo regression run showed the
+// conflation flooding wikis with false dangling findings. Scope/affects
+// stay unverdicted props by design: they speak the wiki's vocabulary, and
+// the wiki-to-cluster label mapping is the deriving toolchain's side of the
+// boundary.
+// v162: a hint must name a provider. tsBaseHint now derives nothing from a base
+// identifier carrying no URL/host suffix, and nothing at all from a token that
+// is not a bare identifier — `${base}`, `${url}`, `${getRootUrl()}` and
+// `${Cypress.env('baseUrl')}` named no provider, resolved to no loaded repo,
+// and so filed real internal blind spots as expected third-party calls: on a
+// three-repo estate 7 of 15 unresolved call sites vanished into `external` and
+// a coverage-gap finding stopped being reported. Same rule the Ruby side's
+// stripURLVarSuffix already applied, for the same reason. The single-segment
+// carve-out now reads target_hint alone rather than serviceHint, whose `api`
+// fallback is the client FILE's name: with two repos serving one short path, a
+// file named api.ts elected the repo named api, and renaming the file moved the
+// dependency.
+// v163: exported package-level Go consts and vars emit symbols. A const-only
+// file — a shared vocabulary, a sentinel-error set — was parsed yet invisible:
+// no fact carried its path, so an anchor to it verdicted dangling as "eluded
+// extraction" when the honest answer was that the extractor skipped every
+// ValueSpec by construction. Exported-only, package-level only: private
+// bindings and function-local declarations are implementation detail, and
+// emitting them would drown the symbol set.
+const cacheVersion = "v163"
 
 // extractorCache holds per-extractor facts keyed by a content hash of the files
 // the extractor depends on. It is loaded from disk at the start of a snapshot and

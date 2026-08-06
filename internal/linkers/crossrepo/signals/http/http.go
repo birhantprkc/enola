@@ -40,6 +40,7 @@ func (s *Signal) Contribute(in plugin.SignalInput, out plugin.EvidenceSink) {
 	// unmatched-client pass so verdicts stay in lockstep).
 	all := in.Facts()
 	server := m.IndexServerRoutes(all)
+	declaredTargets := soleDeclaredHTTPTargets(all)
 
 	// Match client routes against the server index.
 	for _, f := range all {
@@ -79,11 +80,20 @@ func (s *Signal) Contribute(in plugin.SignalInput, out plugin.EvidenceSink) {
 				// A single-segment path (/activate) cleared the generic vocabulary but
 				// is thinner evidence than a multi-segment one: there is less path to
 				// coincide by accident, so a hint-disambiguated pick among several
-				// candidate providers is not enough. Demand an outright unambiguous
-				// match, and otherwise drop the call site back to unresolved — where a
-				// genuinely missing link stays visible as a coverage gap rather than
-				// being resolved to the wrong service.
-				if provider != "" && routeindex.SingleSegmentPath(np) && !unambiguous {
+				// candidate providers is normally not enough. Demand an outright
+				// unambiguous match — with one carve-out: a hint whose normalized form
+				// EQUALS a provider's label exactly is not a coincidence class (the
+				// source names the host — `${config.ACME_HOST}/mcp` — and two
+				// loaded repos serving /mcp is precisely the case that hint exists
+				// for). Substring hint matches stay rejected for these paths.
+				//
+				// Only target_hint qualifies, for the same reason the external
+				// classification below says so: serviceHint falls back to the `api`
+				// prop, which is the client FILE's name. A file named api.ts would
+				// otherwise elect the repo named api out of several candidates, and
+				// renaming that file would move the dependency.
+				if provider != "" && routeindex.SingleSegmentPath(np) && !unambiguous &&
+					facts.NormalizeRepoLabel(f.PropString("target_hint")) != facts.NormalizeRepoLabel(provider) {
 					provider = ""
 				}
 				// A non-empty provider means the call site matched a loaded service (a
@@ -102,11 +112,55 @@ func (s *Signal) Contribute(in plugin.SignalInput, out plugin.EvidenceSink) {
 		}
 		// A call to a hardcoded external host (e.g. a third-party API) that matched
 		// no loaded repo is bucketed separately instead of left in unresolved —
-		// otherwise it reads as an internal blind spot it is not.
+		// otherwise it reads as an internal blind spot it is not. Externality is
+		// claimed from the URL literal naming a foreign host, and from nothing
+		// else: a target_hint that resolves to no loaded repo is as consistent
+		// with a derivation that named no provider as with a third-party call,
+		// and filing a blind spot as an expected non-match stops it being
+		// reported at all.
 		if !matched && routeindex.IsExternalClient(f) {
 			out.Coverage(f.Repo, CoverageEdgeType).External++
+			continue
+		}
+		if !matched {
+			// Attribution by declared intent: when the calling repo's declaration
+			// names exactly one http-client seam, an unmatched call is attributed
+			// to that declared target — counted in its own bucket, never as a
+			// resolved edge endpoint. The declaration is stated, the attribution
+			// is labeled, and the blind spot stops masquerading as unknown.
+			if target, ok := declaredTargets[f.Repo]; ok && target != f.Repo {
+				out.Coverage(f.Repo, CoverageEdgeType).Declared++
+			}
 		}
 	}
+}
+
+// soleDeclaredHTTPTargets maps every repo whose declaration names exactly ONE
+// http-client seam to that seam's target. Repos naming several are absent: with
+// more than one candidate the attribution would be a guess, and the whole point
+// of the bucket is that it is stated rather than inferred.
+//
+// Built once per pass, deliberately. The lookup is needed per unmatched call
+// site, and answering it by scanning every fact each time made both passes
+// O(call sites × facts) — invisible on a fixture, quadratic on an estate.
+func soleDeclaredHTTPTargets(all []facts.Fact) map[string]string {
+	targets := map[string]string{}
+	counts := map[string]int{}
+	for _, f := range all {
+		if f.Kind != facts.KindIntent || f.Repo == "" ||
+			f.PropString("intent_kind") != "consumes" ||
+			f.PropString("via") != facts.ViaHTTPClient {
+			continue
+		}
+		counts[f.Repo]++
+		targets[f.Repo] = f.PropString("target")
+	}
+	for repo, n := range counts {
+		if n != 1 {
+			delete(targets, repo)
+		}
+	}
+	return targets
 }
 
 // pickProvider resolves which provider repo a client route points at, and
@@ -162,12 +216,12 @@ func pickProvider(client facts.Fact, matches []routeindex.RouteRef) (string, boo
 // HTTP-client extractor existed: nothing tied this reader to those writers.
 func httpVia(client facts.Fact) string {
 	if client.PropString(facts.PropFramework) == facts.FrameworkGRPC {
-		return "grpc"
+		return facts.ViaGRPC
 	}
 	if facts.HandWrittenClientSources[client.PropString(facts.PropSource)] {
-		return "http-client"
+		return facts.ViaHTTPClient
 	}
-	return "http"
+	return facts.ViaHTTP
 }
 
 // matchConfidence classifies how trustworthy an HTTP route match is. It is
@@ -293,7 +347,11 @@ func UnmatchedServerRouteKeys(m *routeindex.Matcher, all []facts.Fact) map[strin
 // name them rather than restating the literals, so the value set cannot be described
 // in two files and silently drift. Changing a value here changes emitted facts.
 const (
-	ReasonNoMethod       = "no_method"       // the call site carried no usable HTTP verb
+	ReasonNoMethod = "no_method" // the call site carried no usable HTTP verb
+	// ReasonDeclaredTarget marks a call that matched no server route but whose
+	// repo declares exactly one http-client seam: attributed there by intent,
+	// labeled as such, never resolved into an edge.
+	ReasonDeclaredTarget = "attributed_by_intent"
 	ReasonGenericPath    = "generic_path"    // a sub-2-segment path the matcher deliberately skips
 	ReasonMethodMismatch = "method_mismatch" // a server route serves this path suffix, but not this verb
 	ReasonPathUnknown    = "path_unknown"    // no server route shares a >=2-segment suffix with this path
@@ -314,6 +372,7 @@ func UnmatchedClientRouteKeys(m *routeindex.Matcher, all []facts.Fact) map[strin
 	}
 	server := m.IndexServerRoutes(all)
 	serverSuffixes := m.IndexServerPathSuffixes(all)
+	declaredTargets := soleDeclaredHTTPTargets(all)
 	unmatched := map[string]string{}
 	for _, f := range all {
 		if f.Kind != facts.KindRoute || f.Repo == "" || routeindex.RoleOf(f) != facts.RoleClient {
@@ -321,6 +380,10 @@ func UnmatchedClientRouteKeys(m *routeindex.Matcher, all []facts.Fact) map[strin
 		}
 		if routeindex.IsExternalClient(f) {
 			continue // a hardcoded external host is an expected non-match, not a blind spot
+		}
+		if f.PropString(facts.PropRouteType) == facts.RouteTypeGraphQL {
+			continue // GraphQL operations are the graphql signal's domain; an HTTP
+			// verb-and-path reason stamped on one is noise, not triage
 		}
 		id := routeindex.RouteIdentity(f)
 		method := routeindex.NormalizeMethod(f.PropString("method"))
@@ -336,6 +399,12 @@ func UnmatchedClientRouteKeys(m *routeindex.Matcher, all []facts.Fact) map[strin
 		cp := routeindex.CanonicalLeadingSlash(np)
 		matches, _ := m.LookupClientMatches(server, cp, method)
 		if provider, _ := pickProvider(f, matches); provider == "" {
+			// No hinted-external skip here either: mirrored from linkHTTP, an
+			// unresolvable hint is not evidence that the call leaves the estate.
+			if target, ok := declaredTargets[f.Repo]; ok && target != f.Repo {
+				unmatched[id] = ReasonDeclaredTarget
+				continue
+			}
 			// Distinguish "a server serves this path but not this verb" from "no
 			// server serves this path at all", so the residual is self-triaging.
 			if m.ClientPathHasServer(serverSuffixes, cp) {
