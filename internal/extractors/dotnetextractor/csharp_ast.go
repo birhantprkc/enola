@@ -1,4 +1,4 @@
-package csharpextractor
+package dotnetextractor
 
 import (
 	"log"
@@ -43,7 +43,7 @@ func extractFileASTFull(src []byte, relFile string) ([]facts.Fact, aspnetScaffol
 		// accept, and the symptom — every C# file parsing to nothing — is
 		// otherwise indistinguishable from a repository with no C# in it.
 		grammarErrOnce.Do(func() {
-			log.Printf("[csharp-extractor] tree-sitter grammar unusable, no C# will be extracted: %v", err)
+			log.Printf("[dotnet-extractor] tree-sitter grammar unusable, no C# will be extracted: %v", err)
 		})
 		return nil, aspnetScaffold{}
 	}
@@ -63,6 +63,10 @@ func extractFileASTFull(src []byte, relFile string) ([]facts.Fact, aspnetScaffol
 	root := tree.RootNode()
 	w.walkTopLevelChildren(root)
 	w.scaffold.minimal = collectMinimalAPIRoutes(root, src, relFile, w.dir)
+	// APPEND: noteRefit already added this file's Refit declarations during the
+	// walk above, and assigning here would discard them.
+	w.scaffold.clients = append(w.scaffold.clients, collectHTTPClientCalls(root, src, relFile, w.dir)...)
+	w.scaffold.conventional, w.scaffold.conventionalSkipped = collectConventionalRoutes(root, src, relFile, w.dir)
 	return w.out, w.scaffold
 }
 
@@ -412,6 +416,7 @@ func (w *astWalker) handleTypeDecl(node *sitter.Node, kind string) {
 	// usually in another file.
 	if kind == facts.SymbolClass {
 		w.noteController(node, f.Name, name)
+		w.noteStorage(nodeText(node, w.src), f.Name, w.baseTypes(node), int(node.StartPosition().Row)+1)
 	}
 
 	body := node.ChildByFieldName("body")
@@ -623,6 +628,9 @@ func (w *astWalker) handleMethod(node *sitter.Node) {
 
 	if node.Kind() == "method_declaration" && len(w.typeStack) > 0 {
 		w.noteAction(node, w.canonicalName(w.enclosingType()), w.out[idx].Name, name)
+		// A Refit attribute on an interface method declares an OUTBOUND request the
+		// same way [HttpGet] declares an inbound one.
+		w.noteRefit(node, int(node.StartPosition().Row)+1)
 	}
 
 	// A constructor is where dependency injection lands in C#. Injecting from
@@ -985,6 +993,9 @@ func (w *astWalker) walkForCalls(node *sitter.Node) {
 		}
 	case "invocation_expression":
 		w.handleInvocation(node)
+		// A container registration is the only place a DI-wired implementation is
+		// named, so without this it has no inbound edge and reads as dead.
+		w.noteDIRegistration(node)
 		if w.metrics != nil {
 			if lam := iteratorLambda(node, w.src); lam != nil {
 				bounded := iteratorReceiverBounded(node, w.src)

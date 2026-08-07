@@ -1238,7 +1238,85 @@ import (
 // DTO, constant and attribute packages told to extract interfaces. Constructors
 // are not behaviour (a record has one too) and nested types are not counted, so a
 // class holding a nested handler stays a data holder.
-const cacheVersion = "v171"
+// v172: MSBuild project files are PARSED rather than read by path. A
+// ProjectReference becomes a module depends_on edge, so .NET's dependency unit —
+// the assembly — is finally in the graph; before this, cycles and package_metrics
+// judged .NET at directory granularity while MSBuild judged it at assembly
+// granularity. PackageReference becomes a nuget dependency fact, and
+// AssemblyName/TargetFramework/OutputType/IsTestProject/solution become module
+// props. Project files of EVERY .NET language are read (.fsproj, .vbproj), which
+// is what stops a claimed repository from being an empty one: Giraffe ships a
+// .slnx and no .cs, so the extractor matched, claimed it and emitted zero facts.
+// v173: Razor is read. A .razor component becomes a partial symbol that merges
+// with its .razor.cs code-behind, carrying the markup's references — @onclick
+// handlers, @bind targets, @if conditions, component tags, @inject types — so a
+// member whose only caller is markup stops reading as dead. MudBlazor reported
+// 5,749 orphans of 9,287 symbols before this. A .cshtml view emits a KindFileRef
+// instead of a symbol, and ASP.NET tag helpers (asp-for="Prop") are read as
+// references, which is how MVC views bind view-model members with no @ transition
+// at all. @page becomes a UI route (type=page), never a server route.
+// v174: XAML is read. An x:Class document becomes a partial symbol that merges
+// with its .xaml.cs code-behind, carrying event handlers (Click="OnSave"), bound
+// members ({Binding Path=Title}, {x:Bind}), converters and clr-namespace control
+// tags — so a dependency property or view-model member whose only use is a
+// binding stops reading as dead. Files reported 4,819 orphans, 15.9% of them
+// XAML-only. A document with no x:Class emits a file_ref instead of inventing a
+// class. Covers WPF, WinUI/UWP, MAUI and Avalonia (.axaml).
+// v175: VB.NET is read, into the SAME fact set as C# so a VB class referencing a
+// C# type resolves through one shared type index. Line-oriented: VB terminates
+// every construct explicitly and has no maintained tree-sitter grammar. Types,
+// members, Imports, Inherits/Implements, Handles clauses and complexity metrics.
+// roslyn's VB compiler is 3,652 files and 6,644 of its C# orphans had callers
+// only there. Also fixes a CASE-SENSITIVITY hole in the .NET test globs: .NET
+// names those directories Test/ and Tests/, which the lowercase-only patterns
+// never matched, so roslyn's 4,734 test files were indexed as production code.
+// v176: F# is read — modules, types, members and module-level FREE FUNCTIONS,
+// which no other .NET language has. dotnet/fsharp parsed 111 files of 10,519
+// before this. Indentation-scoped: F# closes a scope by dedenting.
+//
+// Two fixes it forced. Free functions now enter the bare-call index alongside
+// methods, without which every F#-to-F# call was dropped. And a module's
+// `language` prop is now the dominant language of the files in it rather than a
+// hardcoded "csharp" — the layers explainer gates on that prop, and a directory
+// of .vb or .fs sources was claiming to be C#.
+// v177: persistence. `storage` was ZERO in all fourteen .NET repos of the corpus,
+// bitwarden-server and eShop included, both EF Core products. A DbContext becomes
+// a storage fact; the types its DbSet<T> and IEntityTypeConfiguration<T> name
+// become entities, with the physical table from ToTable("…"); Dapper's generic
+// query methods and IMongoCollection<T> name their row types; a Migration
+// subclass is recorded as one.
+//
+// EF Core entities carry NO ANNOTATION — Java can look for @Entity, a C# entity
+// is a plain class — so an entity is named for the SYMBOL that declares it, after
+// resolution, rather than for the directory that mentioned it.
+// v178: outbound HTTP. role=client routes are emitted for HttpClient verb calls
+// and Refit attributes, so a C# service is finally BOTH sides of a cross-repo
+// edge rather than a route provider only.
+//
+// The path is rarely a literal at the call site — eShop holds a base URL in a
+// field, builds the path by interpolation into a local, and passes the local — so
+// a literal environment is resolved per member body, with type-level fields as
+// the fallback. An interpolation hole becomes a path parameter rather than being
+// dropped, which is what makes a client's items/{id} match a server template of
+// the same shape. An absolute URL keeps only its path: under Aspire the host is a
+// service NAME, not a hostname.
+// v179: conventional MVC routing. A MapControllerRoute / MapAreaControllerRoute
+// registration is READ, and its template — routinely a const field — resolved
+// through the same literal environment the client scan builds, with areaName and
+// the controller/action defaults substituted in. OrchardCore declares 288 verb
+// attributes across 114 controllers and only 7 carry a [Route].
+//
+// A template still containing {controller}/{action}/{area} after substitution is
+// NOT emitted: expanding it needs each controller's area, and a route at a literal
+// /{area}/… would be a URL the application never serves. The count left generic is
+// logged rather than silently absorbed.
+// v180: DI registrations are references. A .NET app calls almost everything
+// through an interface, and the only place the implementation is named is
+// `services.AddScoped<IFoo, Foo>()` in a startup file — so without reading those,
+// Foo has no inbound edge and reads as dead. 441 of bitwarden-server's 1,661
+// orphan classes (27%) and 59 of eShop's 202 were named in a registration and
+// nowhere else. A fix to the graph rather than to a confidence heuristic.
+const cacheVersion = "v180"
 
 // extractorCache holds per-extractor facts keyed by a content hash of the files
 // the extractor depends on. It is loaded from disk at the start of a snapshot and

@@ -1,4 +1,4 @@
-package csharpextractor
+package dotnetextractor
 
 import (
 	"log"
@@ -31,6 +31,18 @@ type aspnetScaffold struct {
 	// do need the merged symbol set to bind a handler, so they are carried here
 	// and materialised alongside the controller routes.
 	minimal []minimalRoute
+	// storage holds persistence evidence, decided after the walk for the same
+	// reason routing is: whether a class is a DbContext depends on a base list
+	// naming a type declared in another file.
+	storage storageScaffold
+	// clients holds resolved OUTBOUND requests: HttpClient verb calls and Refit
+	// attributes. They need no cross-file composition, only the file-local literal
+	// environment the scan already built.
+	clients []clientCall
+	// conventional holds MVC route registrations, and the count of those that were
+	// registrations but could not be resolved — kept so the gap stays visible.
+	conventional        []conventionalRoute
+	conventionalSkipped int
 }
 
 func (s *aspnetScaffold) empty() bool {
@@ -41,6 +53,10 @@ func (s *aspnetScaffold) merge(o aspnetScaffold) {
 	s.controllers = append(s.controllers, o.controllers...)
 	s.actions = append(s.actions, o.actions...)
 	s.minimal = append(s.minimal, o.minimal...)
+	s.storage.merge(o.storage)
+	s.clients = append(s.clients, o.clients...)
+	s.conventional = append(s.conventional, o.conventional...)
+	s.conventionalSkipped += o.conventionalSkipped
 }
 
 // controllerDecl is a type that may serve routes: it carries a [Route] template, an
@@ -350,7 +366,7 @@ func composeControllerRoutes(allFacts []facts.Fact, sc aspnetScaffold) []facts.F
 		}
 	}
 	if unrouted > 0 {
-		log.Printf("[csharp-extractor] %d controller action(s) use conventional routing; "+
+		log.Printf("[dotnet-extractor] %d controller action(s) use conventional routing; "+
 			"their paths come from Program.cs and were not extracted", unrouted)
 	}
 	return out

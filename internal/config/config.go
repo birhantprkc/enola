@@ -275,9 +275,53 @@ func Default() *Config {
 			// solution layout puts a test project in `MyApp.Tests/` BESIDE `MyApp/`
 			// rather than under a `tests/` directory, and 303 files in the corpus
 			// are reachable only that way.
+			// BOTH casings. Glob matching is case-sensitive and .NET names these
+			// directories in PascalCase: dotnet/roslyn puts 784 files under Test/ and
+			// 73 under Tests/, none of which the lowercase patterns match. They were
+			// being indexed as production code.
 			"**/tests/**/*.cs",
 			"**/test/**/*.cs",
+			"**/Tests/**/*.cs",
+			"**/Test/**/*.cs",
 			"**/*.Tests/**/*.cs",
+			// Razor markup in the same test trees. A test project's .razor/.cshtml
+			// reference production members exactly as a test .cs does, so indexing
+			// them would vouch for symbols no production code uses — the same
+			// suppression of genuine dead-code findings the .cs rules avoid.
+			// VB.NET test trees, for the same reason as the .cs rules above. Roslyn's
+			// analyzer tests are themselves .vb files that embed VB source as XML
+			// literals, so indexing them contributes thousands of fixture types
+			// (`Class C`, `Interface I`, `Enum E`) that no production code declares.
+			"**/tests/**/*.fs",
+			"**/test/**/*.fs",
+			"**/Tests/**/*.fs",
+			"**/Test/**/*.fs",
+			"**/*.Tests/**/*.fs",
+			"**/tests/**/*.vb",
+			"**/test/**/*.vb",
+			"**/Tests/**/*.vb",
+			"**/Test/**/*.vb",
+			"**/*.Tests/**/*.vb",
+			"**/tests/**/*.razor",
+			"**/test/**/*.razor",
+			"**/Tests/**/*.razor",
+			"**/Test/**/*.razor",
+			"**/*.Tests/**/*.razor",
+			"**/tests/**/*.cshtml",
+			"**/test/**/*.cshtml",
+			"**/Tests/**/*.cshtml",
+			"**/Test/**/*.cshtml",
+			"**/*.Tests/**/*.cshtml",
+			"**/tests/**/*.xaml",
+			"**/test/**/*.xaml",
+			"**/Tests/**/*.xaml",
+			"**/Test/**/*.xaml",
+			"**/*.Tests/**/*.xaml",
+			"**/tests/**/*.axaml",
+			"**/test/**/*.axaml",
+			"**/Tests/**/*.axaml",
+			"**/Test/**/*.axaml",
+			"**/*.Tests/**/*.axaml",
 			// enola's own output. This is the DEFAULT location only; the glob for the
 			// configured one is derived in Normalize, which is what makes a custom
 			// output.dir safe. The literal stays because a repository that used the
@@ -371,9 +415,15 @@ func Default() *Config {
 			// reads as dead — the same trade Python already makes, and the right
 			// way round: a missing edge is visible in a dead-code review, while the
 			// 31 phantom endpoints csharp-sdk reported before this change were not.
-			"**/tests/**/*.cs", "**/test/**/*.cs", "**/*.Tests/**/*.cs",
+			"**/tests/**/*.cs", "**/test/**/*.cs", "**/Tests/**/*.cs", "**/Test/**/*.cs", "**/*.Tests/**/*.cs",
+			"**/tests/**/*.fs", "**/test/**/*.fs", "**/Tests/**/*.fs", "**/Test/**/*.fs", "**/*.Tests/**/*.fs",
+			"**/tests/**/*.vb", "**/test/**/*.vb", "**/Tests/**/*.vb", "**/Test/**/*.vb", "**/*.Tests/**/*.vb",
+			"**/tests/**/*.razor", "**/test/**/*.razor", "**/Tests/**/*.razor", "**/Test/**/*.razor", "**/*.Tests/**/*.razor",
+			"**/tests/**/*.cshtml", "**/test/**/*.cshtml", "**/Tests/**/*.cshtml", "**/Test/**/*.cshtml", "**/*.Tests/**/*.cshtml",
+			"**/tests/**/*.xaml", "**/test/**/*.xaml", "**/Tests/**/*.xaml", "**/Test/**/*.xaml", "**/*.Tests/**/*.xaml",
+			"**/tests/**/*.axaml", "**/test/**/*.axaml", "**/Tests/**/*.axaml", "**/Test/**/*.axaml", "**/*.Tests/**/*.axaml",
 		},
-		Extractors: []string{"cpp", "csharp", "go", "grpc", "java", "kotlin", "openapi", "php", "python", "typescript", "swift", "ruby", "rust", "hcl", "ansible", "mdintent"},
+		Extractors: []string{"cpp", "dotnet", "go", "grpc", "java", "kotlin", "openapi", "php", "python", "typescript", "swift", "ruby", "rust", "hcl", "ansible", "mdintent"},
 		Explainers: []string{"cycles", "layers", "crossrepo", "coverage", "unused-routes", "god-class", "hotspots", "dependency-depth", "exported-surface", "complexity-outliers", "intent"},
 		Renderers:  []string{"llm_context"},
 		Output: OutputConfig{
@@ -552,8 +602,27 @@ func (c *Config) RepoPaths() ([]string, error) {
 }
 
 // IsExtractorEnabled returns true if the named extractor is enabled.
+// extractorAliases maps an extractor's current name to names it also answers to.
+//
+// `csharp` became `dotnet` when the extractor grew past C# into VB.NET, F#, Razor
+// and XAML. The alias is not politeness: an `extractors:` list REPLACES the
+// built-in default rather than merging with it, so a config written under the old
+// name would silently disable .NET extraction entirely and report zero facts with
+// no error — the exact failure this file's own comments warn about.
+var extractorAliases = map[string][]string{
+	"dotnet": {"csharp"},
+}
+
 func (c *Config) IsExtractorEnabled(name string) bool {
-	return contains(c.Extractors, name)
+	if contains(c.Extractors, name) {
+		return true
+	}
+	for _, alias := range extractorAliases[name] {
+		if contains(c.Extractors, alias) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsExplainerEnabled returns true if the named explainer is enabled.
