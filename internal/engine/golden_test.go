@@ -92,6 +92,22 @@ var fixtures = []fixture{
 	{name: "rust_sample", subRepos: []string{"."}},
 	{name: "java_sample", subRepos: []string{"."}},
 	{name: "cpp_sample", subRepos: []string{"."}},
+	// C#: both namespace spellings, a positional record, an interface whose
+	// members carry no modifier, constructor injection through a `using` alias,
+	// and a partial type split across two files. Pins v164's three C#-specific
+	// decisions: the two Widget halves fold into ONE symbol carrying the union of
+	// their edges, private state produces no symbol while public properties do,
+	// and a `.g.cs` file yields nothing at all — the absence of a
+	// src/Acme.Api/Generated module is what proves it was skipped rather than
+	// merely emptied.
+	{name: "csharp_sample", subRepos: []string{"."}},
+	// ASP.NET Core attribute routing. Pins v165: a controller inherits its
+	// [Route("[controller]")] from a base class in ANOTHER file and resolves the
+	// token to its own name, a named argument stays out of the path, a leading "/"
+	// makes a template absolute, and — by their ABSENCE from the golden —
+	// AccountController's conventionally-routed actions mint no route at all
+	// rather than collapsing onto "/".
+	{name: "csharp_aspnet_sample", subRepos: []string{"."}},
 	{name: "php_sample", subRepos: []string{"."}},
 	{name: "php_laravel_sample", subRepos: []string{"."}},
 	{name: "php_symfony_sample", subRepos: []string{"."}},

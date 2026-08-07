@@ -1143,7 +1143,102 @@ import (
 // ValueSpec by construction. Exported-only, package-level only: private
 // bindings and function-local declarations are implementation detail, and
 // emitting them would drown the symbol set.
-const cacheVersion = "v163"
+// v164: C# is extracted. Types (class/interface/struct/record/enum/delegate),
+// their members, `using` directives, base lists, constructor and primary-
+// constructor injection, same-type call resolution and the standard complexity /
+// io_direct metrics. Three decisions are C#-specific and load-bearing: a
+// `partial` type declared across several files merges into ONE symbol rather
+// than one per half (7,740 files in the benchmark corpus declare one, so left
+// alone it inflates every symbol count and scatters a type's edges); only public
+// and protected fields and properties become symbols, since a BCL-scale
+// repository's private state would otherwise dominate the fact set; and a bare
+// type reference resolves against a project-wide index rather than the file's
+// imports, because C# `using` opens a NAMESPACE and so names no type in
+// particular — an ambiguous simple name resolves to nothing rather than to a
+// guess.
+// v165: ASP.NET Core attribute routing. A class-level [Route] composes with a
+// method-level [HttpGet("…")] into one route per verb, bound to its action by a
+// handled_by edge. Two rules carry it. The template is frequently INHERITED — 40
+// of jellyfin's 64 controllers declare no [Route] and take [Route("[controller]")]
+// from a shared base in another file — so composition runs after the whole fact
+// set exists and walks the resolved inheritance edges, resolving [controller] to
+// each subclass's own name. And a controller with no [Route] anywhere in its
+// hierarchy emits NOTHING: that is conventional routing, whose template lives in
+// Program.cs, and composing from what is visible gave every action the path "/" —
+// wrong, and (facts being name-keyed) collapsing a controller's actions onto one
+// root node. Measured on jellyfin: 422 routes, exactly one per verb attribute in
+// the source, all 388 distinct handlers resolving to real symbols.
+// v166: ASP.NET Core minimal APIs. `var api = app.MapGroup("api/orders")` binds a
+// prefix to a local variable and `api.MapPut("/cancel", H)` composes against it,
+// including nested groups and a fluent call after MapGroup; the handler binds when
+// it is a method group, and a lambda carries none rather than a fabricated one.
+// Scoped to one body, like the Go extractor's intra-function subrouter
+// composition. Two rules keep it honest: a string-literal first argument is the
+// discriminator, so MapControllers/MapRazorPages/MapHub — which take no path — are
+// excluded structurally rather than by a name list; and a group whose prefix is
+// NOT a literal (the MCP C# SDK mounts its whole surface at a caller-supplied
+// `pattern`) marks its routes unresolvable and emits nothing, since publishing the
+// registration path alone would claim endpoints the library does not serve and
+// collapse the `MapPost("")` ones onto "/". Measured: eShop 0 -> 30 routes with
+// composed prefixes; the SDK's caller-mounted file contributes 0.
+// v167: CSharpExtractor implements plugin.TestRefExtractor. Excluding test
+// projects (v166's globs) left a production symbol whose only caller is a test
+// with no inbound edge at all, reading as dead; this restores that one signal
+// without putting test code back in the graph — one KindTestRef fact per test
+// file, carrying RelCalls to the production names it touches and no symbols, so a
+// test class still never becomes a dead-code candidate. Targets are emitted AS
+// WRITTEN (`OrderService.Find`, `Find`) rather than resolved, because the
+// production symbol index lives inside Extract and the orphan detector matches
+// both the full target and its last segment — the same shape Ruby emits. A
+// framework receiver (Assert, Mock, It, …) disqualifies the bare method name as
+// well as the qualified one: filtering only `Assert.Equal` let `Equal` through,
+// and production code really does declare Equal, so the harness would have vouched
+// for a symbol no test exercises. Measured on jellyfin: 210 test-ref facts, 2,826
+// distinct targets, 70% matching a production symbol.
+// v168: a C# call on an untracked receiver emits a bare method-name edge. The
+// call graph was same-type-and-static only, and a DI-wired .NET application calls
+// almost everything through an interface — so a method reached that way had no
+// inbound edge at all and read as dead. On jellyfin that was 2,478 of 6,975
+// methods; it is now 988, and both halves of every implicit interface
+// implementation (the interface member AND the class method serving it) are
+// rescued. The name is kept BARE rather than bound even when exactly one type
+// declares it: jellyfin has one `Match` method, FileStackRule.Match, while four of
+// its five variable-receiver `.Match(` call sites are Regex — binding on
+// uniqueness would have pointed them into the video-stack parser, and a wrong edge
+// feeds impact_analysis and find_path. Nothing is lost, because the dead-code
+// detector matches by short name: measured identical rescue with and without
+// binding. A name no type in the repo declares is dropped, which is the majority
+// (.ToString(), .Add(), .GetAwaiter()).
+// v169: a qualified `Type.Member` reference emits edges to both the member and
+// the declaring type, and a member access that is not a call (an enum member read,
+// a static field, a constant) emits one at all. Previously only invocations did,
+// so `VideoRange.HDR` produced nothing and 84 of jellyfin's 137 enums read as
+// isolated while it appeared at 25 call sites. The member edge alone is not
+// enough either — the dead-code detector matches by last segment, so it vouches
+// for HDR and says nothing about VideoRange, which also left every class reached
+// only through static calls unreferenced. The TYPE edge is added in
+// resolveCSharpTargets once the receiver has provably resolved, not at the call
+// site: a bare type name emitted there is indistinguishable from the bare method
+// name a member call produces, and `foo.Order()` would bind to a class named
+// Order. Receivers are gated on PascalCase, C#'s type-naming convention. On
+// jellyfin: enums 105 -> 8 unreferenced, constants 802 -> 179, classes 848 -> 729.
+// v170: a loop's iterable is walked in the ENCLOSING scope, not inside the loop.
+// `foreach (x in items.Where(p))` enumerates once — the lambda runs per element of
+// `items`, the same n the loop runs, not n per iteration — so walking it inside
+// reported O(n²) for O(n) work on the most common C# iteration idiom. A `for`
+// initializer runs once for the same reason; its condition and update genuinely
+// repeat and stay inside. On jellyfin this moved 26 methods from scaling depth 2
+// to 1 and 3 from 3 to 2, and dropped 21 spurious N+1 candidates.
+// v171: a C# class that declares state and no behaviour carries data_holder. The
+// package-metrics explainer spares "data holder" packages its rigid — extract
+// interfaces advice, but recognised only a dedicated construct (Kotlin data class,
+// Java/C# record). C# almost never uses one: jellyfin declares 1,552 classes and
+// 13 records, while 278 of those classes are property-only carriers — so the
+// exemption saw nothing and 12 of that repo's 37 package-metrics findings were
+// DTO, constant and attribute packages told to extract interfaces. Constructors
+// are not behaviour (a record has one too) and nested types are not counted, so a
+// class holding a nested handler stays a data holder.
+const cacheVersion = "v171"
 
 // extractorCache holds per-extractor facts keyed by a content hash of the files
 // the extractor depends on. It is loaded from disk at the start of a snapshot and

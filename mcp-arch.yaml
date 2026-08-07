@@ -71,6 +71,20 @@ ignore:
   - ".svelte-kit/**"
   # Rust / Maven / Gradle build output, at any depth.
   - "**/target/**"
+  # .NET build output, at any depth (one obj/bin pair per project). obj/ holds
+  # generated C# — GlobalUsings.g.cs, AssemblyInfo.cs, source-generator output —
+  # and is not a source convention elsewhere. bin/ IS one (bin/cli.js), so only
+  # .NET's own configuration subdirectories are excluded.
+  - "**/obj/**"
+  - "**/bin/Debug/**"
+  - "**/bin/Release/**"
+  # C# tests. Directory-scoped and deliberately WITHOUT a filename pattern:
+  # `**/*Test.cs` would delete XmlQualifiedNameTest, a real XPath node-test type.
+  # `*.Tests/` is not redundant — a .NET test project usually sits beside its app
+  # rather than under a tests/ directory.
+  - "**/tests/**/*.cs"
+  - "**/test/**/*.cs"
+  - "**/*.Tests/**/*.cs"
   # Minified / bundled JS (also detected heuristically by the extractor; kept in
   # sync with config.Default() in internal/config/config.go)
   - "**/*.min.js"
