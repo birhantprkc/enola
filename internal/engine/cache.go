@@ -1432,7 +1432,80 @@ import (
 // untrue — the same over-claim the prop already prevents for C# and Rust. A
 // single-module repository returns "." rather than "", because callers read "" as
 // unattributed and that is the case where attribution matters most.
-const cacheVersion = "v189"
+//
+// v190: Dart and Flutter. Symbols, imports, call edges, complexity metrics and the
+// io_direct/performs_io closure, plus four framework surfaces — Flutter widget roles,
+// navigation routes, outbound HTTP call sites, and local/remote stores. Two decisions
+// carry most of the weight. Every framework pass is gated on the FILE'S OWN IMPORTS,
+// which Dart makes a language guarantee rather than a heuristic: imports are mandatory
+// and there is no ambient namespace, so a file that has not imported go_router cannot
+// be calling it — this is what makes it safe to match on names as short as `go`, `get`
+// and `collection`, the trap that produced phantom Scala routes and topics. And
+// navigation routes carry type "page", so routeindex.IsUIRoute keeps a Flutter screen
+// out of the cross-repo server-route index and out of unused-routes: an app's
+// `/users/:id` screen is not an endpoint anything can call, and indexing it beside its
+// own backend's real `/users/:id` would manufacture an edge in the wrong direction.
+// Module facts carry pub_package (registered in facts.CompilationUnitProps) because
+// Dart permits circular imports between libraries outright — legal, compiling, and
+// common — so a Dart cycle is a coupling signal and never a build-order defect.
+// Generated Dart (.g.dart, .freezed.dart, .mocks.dart, .pb*.dart) produces nothing:
+// it is the majority of files in a build_runner project and none of it is navigated.
+// v191: gin routes in the Go extractor. Registrations (`r.GET`, the generic
+// `r.Handle("GET", …)`, `Any`), `Group("/prefix")` mounts composed onto them, and
+// `func(*gin.Context)` tagged http_handler so a route binds to the method serving it.
+// Two decisions are measured rather than assumed. The group prefix is JOINED, not
+// concatenated: gin spells a no-prefix group `Group("/")` and real code leans on it —
+// ente's server opens seven — so concatenating turns every route beneath one into
+// "//ping", a path nothing serves and no client route matches. And `Group` is
+// recognised by its argument being a STRING LITERAL rather than by naming the
+// framework, because chi declares a `Group` too with an entirely different meaning
+// (`r.Group(func(r chi.Router){…})` takes a function and mounts nothing) — the shape
+// discriminates them structurally. Verified on ente's server: 359 registrations
+// outside test files, 359 routes extracted, no doubled separators, and its Flutter
+// client goes from 167 unresolved call sites to 167 resolved.
+// v192: the Dart package index is read from disk instead of from the engine's file
+// list. `**/*.yaml` is in the default ignore globs, so a pubspec.yaml never reaches an
+// extractor — 0 of appflowy's 4,114 walked files — and the index was therefore always
+// EMPTY, silently and in three places at once: modules carried no pub_package (so every
+// legal Dart cycle was reported as something that "can cause initialization issues"),
+// the repo's own `package:` imports classified as external rather than internal (10,125
+// internal edges missing on appflowy alone), and Flutter was never detected from the
+// manifest. Same deliberate bypass the OpenAPI extractor and PHP's Symfony route config
+// already make, for the reason the glob rule states: the globs suppress config and data
+// noise, and a pubspec is the definition of the compilation unit.
+//
+// v192 also carries three corrections the corpus exposed and the fixtures could not,
+// all of them guessed node kinds that silently matched nothing:
+//   - cyclomatic complexity counted NO logical operators, because Dart models `&&` as
+//     its own node kind rather than as a generic binary expression. Counted on the
+//     OPERATOR node, which is exact — counting occurrences in the enclosing
+//     expression's text would recount them at every nested level.
+//   - the constant-trip loop discount never applied, so a literal-bounded
+//     `for (var i = 0; i < 10; i++)` inflated scaling depth and turned an honest O(n)
+//     into a fabricated O(n2). A C-style for and a for-in are the same node kind here
+//     and are told apart by whether for_loop_parts holds a relational_expression.
+//   - a bare call resolved to ANY unique short name, including a constant. immich
+//     declares the enum constant LogLevel.severe and separately calls log.severe(...),
+//     so 117 call sites bound to the constant and god-class reported it as a
+//     high-fan-in symbol with 117 dependents. Calls now resolve only to callables.
+//
+// v193: four corrections the enterprise tools exposed on the Dart corpus, none of
+// which the OSS explainers could see.
+//   - recursion required only a matching short NAME, so `dispose()` calling
+//     `controller.dispose()` counted as recursing. 64 false findings on one app, 63 of
+//     the analyzer's 75. Now the receiver must be absent, `this`, or the bare name.
+//   - calls inside a closure BODY were dropped entirely: the invocation is a direct
+//     child sequence of the closure node, which the walk descended past without
+//     scanning. Arrow closures are pervasive in Flutter, so functions plainly in use
+//     were reported dead.
+//   - dependency facts are named `<importer> -> <imported>`, the shared convention the
+//     package-metrics explainer splits on. Naming only the target made every Dart edge
+//     unrecoverable there: Ce was 0 for every package and average instability 0.00.
+//   - symbols now carry a leading `declares` edge to their module, which is how that
+//     explainer attributes a symbol to a package. A Dart class also declares its
+//     members, so the first member name was being read as a package — 1,746 phantom
+//     packages on drift against 199 real modules, the .NET failure in Dart's clothing.
+const cacheVersion = "v193"
 
 // extractorCache holds per-extractor facts keyed by a content hash of the files
 // the extractor depends on. It is loaded from disk at the start of a snapshot and
