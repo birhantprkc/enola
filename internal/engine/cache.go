@@ -1316,7 +1316,123 @@ import (
 // Foo has no inbound edge and reads as dead. 441 of bitwarden-server's 1,661
 // orphan classes (27%) and 59 of eShop's 202 were named in a registration and
 // nowhere else. A fix to the graph rather than to a confidence heuristic.
-const cacheVersion = "v180"
+//
+// v181: Scala. A fourth JVM language, and the first whose extractor must assume it
+// does NOT own the repository: apache/spark holds 1,355 .java beside 6,275 .scala
+// and apache/pekko 582, in the same packages, so jvmsrc's package index now reads
+// .scala too and the Java/Kotlin extractors invalidate on it. Symbols, extends/with
+// as implements, `new` as instantiates, and imports; call edges and complexity
+// metrics are not in this version. Two decisions are load-bearing and measured
+// rather than assumed. The grammar is pinned to tree-sitter-scala v0.24.1 — the
+// newest ABI-14 release, since v0.25.0+ are ABI 15 and the vendored runtime rejects
+// them SILENTLY, the C# failure mode. And the test globs are scoped to the sbt
+// source set (`src/test`, two segments) rather than to a directory named `test`,
+// because a one-segment glob deletes 183 production files across the benchmark
+// corpus, 175 of them zio's own test library whose package is `zio.test`; the
+// shared path matcher gained multi-segment directory prefixes for it.
+//
+// v182: Scala call graph, complexity metrics and the I/O closure. The load-bearing
+// decision is what counts as a LOOP, because Scala spells iteration and effect
+// sequencing the same way: `for (u <- users) yield load(u)` runs load once per user,
+// `for (a <- fetchA; b <- fetchB(a)) yield b` runs fetchB exactly once, and the two
+// are the same construct. Counting the second as a loop puts a per-iteration-I/O
+// finding on every effectful method in the language. Measured over the corpus (8,119
+// production files) rather than assumed: `for … yield` is 60.4% effect-typed and
+// `for` without yield only 9.7%, so the `yield` keyword is the discriminator; the
+// same split puts flatMap/fold (~49% effect) on the discounted side and
+// foreach/map/filter/foldLeft on the scaling side. Ambiguous constructs raise
+// loop_depth but not scaling_loop_depth, the discount Go and C# already use for
+// constant-trip loops, so a finding is downgraded rather than fabricated or lost.
+// Call resolution binds a receiver whose type the SOURCE declares (constructor and
+// method parameters), which is what lets performs_io cross the constructor-injection
+// boundary every Scala service is built on; an inferred or chained receiver stays a
+// bare short name rather than a guessed one. Also classifies sbt's `project/` and
+// Gradle's `buildSrc/` as tooling: both are build DEFINITIONS compiled as ordinary
+// source, so every JVM extractor read them as production packages.
+//
+// v183: Scala routes, storage and outbound clients. Play's conf/routes (and its
+// included *.routes) is read directly from disk like the OpenAPI and Symfony route
+// configs — it has no extension, so no glob would admit it — and a sub-router's
+// mount prefix is composed onto its paths UNLESS they already carry it segment-wise,
+// which every included routes file in the corpus does and which composing blindly
+// turned into /team/team. Pekko/Akka HTTP and http4s route trees are read from the
+// AST, one route per verb a path block names.
+//
+// The recurring lesson is that Scala's DSL names are ordinary method names, so three
+// passes are gated on the file importing the framework: `path(...)` produced routes
+// from a metrics timer whose API is literally path(result).record(nanos); `get`/`post`
+// would make every map lookup an HTTP call; and `topic` is a domain noun — a forum's
+// closeTopic/hideTopic became seven phantom Kafka topics, which is not inert, because
+// the linker turns a topic into cross-repo coupling by name ownership. SQL string
+// literals are deliberately NOT read: the corpus contains a SQL engine whose 198
+// literal-bearing files are grammar and planner fixtures, not storage it owns.
+//
+// Also fixes a non-determinism: Pekko verb selection scanned enclosing source text
+// and iterated a Go map, so a route's method varied between runs on identical input.
+//
+// v184: Scala test references. Excluding test source sets left a production symbol
+// whose only caller is a spec with no inbound edge at all, so it read as dead — a
+// large class in Scala, where a library's public API is frequently exercised only
+// from its own suite. One test_ref fact per file carries the outbound references and
+// no symbols, so specs still never become dead-code candidates themselves. Assertion,
+// matcher, mocking and spec-structure names are dropped, and a harness receiver
+// disqualifies the BARE method name too: filtering only `Assert.equals` lets `equals`
+// through, and production code declares `equals`, so the harness would vouch for a
+// symbol no test exercises and suppress a real finding. 50-85% of a spec's references
+// match a production symbol; the rest are library calls that match nothing.
+//
+// v185: walk anonymous-class bodies. handleInstanceExpression walked only the
+// constructor arguments, so the body of `new: …` (Scala 3, braceless) and
+// `new T { … }` was dropped whole — 1,817 such bodies across the corpus, carrying
+// 5,673 declarations and 9,637 calls. An anonymous class is where Scala puts
+// implementations, so this was the largest single cause of dead-code false
+// positives: an extension method whose only call site sat inside such a body had no
+// inbound edge at all and was reported at HIGH confidence.
+//
+// v186: a parenless member reference is an edge. Scala's uniform access principle
+// means a parameterless method is invoked WITHOUT parentheses, so `xa.transaction`
+// and `stream.union2` reach the grammar as field_expression — the same node as a
+// field read — and treating only call_expression as a reference left every such
+// method with no inbound edge. The same node also covers a value passed by name
+// (`WebHook.Create`) and a method used as a value (`Form.apply`), which are
+// references by any reading. The edge is emitted but NOT recorded as an in-loop
+// call: a field read inside a loop is not per-iteration work in the sense the N+1
+// heuristic means, and admitting every one would bury the real callees in the
+// analyzer's evidence. Costs 24-34% more edges, which is what a whole category of
+// reference is worth.
+//
+// v187: a combinator applied to an Option repeats at most once. The combinator NAME
+// cannot distinguish iteration from an Option chain — `xs.foreach` and
+// `xs.find(p).foreach` differ only in what they are applied to — so the receiver's
+// trailing method is the evidence. Demoted to the discounted tier rather than
+// dropped: the construct is still repetition-shaped, it just cannot scale with the
+// input. This was the only confirmed analyze_performance false positive on the
+// corpus; a servlet's `find{…}.foreach{…}` was reported O(n²) at high severity
+// though neither combinator can run twice.
+//
+// v188: a trait is an abstraction only when it declares something abstract, and a
+// case class is a data holder. Scala traits carry implementations and the idiom
+// leans on it — a mixin with a self-type and a concrete body is the ordinary way to
+// compose a service — so counting every trait as abstract read one corpus package of
+// sixteen controller traits, whose bodies ARE the REST API and which declare nothing
+// abstract between them, as A=1.00 and reported it "useless". The `abstract` prop is
+// authoritative for package metrics and can demote as well as promote (the hook Ruby
+// uses for namespace modules), so it is now declared explicitly either way. Separately
+// a case class carries the data_holder marker, the same signal a Kotlin data class or
+// a record gives, which stops "extract interfaces" being advised on a package that is
+// mostly value carriers — one corpus package of 92 header types got exactly that.
+//
+// v189: Scala module facts carry the build module they compile into (jvm_module),
+// derived from the path prefix before the first `src/` segment — the layout sbt,
+// Mill, Maven and Gradle share, so no build file is parsed. The cycles explainer
+// reads it: Scala imposes no package-level acyclicity WITHIN a module, so a cycle
+// there is legal and compiles, while sbt and Maven both reject a circular
+// dependency BETWEEN modules. Without the prop every Scala cycle was reported as
+// something that "can cause initialization issues", which for the common case is
+// untrue — the same over-claim the prop already prevents for C# and Rust. A
+// single-module repository returns "." rather than "", because callers read "" as
+// unattributed and that is the case where attribution matters most.
+const cacheVersion = "v189"
 
 // extractorCache holds per-extractor facts keyed by a content hash of the files
 // the extractor depends on. It is loaded from disk at the start of a snapshot and
