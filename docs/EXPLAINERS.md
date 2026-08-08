@@ -27,10 +27,10 @@ constraint rather than an optimisation.
 All of which buys a finding you can trust. It does not buy a verdict — and the gap
 between those two is what the rest of this document is about.
 
-Across the 38 public repositories in [BENCHMARKS.md](BENCHMARKS.md), enola's ten
-explainers produced **24,012 findings**. Every one of them is derived rather than
+Across the 62 public repositories swept in [BENCHMARKS.md](BENCHMARKS.md), enola's ten
+explainers produced **29,633 findings**. Every one of them is derived rather than
 guessed, and that number is still the problem rather than the achievement. Nobody is
-going to read 24,012 findings. Nobody is going to fix them. A report that hands you all
+going to read 29,633 findings. Nobody is going to fix them. A report that hands you all
 of them has told you something true and useless in the same breath, and the honest
 response to it is to close the tab.
 
@@ -82,20 +82,20 @@ computes a saturating score — a fan-in ratio, a coverage share — clamps stri
 
 ## A list of everything wrong is not a list of anything you did
 
-Here is the shape of the problem, from the corpus. Twelve repositories, before anyone
+Here is the shape of the problem, from the corpus. Fifteen repositories, before anyone
 changed a line:
 
-> **974 pre-existing findings.** Up to 159 in a single repository.
+> **1,228 pre-existing findings.** Up to 171 in a single repository.
 
 Now make a change. Add a feature, fix a bug, let an agent refactor a package. Two
 questions look similar and are not:
 
-1. *What is wrong with this repository?* — 974 answers, none of them yours.
+1. *What is wrong with this repository?* — 1,228 answers, none of them yours.
 2. *What did my change do to it?* — the question you can actually act on.
 
-Almost every one of those 974 findings was there before you opened the editor. You did
+Almost every one of those 1,228 findings was there before you opened the editor. You did
 not write them, you are not going to fix them today, and a tool that reports them
-alongside your change has buried the one thing you needed in 973 things you did not.
+alongside your change has buried the one thing you needed in 1,227 things you did not.
 This is how structural analysis dies in practice: not because the analysis is wrong, but
 because the signal-to-noise ratio makes the honest response *turn it off*.
 
@@ -114,13 +114,13 @@ time. And because every finding carries the entities it is about — the modules
 cycle, the symbol with the fan-in, the dependency edge that crossed a layer — a finding
 can be checked against what your change actually touched.
 
-Put those together and the report inverts. Instead of *974 findings, one of which might
+Put those together and the report inverts. Instead of *1,228 findings, one of which might
 be new*, you get:
 
 > **FAIL — 1 structural regression introduced.**
 
-Measured, on those same twelve repositories: an injected dependency cycle was reported
-as **exactly one regression, and not one of the 974 pre-existing findings was repeated**
+Measured, on those same fifteen repositories: an injected dependency cycle was reported
+as **exactly one regression, and not one of the 1,228 pre-existing findings was repeated**
 ([BENCHMARKS.md § 2](BENCHMARKS.md#2-delta-precision--the-ratchet)). Revert the change
 and it goes quiet again. The verdict is a function of the tree, not of history.
 
@@ -151,8 +151,11 @@ that drifted gets to masquerade as something you caused.
 
 ## Only one kind fails the build
 
-Of the 24,012 findings across the corpus, **887 are cycles — 3.7%.** Only those are
-eligible to fail a build. The other 96.3% are reported and let you through.
+Of the 29,633 findings across the corpus, 1,057 come from the cycles explainer, and
+**937 of those are load-order cycles at confidence `1.0` — 3.16%.** Only those are
+eligible to fail a build. The other 96.84% are reported and let you through, including
+the 120 cycles-sourced findings the explainer emits at `0.4` for a highly coupled
+module cluster, which is a coupling signal rather than a defect to break.
 
 That ratio is the design, not an accident. A cycle is the one finding computed with
 certainty rather than inferred, and it is consequential enough to be worth stopping for:
@@ -197,7 +200,7 @@ so — but the mechanism is the argument, and the mechanism is the delta.
 - **The heuristics are repo-relative.** A uniformly complex codebase reports nothing
   remarkable, because nothing in it is remarkable *for that codebase*. Findings compare
   you to yourself, never to an industry baseline.
-- **The bulk of the volume is one explainer.** 20,625 of the 24,012 findings are
+- **The bulk of the volume is one explainer.** 23,775 of the 29,633 findings are
   hotspots, and unlike its siblings it has no output cap. "No new findings" is a
   statement about your change, never a certificate that a repository is clean.
 

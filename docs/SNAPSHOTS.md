@@ -33,9 +33,9 @@ Everything about enola that looks unusual falls out of that one decision, and th
 document is those consequences in order.
 
 That it delivers the verdict it claims to is measured in
-[BENCHMARKS.md § 2](BENCHMARKS.md#2-delta-precision--the-ratchet): across twelve repositories
-carrying **974 pre-existing findings**, an injected dependency cycle was reported as exactly one
-regression, and not one of the 974 was repeated.
+[BENCHMARKS.md § 2](BENCHMARKS.md#2-delta-precision--the-ratchet): across fifteen repositories
+carrying **1,228 pre-existing findings**, an injected dependency cycle was reported as exactly one
+regression, and not one of the 1,228 was repeated.
 
 ## So the unit is a value, and it is named by its contents
 
@@ -51,8 +51,9 @@ looking at?"* from a matter of trust into an equality check — which is what le
 treat a matching ID as proof rather than as a coincidence.
 
 Determinism is the precondition for that, not the payoff. Measured:
-[38 of 38 repositories produced a byte-identical `snapshot_id` and a byte-identical `facts.jsonl`
-across three runs each — 114 runs, 4,211,133 facts, zero drift](BENCHMARKS.md#1-reproducibility).
+[62 of 62 repositories produced a byte-identical `snapshot_id` and a byte-identical `facts.jsonl`
+across three runs each — 186 runs, 5,908,745 facts, zero drift](BENCHMARKS.md#1-reproducibility),
+with the ten Dart/Flutter rows reproducing on a separate run for 72 of 72 overall.
 Cold first and then warm, deliberately, because the thing worth testing is that a cached run and a
 from-scratch run agree rather than that one code path repeats itself.
 
@@ -125,10 +126,11 @@ out in the limits section below rather than left here as a footnote.
 None of the above is affordable unless recomputing the graph is cheap at the cadence a verdict is
 needed, which is roughly twice per task: once before the work and once after.
 
-On the 38-repository corpus, 34 re-snapshot warm in 5.0 seconds or less. The four that do not are the
-largest things in it — the Linux kernel at **33.9s** (55,399 files, 1.9M facts), GitLab at 19.4s,
-rust-lang/rust at 9.1s, Airflow at 5.3s. Warm runs come out 1.33×–5.22× faster than cold over the 21
-repositories whose cold run exceeds half a second; below that the timing is noise
+On the sweep corpus, 52 of 62 re-snapshot warm in 5.0 seconds or less. The ten that do not are the
+largest things in it — the Linux kernel at **49.6s** (55,399 files, 1.9M facts), dotnet/runtime at
+34.3s, GitLab at 25.9s, Spark at 23.7s, roslyn at 15.3s, rust-lang/rust at 13.2s, shopware at 7.2s,
+grafana at 6.8s, discourse at 5.8s, Airflow at 5.2s. Warm runs come out 1.10×–6.04× faster than cold
+over the 52 repositories whose cold run exceeds half a second; below that the timing is noise
 ([BENCHMARKS.md § 4](BENCHMARKS.md#4-scale)).
 
 The mechanism is the per-file content-hash cache in

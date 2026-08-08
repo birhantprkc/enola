@@ -154,11 +154,11 @@ changed, never what was intended.
 
 enola parses your source with tree-sitter and language-specific extractors, normalizes it into a typed fact model, links it into a directed graph, and runs graph algorithms over it: Tarjan's SCC to find groups of modules that can all reach each other (a cycle), cycle-safe longest-path for the deepest import chain, and mean+2σ outlier tests to flag what sits two standard deviations above your own repository's average. No language model, no embeddings. Terms enola uses in its own output are defined in **[docs/GLOSSARY.md](docs/GLOSSARY.md)**.
 
-The same commit yields the same answer, every time: across 38 open-source repositories indexed three times each, all 38 produced a byte-identical snapshot ID and a byte-identical fact file, over 4.2 million facts with zero parse errors ([BENCHMARKS.md](docs/BENCHMARKS.md)). Every snapshot carries a **receipt**: enola's version, the git ref and whether the tree was dirty, the extractors used, and a snapshot ID that's a `sha256` fingerprint of the facts rather than a random UUID. Before comparing two snapshots, enola checks they were built the same way — a different extractor set or changed ignore rules makes a diff meaningless, and it reports that instead of treating the mismatch as your change.
+The same commit yields the same answer, every time: across 72 open-source repositories indexed three times each, all 72 produced a byte-identical snapshot ID and a byte-identical fact file, over 6.8 million facts with zero parse errors ([BENCHMARKS.md](docs/BENCHMARKS.md)). Every snapshot carries a **receipt**: enola's version, the git ref and whether the tree was dirty, the extractors used, and a snapshot ID that's a `sha256` fingerprint of the facts rather than a random UUID. Before comparing two snapshots, enola checks they were built the same way — a different extractor set or changed ignore rules makes a diff meaningless, and it reports that instead of treating the mismatch as your change.
 
 enola runs as a local binary reading local files. Nothing leaves your machine.
 
-It's fast enough to run on every commit: on the same 38-repository corpus, a warm re-index of an unchanged tree took 5.0s for grafana (10,310 files, 163,620 facts) and 33.9s for the Linux kernel (55,399 files, 1.9M facts). Full per-repository numbers, cold and warm, are in [BENCHMARKS.md](docs/BENCHMARKS.md).
+It's fast enough to run on every commit: on the same 72-repository corpus, a warm re-index of an unchanged tree took 6.8s for grafana (10,313 files, 167,987 facts) and 49.6s for the Linux kernel (55,399 files, 1.9M facts). Full per-repository numbers, cold and warm, are in [BENCHMARKS.md](docs/BENCHMARKS.md).
 
 **[ARCHITECTURE.md](ARCHITECTURE.md)** has the fact model, the pipeline, the MCP tool reference and the analysis internals.
 
@@ -216,10 +216,10 @@ Framework- and platform-specific detection for each language is described in **[
 ## Learn more
 
 - **[docs/CLI.md](docs/CLI.md)** — setup, every command and flag, the exit codes, and the `--explain` report.
-- **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** — reproducibility, delta precision, cross-repo coverage and scale, measured on 38 public repositories.
+- **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** — reproducibility, delta precision, cross-repo coverage and scale, measured on 72 public repositories.
 - **[docs/SNAPSHOTS.md](docs/SNAPSHOTS.md)** — why enola computes a graph on demand and keeps it as an addressable snapshot, rather than maintaining one continuously-updated graph, and where the opposite choice is the right one.
 - **[docs/GLOSSARY.md](docs/GLOSSARY.md)** — the words enola uses in its own output — finding, baseline, receipt, coverage gap, incidental shift — defined in one place.
-- **[docs/EXPLAINERS.md](docs/EXPLAINERS.md)** — what the ten explainers compute, why a derived finding you can trust is still not a verdict, and how a delta turns 24,012 findings about a corpus into the one that is about your change.
+- **[docs/EXPLAINERS.md](docs/EXPLAINERS.md)** — what the ten explainers compute, why a derived finding you can trust is still not a verdict, and how a delta turns 29,633 findings about a corpus into the one that is about your change.
 - **[docs/extraction/](docs/extraction/)** — per language, what specific code produces which facts, from committed fixtures, and what each extractor deliberately does not resolve.
 - **[docs/EXTENDING.md](docs/EXTENDING.md)** — teaching enola a connection it does not know: binders, cross-repo signals, and the `linking:` vocabulary that fixes a wrong edge from config rather than a patch.
 - **[docs/INTENT.md](docs/INTENT.md)** — declared intent: the `enola-intent.yaml` / cluster / `enola_intent:` frontmatter carriers, the full vocabulary (via, relations, origin channels), what compiles, how verdicts behave, and the working rules for keeping declarations truthful.

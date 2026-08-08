@@ -1,6 +1,6 @@
 # Benchmarks
 
-Everything here was measured on 2026-08-08, on 62 public open-source repositories,
+Everything here was measured on 2026-08-08, on 72 public open-source repositories,
 with one binary, by scripts you can re-run. Where a number is unflattering it is
 still here.
 
@@ -194,9 +194,11 @@ receipt's `snapshot_id` and the SHA-256 of `facts.jsonl` were compared across al
 three. Running cold then warm is the point: it tests that a cached run and a
 from-scratch run agree, not merely that the same code path repeats itself.
 
-> **62 of 62 repositories produced a byte-identical `snapshot_id` and a
-> byte-identical `facts.jsonl` across all three runs — 159 runs, 5,461,021 facts,
-> zero drift.** `insights.json` is byte-stable on all 62 as well.
+> **62 of 62 repositories in this sweep produced a byte-identical `snapshot_id` and a
+> byte-identical `facts.jsonl` across all three runs — 186 runs, 5,908,745 facts,
+> zero drift.** `insights.json` is byte-stable on all 62 as well. The ten
+> Dart/Flutter rows reproduce on their own run, measured separately, for 72 of 72
+> overall.
 
 This is the property everything else rests on. `snapshot_id` is
 `sha256(facts ‖ enola version ‖ config hash)`, not a UUID, so two runs on the same
@@ -240,8 +242,8 @@ Read the columns as four separate claims, all of which hold on all fifteen:
   That's what makes a PASS or FAIL on a real change something you can rely on.
 - **Benign addition → PASS**, with the delta naming exactly the 2–3 facts added.
   A new leaf module isn't a structural regression, so there's nothing to report.
-- **Injected cycle → FAIL, exactly 1 regression** — out of **974 pre-existing
-  findings across these repositories**, up to 159 in a single one. None of them was
+- **Injected cycle → FAIL, exactly 1 regression** — out of **1,228 pre-existing
+  findings across these repositories**, up to 171 in a single one. None of them was
   repeated. The ratchet holds.
 - **Reverted → PASS again**, +0 facts. The verdict is a function of the tree, not
   of history.
@@ -259,21 +261,29 @@ which is exactly the property that makes the no-change column worth reading.
 
 ### Why only cycles fail
 
-Across the corpus enola produced **24,012 findings**. Broken down:
+Across the corpus enola produced **29,633 findings**. Broken down:
 
 | Explainer | Findings | Class |
 |---|---|---|
-| hotspots | 20,625 | statistical outlier |
-| layers | 585 | heuristic |
-| **cycles** | **887** | **structural fact — the only one that fails a build** |
-| god-class | 714 | statistical outlier |
-| complexity-outliers | 489 | statistical outlier |
-| exported-surface | 442 | candidate |
-| dependency-depth | 270 | statistical outlier |
+| hotspots | 23,775 | statistical outlier |
+| layers | 1,405 | heuristic |
+| god-class | 1,231 | statistical outlier |
+| **cycles** | **1,057** | **937 structural fact, 120 heuristic — see below** |
+| exported-surface | 872 | candidate |
+| complexity-outliers | 829 | statistical outlier |
+| dependency-depth | 464 | statistical outlier |
 
-3.7% of findings are eligible to fail a build. The other 96.3% are reported and let
-you through. That ratio is the design, not an accident: a gate that fails on one
-thing, and says which, is a gate people leave switched on.
+**The cycles row is not all one thing, and the difference is the whole gate.** The
+explainer emits a load-order cycle at confidence `1.0` and, separately, a *highly
+coupled module cluster* at `0.4` — mutual references between directories in an
+autoloaded codebase (Rails, say), where constants resolve lazily and there is no
+load-order defect to break. Both carry `source: cycles`, so counting the explainer
+overstates the gate: **937 of the 1,057 are at `1.0`**, and the default policy fails
+on new `cycles` findings at confidence `>= 1.00`.
+
+So **3.16% of findings are eligible to fail a build** — 937 of 29,633. The other
+96.84% are reported and let you through. That ratio is the design, not an accident: a
+gate that fails on one thing, and says which, is a gate people leave switched on.
 
 ## 3. Cross-repo resolution, misses included
 
@@ -409,7 +419,7 @@ so the demonstration proves its own limit in the same run.
 | Largest Scala | Spark — 5,437 files, 216,767 facts, 39.7s / 23.7s |
 | Largest Go | Grafana — 10,313 files, 167,987 facts, 9.0s / 6.8s |
 | Throughput | 3,100–30,300 facts/sec depending on language |
-| Parse errors, all 62 repositories | **0** |
+| Parse errors, all 72 repositories | **0** |
 | Memory | no repository required tuning on this machine; Spark is the high-water mark and is measured separately in the harness README, because the sweep records time and hashes but not RSS |
 
 Warm runs are 1.10×–6.04× faster than cold (over the 52 repositories whose cold run

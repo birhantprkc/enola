@@ -1117,7 +1117,7 @@ Together these mean the architectural map an agent relies on is both *trustworth
 
 enola computes the graph when asked and keeps the result as a value, rather than maintaining one graph that is updated as your files change. That is not an implementation detail — it is forced by what enola produces. A verdict on a change is a function of two states, and the edit you want graded is the same edit that would update a graph maintained in place: whatever keeps such a graph current fires on exactly the event whose effect you were trying to measure, and the *before* is gone by the time you can ask about it.
 
-So a baseline is a file set you keep rather than a position a process is in, which is why `.enola/baseline/` survives re-snapshots, publishes atomically, and travels to another machine. And the design is only affordable because recomputation is cheap at the cadence a verdict is needed — twice per task: 34 of the 38 benchmarked repositories re-snapshot warm in under five seconds, the Linux kernel in 33.9s.
+So a baseline is a file set you keep rather than a position a process is in, which is why `.enola/baseline/` survives re-snapshots, publishes atomically, and travels to another machine. And the design is only affordable because recomputation is cheap at the cadence a verdict is needed — twice per task: 52 of the 62 repositories in the sweep re-snapshot warm in under five seconds, the Linux kernel in 49.6s.
 
 The full argument, the consequences it forces, and the cases where a continuously-maintained graph is the better design: **[docs/SNAPSHOTS.md](docs/SNAPSHOTS.md)**.
 
