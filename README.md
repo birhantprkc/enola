@@ -5,9 +5,9 @@
 [![Release](https://img.shields.io/github/v/release/enola-labs/enola)](https://github.com/enola-labs/enola/releases)
 [![License](https://img.shields.io/github/license/enola-labs/enola)](LICENSE)
 
-**enola indexes your repository into a dependency graph, pins that graph before a change, and exits `1` if the change closed a dependency cycle.** Tree-sitter parsers and Tarjan's algorithm - no model, no embeddings, nothing leaves your machine.
+**enola indexes your repository into a dependency graph, pins that graph before a change, and exits `1` if the change left two modules importing each other** - a **dependency cycle**. Tree-sitter parsers and Tarjan's algorithm - no model, no embeddings, nothing leaves your machine.
 
-Your agent reads the same graph over MCP, so it knows what depends on what *before* it edits, and gets the verdict *after* - in time to fix its own regression.
+Your agent reads the same graph over **MCP** - the protocol Claude Code, Cursor and Copilot use to plug in tools - so it knows what depends on what *before* it edits, and gets the verdict *after*, in time to fix its own regression.
 
 Go · TypeScript/JavaScript · Python · Java · Kotlin · Scala · Swift · Ruby · Rust · C/C++ · .NET · PHP · Dart · Vue · Svelte · Ember · Terraform · Ansible · gRPC · OpenAPI · GraphQL - [full list](#supported-languages)
 
@@ -29,6 +29,12 @@ Exit code `1`, so a commit hook or a CI job can stop there. The [full output](#w
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/enola-labs/enola/main/install.sh | sh
+```
+
+That drops one binary into `~/.local/bin`. If the next command comes back `enola: command not found`, that directory isn't on your `PATH` yet:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 **2. Tell your agents it exists, and close the loop automatically:**
@@ -120,6 +126,8 @@ Code health
     internal/server.Server.registerTools         complexity 177
 ```
 
+Reading that table: **fan-in** is how many imports point at a module, **fan-out** how many point out of it, and **blast radius** how many distinct modules a change there could reach, following imports backwards up to three hops. Ten files in one module importing yours is ten imports but one module, which is why fan-in is often the larger number.
+
 If those numbers look right for your codebase, the rest of enola is the same measurement with a `before` to compare against.
 
 <sub>Already looked at other code-graph tools? [How enola differs](#why-not-codegraph-graphify-or-codebase-memory-mcp), in one table.</sub>
@@ -187,13 +195,13 @@ A cycle is when two modules end up depending on each other. `billing` imports `i
 
 **Everything else enola finds is reported, but never fails your build:**
 
-- a single function or type that a large part of the codebase depends on
-- a function that nearly everything calls
-- an import chain ten modules deep
-- code reaching across a layer it shouldn't, like a UI file talking straight to the database
-- a function far more complicated than the rest of your code
-- a package that exports almost everything it contains, instead of a small surface
-- API routes that nothing in the code you loaded ever calls
+- a single function or type that a large part of the codebase depends on (`god-class`)
+- a function that nearly everything calls (`hotspots`)
+- an import chain ten modules deep (`dependency-depth`)
+- code reaching across a layer it shouldn't, like a UI file talking straight to the database (`layers`)
+- a function far more complicated than the rest of your code (`complexity-outliers`)
+- a package that exports almost everything it contains, instead of a small surface (`exported-surface`)
+- API routes that nothing in the code you loaded ever calls (`unused-routes`)
 
 **Why the line is there.** A cycle is a fact - the loop is either in the import graph or it isn't (Tarjan's SCC algorithm, confidence `1.00`). The rest are estimates, measured against your own repository: "this file has unusually many dependents *for this codebase*." An estimate that breaks the build is an estimate people learn to switch off, so enola enforces the facts and reports the estimates.
 
@@ -207,7 +215,7 @@ A cycle is when two modules end up depending on each other. `billing` imports `i
 | Report everything, fail nothing | `enola check --warn-only` |
 | Fail if the change spread outside the area you named | `enola check --target=internal/auth --max-spillover=0` |
 
-The names `--fail-on` accepts are enola's individual checks (it calls them **explainers**, one per kind of finding): `cycles`, `layers`, `god-class`, `hotspots`, `dependency-depth`, `exported-surface`, `complexity-outliers`, `unused-routes`, `coverage`, `crossrepo`, `intent`.
+The names in brackets above are enola's individual checks - it calls them **explainers**, one per kind of finding - and they are exactly what `--fail-on` accepts, along with `cycles`, `coverage`, `crossrepo` and `intent`.
 
 That last row is a different question from the others. `--target` is you saying *"this change is about `internal/auth`"*; enola works out which packages depend on it, then reports any package your change touched that isn't in that group - something you edited that your own description didn't cover. Two snapshots can tell you what changed; only you can say what you meant to change.
 
@@ -263,21 +271,31 @@ enola parses your source with tree-sitter and language-specific extractors, norm
 
 ## Beyond one repository
 
-Point enola at a second repo and it links them into one graph - a web client's `fetch()` to the backend route that serves it, an iOS endpoint enum or Android Retrofit interface to that same route, a gRPC call site to the `.proto` service behind it, one service's Kafka producer to another's consumer.
+Point enola at your backend *and* the things that call it - a web app, a mobile app, another service - and it joins them into one graph. Your agent can then answer the question that normally costs you a morning and two colleagues:
 
-The hard part isn't finding the call, it's making both sides match. A route registered as `HandleFunc("/courses", …)` inside a function that receives a `PathPrefix("/api")` subrouter doesn't live at `/courses` - it lives at `/api/courses`, and unless that prefix is composed *interprocedurally*, across function and package boundaries, the client call never resolves. The same goes for Axum's `.nest()`, Rails' `scope`/`namespace`, and a Swift endpoint enum whose version prefix is defined in a protocol extension three files away.
+> *If I change this endpoint, what breaks?*
 
-So an agent can answer *if I change this endpoint, which mobile screens break?* by traversal instead of inference - and `enola check` grades a change that spans repos the same way it grades one that doesn't.
+It joins the two sides wherever they meet: a web client's `fetch()` to the route that serves it, a mobile app's call to that same route (an iOS endpoint enum, an Android Retrofit interface), a gRPC call to the service behind it, one service's Kafka producer to another's consumer.
 
-enola shows this working on your own code, rather than asking you to trust it:
+**The hard part is that the two sides rarely spell the endpoint the same way.** Your frontend calls `/api/courses`. Your backend file says:
+
+```go
+r.HandleFunc("/courses", listCourses)
+```
+
+The `/api` was attached somewhere else entirely - in whatever function set this router up, quite possibly in another package. Compare the two strings literally and you find nothing, so enola follows that prefix across function and package boundaries (*interprocedurally*) and files the route under the address it actually answers on: `/api/courses`. Same story for Axum's `.nest()`, Rails' `scope` and `namespace`, and a Swift endpoint enum whose version prefix lives three files away in a protocol extension.
+
+Once both ends line up, `enola check` grades a change spanning two repos exactly the way it grades one that doesn't.
+
+**It also tells you what it missed.** Some calls can't be resolved - a URL assembled at runtime, a client library enola doesn't know - and a tool that quietly drops those looks identical to one that found everything:
 
 ```bash
 enola coverage cluster.yaml
 ```
 
-reports, per service, how many outbound calls enola found, how many it resolved, and **how many it couldn't**. This distinguishes a genuinely isolated service from one whose edges enola simply failed to resolve - misses are always shown, not hidden.
+That reports, per service, how many outbound calls it found, how many it matched to a route, and **how many it couldn't**. Which is the difference between a service that genuinely talks to nothing and a service whose edges enola just failed to follow.
 
-[`examples/cross-repo/`](examples/cross-repo/) is a two-service demo you can run in one command: a prefix composed across a function boundary so the client's call resolves, and one deliberately dynamic call that stays unresolved, to show what an unresolved edge looks like rather than hide it.
+[`examples/cross-repo/`](examples/cross-repo/) is a two-service demo you can run in one command. It contains one deliberately unresolvable call, so you can see what a miss looks like before you go looking for them in your own code.
 
 ## Supported languages
 
@@ -335,7 +353,14 @@ It is silent for builds from source, never runs when `CI` is set, and turns off 
 
 Apache License 2.0 - see [`LICENSE`](LICENSE).
 
-This repository is the full engine, not a trial edition. Every extractor and every language ships here (Go, TypeScript/JavaScript/Vue/Svelte/Ember, Python, Java, Kotlin, Scala, Dart/Flutter, Ruby, PHP, Swift, Rust, C/C++, .NET (C#/VB.NET/F#/Razor/XAML), Terraform/HCL, Ansible, gRPC/Protobuf, OpenAPI, GraphQL), along with the cross-repo linker, all 16 MCP tools, all 11 explainers (cycles, layers, cross-repo, coverage, unused-routes, god-class, hotspots, dependency-depth, exported-surface, complexity-outliers, intent), baselines and `diff_snapshot`, snapshot receipts, the `--explain` report, and the localhost dashboard. None of this is gated, metered, or degraded without a key - there is no license check anywhere in this repository, and no snapshot, fact, or usage counter leaves your machine. (The only outbound request enola makes is to GitHub's release API, and only when you explicitly run `enola upgrade`.)
+**This repository is the full engine, not a trial edition.** Nothing in it is gated, metered, or degraded without a key: there is no license check anywhere in this repository, and no snapshot, fact, or usage counter ever leaves your machine. The only outbound request enola makes is to GitHub's release API, and only when you explicitly run `enola upgrade`.
+
+Everything ships here:
+
+- **Every language** - Go, TypeScript/JavaScript/Vue/Svelte/Ember, Python, Java, Kotlin, Scala, Dart/Flutter, Ruby, PHP, Swift, Rust, C/C++, .NET (C#/VB.NET/F#/Razor/XAML), Terraform/HCL, Ansible, gRPC/Protobuf, OpenAPI, GraphQL
+- **All 16 MCP tools**, plus the cross-repo linker
+- **All 11 explainers** - `cycles`, `layers`, `crossrepo`, `coverage`, `unused-routes`, `god-class`, `hotspots`, `dependency-depth`, `exported-surface`, `complexity-outliers`, `intent`
+- Baselines, `diff_snapshot`, snapshot receipts, the `--explain` report, and the localhost dashboard
 
 ## Acknowledgements
 
