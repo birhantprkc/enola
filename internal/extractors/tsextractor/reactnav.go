@@ -65,7 +65,7 @@ var (
 // bound handled_by to the component the registration names when that component
 // is an import the file states (the Ember handled_by contract, resolved
 // in-extractor because the import binding is file-local and exact).
-func extractReactNavScreens(root *sitter.Node, src []byte, relFile string, aliases map[string]string) []facts.Fact {
+func extractReactNavScreens(root *sitter.Node, src []byte, relFile string, aliases map[string]tsAlias) []facts.Fact {
 	text := string(src)
 	matches := screenTag.FindAllStringSubmatchIndex(text, -1)
 	if len(matches) == 0 {

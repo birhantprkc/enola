@@ -1505,7 +1505,24 @@ import (
 //     explainer attributes a symbol to a package. A Dart class also declares its
 //     members, so the first member name was being read as a package — 1,746 phantom
 //     packages on drift against 199 real modules, the .NET failure in Dart's clothing.
-const cacheVersion = "v193"
+// v194: TypeScript tsconfig `paths` entries with no `*` are honoured. The parser
+// required a wildcard on BOTH sides and silently dropped the exact form — which is how
+// a monorepo names a sibling package:
+//
+//	"@acme/common":   ["./packages/common/src/index.ts"]   <- dropped
+//	"@acme/common/*": ["./packages/common/src/*"]          <- kept
+//
+// So a bare-specifier import matched nothing, was classified external, and its call edge
+// fell back to the CALLER's directory — one phantom node per calling package, none of
+// them the real symbol. `impact_analysis` and `traverse` therefore returned nothing for
+// any symbol imported across packages, the single most useful query on a TS monorepo.
+// The subpath form resolved correctly throughout, which is why a 72-repo corpus never
+// caught it: the bug is invisible on a single-package repo.
+//
+// Measured before/after on excalidraw, supabase and bitwarden-clients; the exact match
+// mode is carried on the alias rather than inferred, because a bare `@acme/common` used
+// as a prefix would also swallow `@acme/common-utils`.
+const cacheVersion = "v194"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //

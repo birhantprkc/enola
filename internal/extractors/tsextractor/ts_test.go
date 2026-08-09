@@ -1178,10 +1178,10 @@ func TestExtract_ThisMemberReference_EventHandler(t *testing.T) {
 // `enola check` reported edge churn on an untouched tree. Repeating the resolution is
 // what makes this a regression test rather than a coin flip that happened to land.
 func TestResolveImportPath_LongestAliasWinsDeterministically(t *testing.T) {
-	aliases := map[string]string{
-		"@acme/":       "public/@acme/",
-		"@acme/schema": "packages/acme-schema/src",
-		"@":            "src/",
+	aliases := map[string]tsAlias{
+		"@acme/":       {replacement: "public/@acme/"},
+		"@acme/schema": {replacement: "packages/acme-schema/src"},
+		"@":            {replacement: "src/"},
 	}
 
 	for _, tc := range []struct {
@@ -1208,7 +1208,7 @@ func TestResolveImportPath_LongestAliasWinsDeterministically(t *testing.T) {
 }
 
 func TestResolveImportPath_NonAliasPathsUnchanged(t *testing.T) {
-	aliases := map[string]string{"@/": "src/"}
+	aliases := map[string]tsAlias{"@/": {replacement: "src/"}}
 	if got, ext := resolveImportPath("./sibling", "src/app", aliases); ext || got != "src/app/sibling" {
 		t.Errorf("relative import = %q external=%v", got, ext)
 	}
@@ -1258,5 +1258,76 @@ func TestDetect_DenoProject(t *testing.T) {
 	ok, err := New().Detect(dir)
 	if err != nil || !ok {
 		t.Fatalf("Detect = %v, %v — a Deno project has TypeScript and no package.json", ok, err)
+	}
+}
+
+// A tsconfig `paths` pattern with no `*` matches the whole specifier. Until v134 the
+// parser required a `*` on BOTH sides and silently dropped the exact form, which is how
+// a monorepo names a sibling package:
+//
+//	"@excalidraw/common":   ["./common/src/index.ts"]   <- dropped
+//	"@excalidraw/common/*": ["./common/src/*"]          <- kept
+//
+// So `import { randomId } from "@excalidraw/common"` (no subpath) matched nothing, was
+// classified external, and its call edge fell back to the CALLER's directory — a phantom
+// node per calling package. Measured on excalidraw: 4,847 internal call edges dangling,
+// and impact_analysis/traverse blind to every cross-package symbol.
+func TestParseTSConfigAliases_ExactPatternIsRecorded(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tsconfig.json")
+	if err := os.WriteFile(path, []byte(`{"compilerOptions":{"paths":{
+		"@acme/common":   ["./packages/common/src/index.ts"],
+		"@acme/common/*": ["./packages/common/src/*"]
+	}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	aliases, ok := tryParseTSConfigAliases(path)
+	if !ok {
+		t.Fatal("no aliases parsed")
+	}
+	exact, found := aliases["@acme/common"]
+	if !found {
+		t.Fatalf("exact pattern dropped; got %v", aliases)
+	}
+	if !exact.exact {
+		t.Errorf("exact pattern not marked exact: %+v", exact)
+	}
+	if exact.replacement != "packages/common/src/index.ts" {
+		t.Errorf("replacement = %q", exact.replacement)
+	}
+	if wc, found := aliases["@acme/common/"]; !found || wc.exact {
+		t.Errorf("wildcard form should survive as a prefix, got %+v found=%v", wc, found)
+	}
+}
+
+// The reason the match mode is carried explicitly rather than inferred: an exact entry
+// stored as a bare prefix would also swallow a DIFFERENT package whose name extends it,
+// drawing edges into code that was never imported.
+func TestResolveImportPath_ExactAliasDoesNotSwallowSiblingPackage(t *testing.T) {
+	aliases := map[string]tsAlias{
+		"@acme/common": {replacement: "packages/common/src/index.ts", exact: true},
+	}
+	got, external := resolveImportPath("@acme/common", "packages/element/src", aliases)
+	if external || got != "packages/common/src/index.ts" {
+		t.Errorf("exact hit = %q external=%v", got, external)
+	}
+	// A sibling package sharing the prefix must NOT match the exact entry.
+	if got, external := resolveImportPath("@acme/common-utils", "packages/element/src", aliases); !external {
+		t.Errorf("@acme/common-utils should be external, got %q", got)
+	}
+}
+
+// tsconfig resolves most-specific-first, and an exact pattern is maximally specific, so
+// it must beat a prefix that also matches rather than being ranked against it by length.
+func TestResolveImportPath_ExactBeatsPrefix(t *testing.T) {
+	aliases := map[string]tsAlias{
+		"@acme/":       {replacement: "public/@acme/"},
+		"@acme/common": {replacement: "packages/common/src/index.ts", exact: true},
+	}
+	if got, _ := resolveImportPath("@acme/common", "src", aliases); got != "packages/common/src/index.ts" {
+		t.Errorf("exact should win over prefix, got %q", got)
+	}
+	if got, _ := resolveImportPath("@acme/other", "src", aliases); got != "public/@acme/other" {
+		t.Errorf("prefix still applies to non-exact specifiers, got %q", got)
 	}
 }

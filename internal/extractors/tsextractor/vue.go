@@ -198,7 +198,7 @@ func containsCreateRouterCall(node *sitter.Node, src []byte) bool {
 }
 
 // extractVueSFC extracts architectural facts from a Vue Single File Component.
-func (e *TSExtractor) extractVueSFC(rawSrc []byte, relFile string, isNuxt bool, aliases map[string]string) []facts.Fact {
+func (e *TSExtractor) extractVueSFC(rawSrc []byte, relFile string, isNuxt bool, aliases map[string]tsAlias) []facts.Fact {
 	var result []facts.Fact
 	blocks := extractVueScriptBlocks(rawSrc)
 
@@ -265,7 +265,7 @@ func (e *TSExtractor) extractVueSFC(rawSrc []byte, relFile string, isNuxt bool, 
 
 // extractVueScriptBlock parses a single <script> block from a Vue SFC and
 // returns the extracted facts with line numbers adjusted to the original file.
-func (e *TSExtractor) extractVueScriptBlock(block *vueScriptBlock, relFile string, isNuxt bool, aliases map[string]string) []facts.Fact {
+func (e *TSExtractor) extractVueScriptBlock(block *vueScriptBlock, relFile string, isNuxt bool, aliases map[string]tsAlias) []facts.Fact {
 	isTSX := block.Lang == "tsx"
 	lang := typescript.LanguageTypescript()
 	if isTSX {

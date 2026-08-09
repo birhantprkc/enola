@@ -278,7 +278,7 @@ type extractCtx struct {
 	knownFiles  map[string]bool // repo-relative (slash) paths of all indexed TS/JS files
 }
 
-func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, isNuxt, isSvelteKit, isEmber, isReactNav bool, orms ormFlags, aliases map[string]string, knownFiles map[string]bool, grpcStubs *grpcStubIndex) []facts.Fact {
+func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, isNuxt, isSvelteKit, isEmber, isReactNav bool, orms ormFlags, aliases map[string]tsAlias, knownFiles map[string]bool, grpcStubs *grpcStubIndex) []facts.Fact {
 	if isVueFile(relFile) {
 		return e.extractVueSFC(src, relFile, isNuxt, aliases)
 	}
@@ -442,7 +442,7 @@ func (e *TSExtractor) extractFile(src []byte, relFile string, isNextJS, isVue, i
 	return result
 }
 
-func (e *TSExtractor) extractImports(root *sitter.Node, src []byte, relFile string, aliases map[string]string) []facts.Fact {
+func (e *TSExtractor) extractImports(root *sitter.Node, src []byte, relFile string, aliases map[string]tsAlias) []facts.Fact {
 	var result []facts.Fact
 	dir := filepath.Dir(relFile)
 
@@ -1403,9 +1403,19 @@ func nodeText(node *sitter.Node, src []byte) string {
 
 // tsAliasRoot is a directory (repoPath-relative, "" = root) and the alias
 // map its tsconfig declares, already qualified with dir as a prefix.
+// tsAlias is one tsconfig `paths` entry. The match mode is carried explicitly because
+// the two forms cannot share prefix semantics: an exact entry `@acme/common` stored as a
+// bare prefix would also match `@acme/common-utils` and draw edges into the wrong
+// package. tsconfig itself distinguishes them — a pattern without `*` matches the whole
+// specifier and nothing else.
+type tsAlias struct {
+	replacement string
+	exact       bool
+}
+
 type tsAliasRoot struct {
 	dir     string
-	aliases map[string]string
+	aliases map[string]tsAlias
 }
 
 // collectTSAliasRoots finds every directory whose tsconfig.json (or
@@ -1431,12 +1441,16 @@ func walkTSAliasRoots(repoPath, dir string, depth, maxDepth int, out *[]tsAliasR
 
 		// Concatenation, not filepath.Join, to preserve the trailing slash
 		// resolveImportPath's `replacement + rest` depends on.
-		qualified := make(map[string]string, len(aliases))
-		for prefix, replacement := range aliases {
+		//
+		// Exact entries are qualified the same way: packages/tsconfig.base.json declares
+		// "@excalidraw/common": ["./common/src/index.ts"], which means
+		// packages/common/src/index.ts. Skipping this resolved one directory too high.
+		qualified := make(map[string]tsAlias, len(aliases))
+		for prefix, a := range aliases {
 			if rel != "" {
-				replacement = rel + "/" + replacement
+				a.replacement = rel + "/" + a.replacement
 			}
-			qualified[prefix] = replacement
+			qualified[prefix] = a
 		}
 		*out = append(*out, tsAliasRoot{dir: rel, aliases: qualified})
 	}
@@ -1457,7 +1471,7 @@ func walkTSAliasRoots(repoPath, dir string, depth, maxDepth int, out *[]tsAliasR
 
 // aliasesAtDir tries tsconfig.json then tsconfig.base.json at dir, returning
 // the first one that declares a non-empty paths map.
-func aliasesAtDir(dir string) (map[string]string, bool) {
+func aliasesAtDir(dir string) (map[string]tsAlias, bool) {
 	for _, name := range []string{"tsconfig.json", "tsconfig.base.json"} {
 		if aliases, ok := tryParseTSConfigAliases(filepath.Join(dir, name)); ok {
 			return aliases, true
@@ -1468,7 +1482,7 @@ func aliasesAtDir(dir string) (map[string]string, bool) {
 
 // aliasesForDir returns the alias map of the root whose dir is the longest
 // matching ancestor-or-equal prefix of dir, or nil if none match.
-func aliasesForDir(roots []tsAliasRoot, dir string) map[string]string {
+func aliasesForDir(roots []tsAliasRoot, dir string) map[string]tsAlias {
 	dir = filepath.ToSlash(dir)
 	var best *tsAliasRoot
 	bestLen := -1
@@ -1492,7 +1506,7 @@ func aliasesForDir(roots []tsAliasRoot, dir string) map[string]string {
 // to every root that doesn't already define it.
 func withSvelteKitLibDefault(roots []tsAliasRoot) []tsAliasRoot {
 	if len(roots) == 0 {
-		roots = []tsAliasRoot{{dir: "", aliases: map[string]string{}}}
+		roots = []tsAliasRoot{{dir: "", aliases: map[string]tsAlias{}}}
 	}
 	for i := range roots {
 		if _, ok := roots[i].aliases["$lib/"]; ok {
@@ -1502,7 +1516,7 @@ func withSvelteKitLibDefault(roots []tsAliasRoot) []tsAliasRoot {
 		if roots[i].dir != "" {
 			target = roots[i].dir + "/src/lib/"
 		}
-		roots[i].aliases["$lib/"] = target
+		roots[i].aliases["$lib/"] = tsAlias{replacement: target}
 	}
 	return roots
 }
@@ -1510,7 +1524,7 @@ func withSvelteKitLibDefault(roots []tsAliasRoot) []tsAliasRoot {
 // tryParseTSConfigAliases reads path alias mappings from a tsconfig.json,
 // e.g. "@/*": ["./src/*"] maps prefix "@/" to replacement "src/". ok is
 // false if the file is missing/invalid or declares no usable paths.
-func tryParseTSConfigAliases(tsconfigPath string) (map[string]string, bool) {
+func tryParseTSConfigAliases(tsconfigPath string) (map[string]tsAlias, bool) {
 	data, err := os.ReadFile(tsconfigPath)
 	if err != nil {
 		return nil, false
@@ -1525,17 +1539,31 @@ func tryParseTSConfigAliases(tsconfigPath string) (map[string]string, bool) {
 		return nil, false
 	}
 
-	aliases := make(map[string]string)
+	aliases := make(map[string]tsAlias)
 	for pattern, targets := range config.CompilerOptions.Paths {
 		if len(targets) == 0 {
 			continue
 		}
+		switch {
 		// "@/*": ["./src/*"] → prefix "@/" maps to replacement "src/"
-		if strings.HasSuffix(pattern, "*") && strings.HasSuffix(targets[0], "*") {
+		case strings.HasSuffix(pattern, "*") && strings.HasSuffix(targets[0], "*"):
 			prefix := strings.TrimSuffix(pattern, "*")
 			replacement := strings.TrimSuffix(targets[0], "*")
-			replacement = strings.TrimPrefix(replacement, "./")
-			aliases[prefix] = replacement
+			aliases[prefix] = tsAlias{replacement: strings.TrimPrefix(replacement, "./")}
+
+		// "@acme/common": ["./packages/common/src/index.ts"] — the bare package
+		// specifier, and the dominant way a monorepo names a sibling package. Dropping
+		// this form (as this function did until v134) left every `import { x } from
+		// "@acme/common"` classified external, so the call edge fell back to the
+		// CALLER's directory and landed on a phantom node. Measured on excalidraw:
+		// 4,847 internal call edges dangling, and impact_analysis/traverse returning
+		// nothing for any cross-package symbol. The subpath form resolved fine, which
+		// is exactly why it went unnoticed.
+		case !strings.HasSuffix(pattern, "*") && !strings.HasSuffix(targets[0], "*"):
+			aliases[pattern] = tsAlias{
+				replacement: strings.TrimPrefix(targets[0], "./"),
+				exact:       true,
+			}
 		}
 	}
 	return aliases, len(aliases) > 0
@@ -1560,14 +1588,22 @@ func tryParseTSConfigAliases(tsconfigPath string) (map[string]string, bool) {
 //
 // Ties are broken on the prefix string so the result is a total order, not merely a
 // less-arbitrary one.
-func resolveImportPath(importPath, fileDir string, aliases map[string]string) (string, bool) {
+func resolveImportPath(importPath, fileDir string, aliases map[string]tsAlias) (string, bool) {
+	// An exact entry wins outright. tsconfig resolves most-specific-first and a pattern
+	// with no `*` matches the whole specifier and nothing else, so it cannot be ranked
+	// against prefixes by length — `@acme/common` (exact) and `@acme/` (prefix) both
+	// match `@acme/common`, and the exact one is the answer.
+	if a, ok := aliases[importPath]; ok && a.exact {
+		return filepath.ToSlash(filepath.Clean(a.replacement)), false
+	}
+
 	bestPrefix, bestReplacement := "", ""
-	for prefix, replacement := range aliases {
-		if !strings.HasPrefix(importPath, prefix) {
+	for prefix, a := range aliases {
+		if a.exact || !strings.HasPrefix(importPath, prefix) {
 			continue
 		}
 		if len(prefix) > len(bestPrefix) || (len(prefix) == len(bestPrefix) && prefix < bestPrefix) {
-			bestPrefix, bestReplacement = prefix, replacement
+			bestPrefix, bestReplacement = prefix, a.replacement
 		}
 	}
 	if bestPrefix != "" {
@@ -1618,7 +1654,7 @@ func resolveModuleFile(resolved string, knownFiles map[string]bool) (indexPath, 
 // fact. Symbols declared in an imported module are named "<moduleDir>.<exportName>",
 // where moduleDir is the directory of the resolved module file — this matches the
 // common file-module case (e.g. import "./utils" → utils.ts → "<dir>.foo").
-func buildImportSymbols(root *sitter.Node, src []byte, relFile string, aliases map[string]string) map[string]string {
+func buildImportSymbols(root *sitter.Node, src []byte, relFile string, aliases map[string]tsAlias) map[string]string {
 	fileDir := filepath.Dir(relFile)
 	m := make(map[string]string)
 	for i := range root.ChildCount() {
@@ -1686,7 +1722,7 @@ func buildImportSymbols(root *sitter.Node, src []byte, relFile string, aliases m
 // file-scope pass, facts.KindTestRef when the caller is ExtractTestRefs walking a
 // test/spec file. The walk and resolvers are identical either way — a reference
 // from a test is spelled exactly as the same reference from production code.
-func (e *TSExtractor) collectTSFileRefs(root *sitter.Node, ctx *extractCtx, aliases map[string]string, kind string) []facts.Fact {
+func (e *TSExtractor) collectTSFileRefs(root *sitter.Node, ctx *extractCtx, aliases map[string]tsAlias, kind string) []facts.Fact {
 	src := ctx.src
 	fileDir := filepath.Dir(ctx.relFile)
 	internal := make(map[string]string)   // local name -> canonical target (internal modules only)
@@ -2032,7 +2068,7 @@ func (e *TSExtractor) ExtractTestRefs(ctx context.Context, repoPath string, file
 // (or nil when it references nothing), reusing collectTSFileRefs' walk. Only the
 // fields collectTSFileRefs reads are populated on the ctx; knownFiles is left nil
 // (see ExtractTestRefs).
-func (e *TSExtractor) testRefsFromFile(src []byte, relFile string, aliases map[string]string) []facts.Fact {
+func (e *TSExtractor) testRefsFromFile(src []byte, relFile string, aliases map[string]tsAlias) []facts.Fact {
 	isTSX := strings.HasSuffix(relFile, ".tsx") || strings.HasSuffix(relFile, ".jsx")
 	lang := typescript.LanguageTypescript()
 	if isTSX {

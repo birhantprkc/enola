@@ -155,7 +155,7 @@ type emberImportBindings struct {
 	external map[string]string
 }
 
-func buildEmberImportBindings(root *sitter.Node, src []byte, relFile string, aliases map[string]string) emberImportBindings {
+func buildEmberImportBindings(root *sitter.Node, src []byte, relFile string, aliases map[string]tsAlias) emberImportBindings {
 	b := emberImportBindings{
 		internal: make(map[string]string),
 		external: make(map[string]string),
@@ -805,7 +805,7 @@ const EmberDefaultExportProp = "ember_default_export"
 // synthesized the way a script-less Vue SFC is. Service classes, @service
 // injections and ember-data models gain their props and companion facts.
 func emberEnrich(result []facts.Fact, root *sitter.Node, src []byte, relFile string,
-	aliases map[string]string, segments []emberTemplateSegment) []facts.Fact {
+	aliases map[string]tsAlias, segments []emberTemplateSegment) []facts.Fact {
 
 	dir := filepath.Dir(relFile)
 	base := strings.TrimSuffix(filepath.Base(relFile), filepath.Ext(relFile))

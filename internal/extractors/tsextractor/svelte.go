@@ -316,7 +316,7 @@ func extractSvelteMarkupRefs(rawSrc []byte, relFile string) *facts.Fact {
 }
 
 // extractSvelteSFC extracts architectural facts from a Svelte Single File Component.
-func (e *TSExtractor) extractSvelteSFC(rawSrc []byte, relFile string, isSvelteKit bool, aliases map[string]string) []facts.Fact {
+func (e *TSExtractor) extractSvelteSFC(rawSrc []byte, relFile string, isSvelteKit bool, aliases map[string]tsAlias) []facts.Fact {
 	var result []facts.Fact
 	blocks := extractSvelteScriptBlocks(rawSrc)
 
@@ -371,7 +371,7 @@ func (e *TSExtractor) extractSvelteSFC(rawSrc []byte, relFile string, isSvelteKi
 	return result
 }
 
-func (e *TSExtractor) extractSvelteScriptBlock(block *svelteScriptBlock, relFile string, isSvelteKit bool, aliases map[string]string) []facts.Fact {
+func (e *TSExtractor) extractSvelteScriptBlock(block *svelteScriptBlock, relFile string, isSvelteKit bool, aliases map[string]tsAlias) []facts.Fact {
 	isTSX := block.Lang == "tsx"
 	lang := typescript.LanguageTypescript()
 	if isTSX {
