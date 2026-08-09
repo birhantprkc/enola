@@ -349,6 +349,12 @@ It is silent for builds from source, never runs when `CI` is set, and turns off 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** - the concept, the fact model, the pipeline, the MCP tool reference, and the value model.
 - **[examples/](examples/)** - ready-made per-language and multi-repo configs, plus a pre-commit hook and a CI workflow.
 
+## Found it useful?
+
+If `enola --explain` told you something about your codebase you didn't already know, a star helps other people find it.
+
+And if it missed something it should have caught - an unresolved edge, a route it didn't match, a language construct it walked past - [open an issue](https://github.com/enola-labs/enola/issues). Coverage gaps are the most useful bug reports this project gets, because `enola coverage` is built on the premise that a miss should be visible rather than quiet.
+
 ## License
 
 Apache License 2.0 - see [`LICENSE`](LICENSE).
