@@ -7,6 +7,30 @@ The full per-release change lists — every Added, Changed and Fixed line — ar
 [enola.tech/changelog](https://enola.tech/changelog). This file is the same history at
 the resolution a reader of the repository needs.
 
+## v0.4.12 — 2026-09-01
+
+**GraphQL servers join the graph, so client operations have something to match**
+
+enola read GraphQL client operations and graphql-ruby's server field DSL, which left a
+schema-first Node server invisible: a TypeScript client's `Query.pageViews` crossed the
+repository boundary and found nothing on the other side. Server SDL is now read for Apollo
+Server, GraphQL Yoga, Mercurius, express-graphql, graphql-http, GraphQL Tools and
+GraphQL.js, along with code-first root fields from NestJS GraphQL, TypeGraphQL, Nexus and
+Pothos. Each root field becomes a server-role route in the same name shape the client
+emits, which is what the cross-repository `graphql` signal joins on. Activation is a
+repository-wide AST signal and package provenance is required, so a documentation example
+and a client's codegen copy of its backend's schema both stay inert.
+
+The client half widened to match: Relay's tag joins the `gql` tags, static operation
+strings are read in graphql-request modules and plain `fetch` bodies, and tag extraction
+now runs inside Vue and Nuxt `<script>` and `<script setup>`. Fixed: a Ruby client literal
+holding more than one operation reported only the first. The TypeScript pass reads each
+source once instead of rereading every file to build the gRPC stub index. Resolvers are
+not read — which root fields exist is in the graph, which function serves one is not.
+
+`cacheVersion` moves to `v259`: every repository re-extracts once, a repository serving
+GraphQL gains server-role routes, and baselines on those repositories should be re-pinned.
+
 ## v0.4.11 — 2026-08-30
 
 **A Vue component's template is code, and enola now reads it**
