@@ -2358,7 +2358,39 @@ import (
 // resolve to a uniquely declared method on that type. Auto-deduced, wrapped,
 // unknown and ambiguous receiver types remain unresolved rather than being
 // guessed, and a receiver call binds only when the method actually exists.
-const cacheVersion = "v260"
+// v261: a Python import that names a module in the importer's OWN package is
+// classified internal and bound to that sibling file module. Previously the
+// directory index could only match the shared parent — the importer's own dir —
+// and a self-match was abandoned, so `from app.db import x` written inside app/
+// was recorded as a THIRD-PARTY dependency with an unresolved dotted target. Every
+// such edge was missing from the module graph, including a package __init__.py's
+// re-exports of its own submodules, which truncated any import-closure walk at the
+// barrel. Inheritance bound through such an import (and through every relative
+// import, latent until now) also resolves: the composed "<module>.<symbol>" is
+// already canonical when the module is a slash path, so it no longer goes to the
+// dotted resolver that cannot read one.
+// v262: a Python absolute import binds to the MODULE it names, not to the package
+// directory that also matches one segment shorter — `from pkg.shared.logging import
+// x` resolves to pkg/shared/logging, where it previously resolved to pkg/shared and
+// became indistinguishable from an import of the package itself. This is the
+// granularity the extractor's own relative-import handling has always produced, and
+// the one TypeScript and Ruby produce for their file-addressed imports; the package
+// directory remains the answer when the dotted path names a package. Module-level
+// metrics are unchanged, since explainers roll a file target up to its directory.
+// v263: Python import facts carry Props["deferred"]=true when the import does not
+// run at module-import time — a function/class-body (lazy) import, or an
+// `if TYPE_CHECKING:` block, which never executes at all. Absence means the import
+// IS on the import path, following `from`. This is the distinction an import-closure
+// walk needs and the one source indentation cannot draw: a module-level
+// `try: import x` is indented yet runs, a TYPE_CHECKING import is indented and does
+// not. Also fixes a method-local import being emitted twice with disagreeing props,
+// because walkNestedScope registers body imports a second time.
+// v264: the Python stdlib set is completed against Python's own
+// sys.stdlib_module_names. Forty-two modules were missing — atexit, binascii,
+// colorsys, optparse, curses among them — and a stdlib name absent from that set is
+// classified as a third-party dependency, so it appeared in dependency breakdowns and
+// on import paths as a package the project had taken on.
+const cacheVersion = "v264"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //
