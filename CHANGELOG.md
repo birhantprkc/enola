@@ -7,6 +7,27 @@ The full per-release change lists — every Added, Changed and Fixed line — ar
 [enola.tech/changelog](https://enola.tech/changelog). This file is the same history at
 the resolution a reader of the repository needs.
 
+## v0.4.13 — 2026-09-04
+
+**Python imports bind to the module they name**
+
+An absolute Python import bound to the enclosing package directory, and one naming the
+importer's own package bound to nothing and read as a third-party dependency. Both now
+bind to the module, the granularity relative imports always had. Imports that never run
+at module-import time (function and class bodies, `if TYPE_CHECKING:`) carry a
+`deferred` prop. The new `import-closure` explainer reports what importing a package
+executes, including the `__init__.py` files no import statement names, and ranks
+barrels by how much each one alone brings in. Informational only.
+
+C++ call resolution binds a bare call when exactly one function in the repository
+declares that short name, and resolves `obj.method()` when the receiver has an explicit
+type and the method is unique; `auto`, template wrappers and missing methods stay
+unresolved. Three TypeScript passes now match inside tree-sitter instead of walking the
+tree in Go, cutting allocations with byte-identical output.
+
+`cacheVersion` moves to `v264`. Python and C++ repositories re-extract once; changed
+import targets and new call edges can shift findings, so re-pin baselines there.
+
 ## v0.4.12 — 2026-09-01
 
 **GraphQL servers join the graph, so client operations have something to match**
