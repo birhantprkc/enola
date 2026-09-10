@@ -7,6 +7,19 @@ The full per-release change lists — every Added, Changed and Fixed line — ar
 [enola.tech/changelog](https://enola.tech/changelog). This file is the same history at
 the resolution a reader of the repository needs.
 
+## v0.4.18 — 2026-09-10
+
+**install.sh runs under dash and on Windows, and upgrades get their own checksum**
+
+`curl … | sh` failed wherever `sh` is dash, as on Debian and Ubuntu, because dash rejects
+`set -o pipefail`; install.sh is now POSIX sh. It also installs the native `enola.exe`
+from Git Bash, MSYS2 and Cygwin instead of refusing them, moving a running copy aside so a
+re-run can replace it. `enola upgrade` now verifies against a new
+`enola-<version>-<os>-<arch>.upgrade.sha256`, the same digest as `.sha256` under a name
+only the updater fetches, so release download counts can tell upgrades from fresh
+installs. Integrations should keep verifying against `.sha256`. Nothing changed for pip
+installs, and this version is not on PyPI.
+
 ## v0.4.17 — 2026-09-09
 
 **Refresh loads a newer snapshot, and the dashboard opens on findings**
