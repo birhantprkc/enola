@@ -331,9 +331,7 @@ jobs:
   # be one users can install and then cannot upgrade away from.
   pypi-publish:
     needs: publish
-    # TEMPORARILY DISABLED while the install and upgrade changes are tested on a
-    # GitHub release. Re-enable by dropping `false &&`.
-    if: false && github.event_name == 'push'
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
 
     # Named by the Trusted Publisher configuration on PyPI. Publishing uses no
