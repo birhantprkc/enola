@@ -2400,7 +2400,17 @@ import (
 // inside the URL. The separator is now the last `@` before the range's protocol
 // colon, and a spec is unquoted per entry, since a multi-spec header quotes the
 // whole list and the comma split leaves each end with a lone quote.
-const cacheVersion = "v265"
+// v266: TypeScript reads requests made through in-house clients the config declares
+// (clients:, internal/clientspec). `this.<member>.<method>(…)` on a member whose
+// declared type a spec names becomes a client route: its path folded through the
+// enclosing class's own fields and single-assigned locals, its verb read from an
+// options object, its service name kept as a target hint. The declared clients enter
+// the extractor's cache key, so editing them re-extracts.
+// v267: TypeScript accounts for each declared in-house client per repository: one
+// extraction fact per client (typescript:client:<name>) with its receivers, the calls
+// made through it, the routes they became and the calls skipped by cause. Emitted even
+// when a client found nothing, so a client that matches nothing anywhere is reported.
+const cacheVersion = "v267"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //
@@ -2929,6 +2939,14 @@ func computeExtractorKeys(all []extractors.Extractor, files []string, hashes map
 		h := sha256.New()
 		h.Write([]byte(cacheVersion + "\x00" + name + "\x00" + sharedHash + "\x00"))
 		h.Write([]byte(hashFileSet(keyFiles[name], hashes)))
+		// Configuration the extractor reads decides its facts as surely as its files
+		// do. Written only when non-empty, so an extractor with nothing configured keys
+		// exactly as before and its existing cache stays valid.
+		if ck, ok := owners[name].(plugin.ConfigKeyed); ok {
+			if k := ck.ConfigKey(); k != "" {
+				h.Write([]byte("\x00config\x00" + k))
+			}
+		}
 		keys[name] = hex.EncodeToString(h.Sum(nil))
 	}
 	return keys

@@ -55,6 +55,39 @@ type fixture struct {
 	// because most fixtures pin extraction, and re-recording every finding on every
 	// heuristic tweak would make the goldens noise.
 	goldenInsights bool
+
+	// dir is the tree under testdata/repos, when it is not name. Several goldens can
+	// share one tree and differ only in config, which is how a behavior that config
+	// switches on is pinned beside the default it must leave untouched.
+	dir string
+
+	// config is a file under testdata/configs the engine is built with. Empty means
+	// the built-in defaults, as every fixture had before.
+	config string
+}
+
+// sourceDir returns the fixture tree to copy.
+func (f fixture) sourceDir() string {
+	d := f.dir
+	if d == "" {
+		d = f.name
+	}
+	return filepath.Join("testdata", "repos", d)
+}
+
+// configPath returns the config to build the engine with. A named config that is
+// missing fails the test: bootstrap treats a missing path as "use defaults", so a
+// typo here would otherwise record a default run under a configured golden's name.
+func (f fixture) configPath(t *testing.T) string {
+	t.Helper()
+	if f.config == "" {
+		return filepath.Join(t.TempDir(), "no-such-config.yaml")
+	}
+	p := filepath.Join("testdata", "configs", f.config)
+	if _, err := os.Stat(p); err != nil {
+		t.Fatalf("fixture %s names config %s: %v", f.name, p, err)
+	}
+	return p
 }
 
 var fixtures = []fixture{
@@ -240,6 +273,35 @@ var fixtures = []fixture{
 	// src/components — innermost reaching up into the layer above it — must be a
 	// violation at confidence 1.00, which is what makes `--fail-on=layers` bite.
 	{name: "ts_layers_sample", subRepos: []string{"."}, goldenInsights: true},
+	// An in-house HTTP wrapper (sendRequest(serviceName, path, options)) called from a
+	// shared SDK, against NestJS servers. With no config it is invisible: no client
+	// route, no sdk -> gateway edge. This golden pins that miss so the configured
+	// goldens over the same tree show exactly what config changes and nothing else.
+	// replica serves gateway's literal route (ambiguity control), MessageBus calls a
+	// sendRequest on an unconfigured type (precision control), and backend reaches the
+	// gateway only through the SDK.
+	{name: "ts_custom_client_default", dir: "ts_custom_client_cluster",
+		subRepos: []string{"gateway", "replica", "sdk", "backend"}},
+	// The same tree with the client declared and no service alias. sendRequest through
+	// IHttpRequestService becomes client routes; MessageBus's sendRequest on another
+	// type, and the call whose path is a method result, do not. Still no edge: the
+	// literal route has two providers and the service name names neither, and the
+	// parameterized route needs literal-against-parameter matching.
+	{name: "ts_custom_client_no_alias", dir: "ts_custom_client_cluster", config: "ts_custom_client_no_alias.yaml",
+		subRepos: []string{"gateway", "replica", "sdk", "backend"}},
+	// The client declared and its service name aliased to gateway. The literal route
+	// both gateway and replica serve now resolves to gateway alone: the edge the
+	// feature exists for. The parameterized route stays unresolved until
+	// literal-against-parameter matching. Findings pinned too, since the edge changes
+	// what the crossrepo and unused-routes explainers conclude.
+	{name: "ts_custom_client_configured", dir: "ts_custom_client_cluster", config: "ts_custom_client_configured.yaml",
+		subRepos: []string{"gateway", "replica", "sdk", "backend"}, goldenInsights: true},
+	// The configured tree with literal-against-parameter matching turned on. The call to
+	// /v1/resources/catalog/items now reaches gateway's /v1/resources/:type/items: a
+	// second endpoint on the same edge, probable, and listed as resting on a parameter.
+	// gateway's parameter route stops reading as unused.
+	{name: "ts_custom_client_param_match", dir: "ts_custom_client_cluster", config: "ts_custom_client_param_match.yaml",
+		subRepos: []string{"gateway", "replica", "sdk", "backend"}, goldenInsights: true},
 }
 
 func TestGolden(t *testing.T) {
@@ -261,12 +323,12 @@ func TestGolden(t *testing.T) {
 func snapshotFixture(t *testing.T, f fixture) ([]byte, []facts.Insight) {
 	t.Helper()
 
-	root := copyTree(t, filepath.Join("testdata", "repos", f.name), t.TempDir())
+	root := copyTree(t, f.sourceDir(), t.TempDir())
 
 	// Build the engine the same way production does, so the golden reflects the
 	// real OSS plugin wiring. A non-existent config path falls back to defaults.
 	eng, _, err := bootstrap.NewEngine(bootstrap.Options{
-		ConfigPath: filepath.Join(t.TempDir(), "no-such-config.yaml"),
+		ConfigPath: f.configPath(t),
 	})
 	if err != nil {
 		t.Fatalf("bootstrap.NewEngine: %v", err)

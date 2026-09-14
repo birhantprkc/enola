@@ -20,6 +20,8 @@ import (
 	"github.com/enola-labs/enola/internal/engine"
 	"github.com/enola-labs/enola/internal/explainers/constraints"
 	"github.com/enola-labs/enola/internal/facts"
+	"github.com/enola-labs/enola/internal/linkers/crossrepo/routeindex"
+	httpsignal "github.com/enola-labs/enola/internal/linkers/crossrepo/signals/http"
 	"github.com/enola-labs/enola/internal/updatecheck"
 	"github.com/enola-labs/enola/internal/version"
 	"github.com/enola-labs/enola/pkg/coverage"
@@ -1683,7 +1685,14 @@ func (s *Server) registerTools() {
 		if args.Endpoint == "" {
 			return errorResult("endpoint is required"), nil, nil
 		}
-		return jsonResult(store.AnalyzeEndpoint(args.Endpoint, args.MaxRoutes))
+		// Callers come from the cross-repo linker's own matching, under the server's
+		// linking vocabulary, so a call it linked is a caller here too.
+		linkVocab, err := s.eng.Config().LinkingVocab()
+		if err != nil {
+			return errorResult(fmt.Sprintf("invalid linking vocabulary: %v", err)), nil, nil
+		}
+		return jsonResult(store.AnalyzeEndpoint(args.Endpoint, args.MaxRoutes,
+			httpsignal.NewCallerFinder(routeindex.New(linkVocab), store.All())))
 	})
 
 	// Tool: impact_analysis
@@ -1927,13 +1936,14 @@ func (s *Server) registerTools() {
 			if args.Repo != "" {
 				return errorResult(fmt.Sprintf("No service node named %q. coverage_report needs a multi-repo (append-mode) snapshot.", args.Repo)), nil, nil
 			}
-			return textResult("No service nodes found. coverage_report needs a multi-repo (append-mode) snapshot."), nil, nil
+			return textResult("No service nodes found. coverage_report needs a multi-repo (append-mode) snapshot." +
+				coverage.RenderClientsMarkdown(coverage.BuildClients(store))), nil, nil
 		}
 
 		if resolveOutputMode(args.OutputMode, modeSummary) == modeFull {
 			return jsonResult(report)
 		}
-		return textResult(report.RenderMarkdown()), nil, nil
+		return textResult(report.RenderMarkdown() + coverage.RenderClientsMarkdown(coverage.BuildClients(store))), nil, nil
 	})
 
 	// Tool: query_insights
