@@ -7,6 +7,39 @@ The full per-release change lists — every Added, Changed and Fixed line — ar
 [enola.tech/changelog](https://enola.tech/changelog). This file is the same history at
 the resolution a reader of the repository needs.
 
+## v0.4.20 — 2026-09-15
+
+**A folder of repositories indexes as a cluster, and in-house HTTP clients can be declared**
+
+- `--generate` and MCP `generate_snapshot` on a folder with two or more git repositories
+  directly under it index them as a cluster, writing `cluster.yaml` there or reusing the
+  existing one. `--no-cluster` (`no_cluster=true` over MCP) indexes the folder as one
+  repository. A folder that is itself a git repository is still indexed as one, with a
+  warning.
+- New `enola cluster init [--dry-run] [dir]` writes `cluster.yaml` for a folder of
+  repositories.
+- New `clients:` config declares in-house HTTP client wrappers by receiver type, method and
+  argument positions. The TypeScript extractor reads their calls as client routes.
+- Each declared client gets a coverage account. `enola coverage` prints a Declared clients
+  table and flags a client that matched no call site in any loaded repository.
+- A `clients:` spec for a language with no client reader yet (`python`, `go`) is skipped
+  with a warning instead of failing config load, and does not change the snapshot ID.
+- New `service_aliases:` maps a service name passed to a declared client to a repository
+  label. It only picks among repositories already serving the path; if the aliased one
+  serves none, no edge is drawn (`unmatched_reason: alias_not_serving`).
+- New opt-in `linking.match_literal_against_params` lets a server path parameter match a
+  literal client segment when no exact match exists. Such endpoints are listed in
+  `param_segment_endpoints`.
+- `enola endpoint` and `endpoint_impact` report as callers the call sites the cross-repo
+  linker matched to the route, under the same config.
+- Fixed: a scoped `package.json` dependency was taken as the repository's own npm scope and
+  hid the import edge to the repository publishing it.
+- Fixed: coverage counts and unmatched reasons now agree for verb-less or generic-path calls
+  in a repository with one declared seam (`attributed_by_intent`).
+- New example: `examples/custom-client`.
+- `cacheVersion` moves to `v267`: extraction caches are rebuilt and pinned baselines may
+  show a one-time change.
+
 ## v0.4.19 — 2026-09-12
 
 **The Stop hook reports once per session instead of at every stop**
