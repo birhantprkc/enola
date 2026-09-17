@@ -51,27 +51,43 @@ jobs:
           - os: ubuntu-latest      # linux/amd64
             goos: linux
             goarch: amd64
-            manylinux: quay.io/pypa/manylinux_2_28_x86_64
+            build_image: quay.io/pypa/manylinux_2_28_x86_64
             wheel_tag: manylinux_2_17_x86_64.manylinux2014_x86_64
           - os: ubuntu-24.04-arm   # linux/arm64 — native arm64 runner
             goos: linux
             goarch: arm64
-            manylinux: quay.io/pypa/manylinux_2_28_aarch64
+            build_image: quay.io/pypa/manylinux_2_28_aarch64
             wheel_tag: manylinux_2_17_aarch64.manylinux2014_aarch64
+          # musl (Alpine). pip on musl accepts only musllinux wheels, so without
+          # these legs `pip install enola-cli` finds no distribution at all there.
+          # Wheel only: the GitHub release, install.sh and `enola upgrade` stay
+          # on the glibc tarballs above, so no release asset is added.
+          - os: ubuntu-latest      # linux/amd64, musl
+            goos: linux
+            goarch: amd64
+            build_image: quay.io/pypa/musllinux_1_2_x86_64
+            wheel_tag: musllinux_1_2_x86_64
+            wheel_only: true
+          - os: ubuntu-24.04-arm   # linux/arm64, musl
+            goos: linux
+            goarch: arm64
+            build_image: quay.io/pypa/musllinux_1_2_aarch64
+            wheel_tag: musllinux_1_2_aarch64
+            wheel_only: true
           - os: macos-15-intel     # darwin/amd64 — native Intel runner
             goos: darwin
             goarch: amd64
-            manylinux: ""
+            build_image: ""
             wheel_tag: macosx_12_0_x86_64
           - os: macos-latest       # darwin/arm64 — native Apple Silicon
             goos: darwin
             goarch: arm64
-            manylinux: ""
+            build_image: ""
             wheel_tag: macosx_12_0_arm64
           - os: windows-latest     # windows/amd64
             goos: windows
             goarch: amd64
-            manylinux: ""
+            build_image: ""
             wheel_tag: win_amd64
     steps:
       - uses: actions/checkout@v7
@@ -113,7 +129,8 @@ jobs:
       # Rocky 8, Amazon Linux 2, Ubuntu 20.04 and Debian 11. The identical source
       # built inside manylinux_2_28 requires only 2.17, and links nothing outside
       # the manylinux policy list. Both numbers are measured, not assumed; see
-      # packaging/pypi/linux_test.sh, which reproduces this locally.
+      # packaging/pypi/linux_test.sh, which reproduces this locally. The musl
+      # legs use the same path inside musllinux_1_2; see packaging/pypi/musl_test.sh.
       #
       # The container gets the runner's own Go toolchain mounted in rather than
       # downloading one, so the compiler is exactly the version go.mod pins and
@@ -151,7 +168,7 @@ jobs:
 
           mkdir -p wheelbin
 
-          if [ -n "${{ matrix.manylinux }}" ]; then
+          if [ -n "${{ matrix.build_image }}" ]; then
             # Both builds in ONE container. The build cache lives inside it and is
             # not mounted (see above), so a second `docker run` would recompile
             # every package from scratch; back to back in one shell, the second
@@ -167,7 +184,7 @@ jobs:
               -e "LDFLAGS=$LDFLAGS" \
               -e "PIPFLAGS=$PIPFLAGS" \
               -e "OUT=${BINARY}${EXT}" \
-              "${{ matrix.manylinux }}" \
+              "${{ matrix.build_image }}" \
               /bin/sh -c '/usr/local/go/bin/go build -ldflags "$LDFLAGS" -o "$OUT" ./cmd/enola &&
                           /usr/local/go/bin/go build -ldflags "$PIPFLAGS" -o wheelbin/enola ./cmd/enola'
           else
@@ -176,6 +193,7 @@ jobs:
           fi
 
       - name: Create tarball
+        if: ${{ !matrix.wheel_only }}
         shell: bash
         run: |
           BINARY="enola-${{ steps.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}"
@@ -226,14 +244,14 @@ jobs:
       - name: Upload wheel
         uses: actions/upload-artifact@v6
         with:
-          name: wheels-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: wheels-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.wheel_only && '-musl' || '' }}
           path: dist/*.whl
           if-no-files-found: error
 
       - name: Upload to release
         # Tag pushes only. A dispatch is a wheel rehearsal and has no release to
         # attach anything to.
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && !matrix.wheel_only
         uses: softprops/action-gh-release@v3
         with:
           # Stays a draft until the publish job confirms every platform made it.
@@ -359,7 +377,7 @@ jobs:
       # machine that worked yesterday.
       - name: Verify every platform wheel is present
         run: |
-          expected=5
+          expected=7
           found="$(find dist -name '*.whl' | wc -l)"
           find dist -name '*.whl' -exec basename {} \;
           if [ "$found" -ne "$expected" ]; then
@@ -370,7 +388,7 @@ jobs:
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
 
-  # The rehearsal. Same wheels, same OIDC handshake, same five-wheel check, a
+  # The rehearsal. Same wheels, same OIDC handshake, same seven-wheel check, a
   # different index and a different environment.
   #
   # What this actually proves, and nothing local could: that Windows and Intel
@@ -400,7 +418,7 @@ jobs:
 
       - name: Verify every platform wheel is present
         run: |
-          expected=5
+          expected=7
           found="$(find dist -name '*.whl' | wc -l)"
           find dist -name '*.whl' -exec basename {} \;
           if [ "$found" -ne "$expected" ]; then

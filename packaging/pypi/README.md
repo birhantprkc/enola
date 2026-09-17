@@ -65,6 +65,11 @@ Tags are not guesses. Two things decide them and both are measured:
 - **Linux.** With cgo the binary links against the glibc of whichever image
   built it, so the floor is a property of the build image. `linux_test.sh`
   measures it with `objdump -T` and tags at what the binary actually needs.
+- **musl (Alpine).** pip on musl accepts only `musllinux` tags, so the
+  manylinux wheels are invisible there, and their binary asks for a glibc
+  loader musl does not have. Separate `musllinux_1_2` wheels are built inside
+  the pypa musllinux image. They are wheel only: the GitHub release and
+  `enola upgrade` stay on the glibc tarballs.
 
 A tag that claims less than the binary needs is the failure worth caring about:
 pip installs it happily and the binary then refuses to start.
@@ -76,6 +81,7 @@ pip installs it happily and the binary then refuses to start.
 | `build_wheel.py` | Builds one wheel. Stdlib only, deterministic output, rejects unknown platform tags and non-PEP-440 versions |
 | `local_test.sh` | darwin/arm64: build, wheel, install, run, uninstall, and the pipx-shaped paths |
 | `linux_test.sh` | Measures the glibc floor across build images, then checks each wheel installs where it should and is refused where it should not |
+| `musl_test.sh` | Builds the musllinux wheel as CI does, installs it with pip on Alpine 3.22 and 3.17, runs a snapshot, and checks pip picks musllinux on Alpine and manylinux on glibc |
 
 `local_test.sh` will not run `enola upgrade` unless the pip guard is compiled in.
 Without it that command performs a real self-update over the network and
