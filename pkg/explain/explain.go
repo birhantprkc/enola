@@ -1,11 +1,12 @@
 // Package explain produces a human-readable statistical summary of an Enola
 // architectural snapshot — the data behind `enola --explain <repository>`.
 //
-// It is intentionally a public package (not internal/) so that enola-enterprise
-// can reuse the base Report and append its own license-gated sections (dead code,
-// package metrics) before rendering. Compute works purely off the exported
-// bootstrap.Engine API, so it sees whatever the engine currently holds: run
-// GenerateSnapshot (or auto-load a snapshot) first.
+// It is intentionally a public package (not internal/) because a report is
+// something code outside this module may want to build and extend: Report is
+// exported data, Render turns it into text, and ExtraSections takes a caller's own
+// block. Compute works purely off the exported bootstrap.Engine API, so it sees
+// whatever the engine currently holds: run GenerateSnapshot (or auto-load a
+// snapshot) first.
 package explain
 
 import (
@@ -16,6 +17,9 @@ import (
 	"strings"
 
 	"github.com/enola-labs/enola/internal/facts"
+	"github.com/enola-labs/enola/internal/metrics"
+	"github.com/enola-labs/enola/internal/orphans"
+	"github.com/enola-labs/enola/internal/perf"
 	"github.com/enola-labs/enola/pkg/bootstrap"
 )
 
@@ -87,8 +91,8 @@ type VendoredReport struct {
 }
 
 // Report is the full statistical picture of a snapshot. Fields are plain types
-// only, so consumers in other modules (enola-enterprise) can read them without
-// importing enola's internal packages.
+// only, so consumers in other modules can read them without importing enola's
+// internal packages.
 // ArchitectureStatement is one named layer order the snapshot recognised. There
 // is one per language cohort, so a repository written in two things has two.
 type ArchitectureStatement struct {
@@ -149,8 +153,21 @@ type Report struct {
 	// with the code, and nothing has been excluded from the snapshot.
 	Vendored *VendoredReport `json:"vendored_candidates,omitempty"`
 
-	// ExtraSections are appended (e.g. by enterprise) and rendered after the
-	// base report.
+	// PackageMetrics, DeadCode and Performance are the three analyzers' aggregate
+	// blocks. They are data rather than pre-rendered text, like everything above:
+	// Render decides how the report reads, in one place.
+	//
+	// They are placed by ALTITUDE rather than in the order they were added.
+	// PackageMetrics renders straight after Impact analysis because both describe
+	// module coupling over the same edges, and reading Ca and Ce beside fan-in and
+	// fan-out is how a reader sees they are the same numbers seen two ways. DeadCode
+	// and Performance render straight after Code health because all three are
+	// symbol-level findings.
+	PackageMetrics *metrics.Summary `json:"package_metrics,omitempty"`
+	DeadCode       *orphans.Summary `json:"dead_code,omitempty"`
+	Performance    *perf.Summary    `json:"performance,omitempty"`
+
+	// ExtraSections are appended by a caller and rendered after the base report.
 	ExtraSections []Section `json:"-"`
 }
 
@@ -335,6 +352,20 @@ func Compute(eng *bootstrap.Engine) *Report {
 	}
 
 	computeHotspots(store, r)
+
+	// The three analyzers, each computed by the same core as its MCP tool so the
+	// report and the tool cannot disagree. A block with nothing in it is left nil
+	// rather than printed empty: a repository with no typed package has nothing to
+	// say about the main sequence, and saying it in zeroes is worse than silence.
+	if m := metrics.Summarize(store); m.Analyzed > 0 {
+		r.PackageMetrics = &m
+	}
+	if d := orphans.Summarize(store); d.Candidates > 0 {
+		r.DeadCode = &d
+	}
+	if p := perf.Summarize(store); p.FunctionsAnalyzed > 0 {
+		r.Performance = &p
+	}
 	return r
 }
 

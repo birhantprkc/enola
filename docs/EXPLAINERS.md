@@ -40,7 +40,7 @@ find*. It is **what happens to a finding after you have found it** — and that 
 entirely on the thing [SNAPSHOTS.md](SNAPSHOTS.md) describes: whether your graph is a
 value you can compare against another one, or a picture of right now.
 
-## Nineteen explainers: three proofs and sixteen estimates
+## Twenty-two explainers: three proofs and sixteen estimates
 
 An explainer reads the fact graph and emits **findings** — a claim, a confidence, and
 the entities the claim is about. There are nineteen, and they fall into six kinds:
@@ -153,9 +153,27 @@ the entities the claim is about. There are nineteen, and they fall into six kind
   library. It reports the initialisations responsible for the most of it, because that
   is the part splitting one would give back.
 
+  `package-metrics`, `dead-code` and `performance` are the three that ask about a
+  whole repository rather than a framework's conventions. `package-metrics` is
+  arithmetic over edges the graph already holds — Ca, Ce, instability, abstractness,
+  and distance from Martin's main sequence — so the numbers are exact and only the
+  claim that a large distance is a problem is an opinion. `dead-code` asks what
+  nothing references, in every language, and answers in three confidence tiers that
+  encode what the graph can actually see rather than how sure it feels: functions
+  high, types medium, everything else low. `performance` estimates where cost grows
+  with the input, from loop-nesting and call-in-loop props the parsers record; its
+  Big-O labels are a structural worst case, not a measurement, and nothing here
+  knows whether a loop is hot.
+
+  Two of them defer. `dead-code` says nothing about a method `dead-methods` has
+  claimed, and `performance` files no `call-in-loop` against a symbol `query-loops`
+  has claimed. In both pairs the narrow explainer answers from a type the graph
+  actually knows while the broad one answers from a keyword across ten languages,
+  and reporting both would be the same loop counted twice.
+
 What each one computes, every threshold it uses and what it deliberately ignores is in
 [ARCHITECTURE.md → Insights](../ARCHITECTURE.md#insights-explainers). The distinction
-that matters here is smaller and blunter: **three of the nineteen prove something. The
+that matters here is smaller and blunter: **three of the twenty-two prove something. The
 other sixteen estimate.** A cycle is a fact about your import graph. A god class is an opinion
 about your repository, expressed as a number, and reasonable people can disagree with
 it.
@@ -224,7 +242,7 @@ Comparing findings across two snapshots gives three outcomes, not two:
 
 The third bucket prevents statistical movement from being attributed to the change.
 
-Most of the nineteen explainers are relative to your repository. `mean + 2σ` moves when the
+Most of the twenty-two explainers are relative to your repository. `mean + 2σ` moves when the
 population moves. A ranked top-N list has fixed membership size, so when a worse
 offender is deleted the next module rises into the window — and a finding "appears" for
 a module nobody edited. Both are real effects of statistics, not of your work.
@@ -243,6 +261,79 @@ Eligibility is not enforcement. A finding fails the build only when `--fail-on` 
 its explainer. Lowering `--min-confidence` can include advisory findings such as god
 classes, deep dependency chains, large exported surfaces and complexity outliers when a
 team deliberately chooses to enforce them.
+
+### Why a finding list stops at fifty
+
+An explainer that reports a large repository one finding at a time buries every
+other explainer. On a large Rails application `dead-methods` produces 955 and
+`query-loops` 419; uncapped, the performance analyzer produced 1,254 of enola's own
+1,385. So an explainer reports at most fifty findings individually and the rest as a
+single rollup naming the number. The tool behind it still returns everything.
+
+The budget is per repository rather than per snapshot. A snapshot can hold several,
+and one budget spent in rank order is spent by whichever repository ranks first: a
+cluster where one repository carries 200 dead methods and another carries 3 would
+report nothing at all about the second, and a reader would take that for a clean
+repository rather than an unexamined one.
+
+The cap is not free, and what it costs decides who may use it. A diff identifies a
+finding by its explainer and its title, so a finding past the cap is invisible to
+`diff_snapshot`, and therefore to `check --fail-on`, except that the rollup's own
+number moves. For a **candidate** that is an acceptable trade: it was going to be
+verified before anyone acted on it. For a **proof** it is not — a repository
+carrying 231 dependency cycles would rank a newly introduced one past the cap, and
+a gate set on cycles would never fire. `cycles`, declared `layers`, `intent` and
+`constraints` are therefore never capped, however many they report.
+
+Some explainers buy their way past the cap with a second channel: props are diffed
+as fact attributes rather than as insights, so `dead-code` stamps `orphan_class` on
+the symbol, `performance` stamps `perf_risk`, and `package-metrics` stamps the
+Martin measures on the module. A change past the cap still shows up on the fact it
+is about, with a name attached, rather than only as a counter moving.
+
+`vendored-candidates` is the deliberate exception in the other direction. It lists
+every candidate uncapped, because it reports directories that look like somebody
+else's code and excludes nothing: a truncated report there is the same failure as a
+silent exclusion, in a quieter form.
+
+### Measured precision of the newest explainers
+
+`package-metrics`, `dead-code` and `performance` are gateable like any other inferred
+explainer. What follows is what they measure at on a twelve-repository cross-language
+sample, at the tier a gate would actually fire on. Four defects were found this way and
+all four are fixed; the numbers below are after.
+
+**`dead-code`, high-confidence tier: 37 of 37 on a Go service.** It was 37 of 41. Every
+one of the four misses was the same thing: a package-local function whose name collides
+with a Go builtin. A repository carrying its own `min` helper, written before Go 1.21
+had one, got no incoming call edge for `min(a, b)` at all — the call was attributed to
+the builtin — so a function called seventeen times read as referenced by nothing, at the
+tier documented as safest to delete. A package's own declaration now shadows the
+predeclared identifier, as it does in Go itself.
+
+**`dead-code` no longer spends its budget on other people's code.** On a C++ repository
+20 of 51 candidates sat under `contrib/`, third-party solvers the reader is not going to
+delete. Candidates under a directory conventionally holding other projects' code now
+rank last, so the capped list is the reader's own code first. They are ranked, not
+excluded: such a directory routinely holds first-party code too, and `find_orphans`
+still returns every candidate.
+
+**`performance`, high-severity tier.** On Rails applications these are ActiveRecord
+reads in loops (`find_by`, `where`, `save!`) and are what they say they are. Rust was
+the exception and is now the fifth ecosystem with its own expensive-call gate, beside
+Swift, the JVM, TypeScript and Dart, for the same reason each of those has one: an async
+runtime spells its in-memory primitives with the generic list's I/O verbs. A `send` on
+an mpsc channel is not a database write. On tokio that cut 42 high-severity findings to
+3 — a `file_type` per directory entry, a socket `connect` in a loop, and a
+`spawn_blocking` per iteration, which are the three that were real. Cargo's `benches/`
+tree also counts as test code now, as `tests/` already did; it accounted for 11 of the
+42.
+
+**Deference is worth what it costs.** On a large Rails application, `query-loops` claims
+333 symbols and suppresses 265 of the `call-in-loop` findings this explainer would
+otherwise file — a quarter of them — and `dead-methods` claims 268 symbols, suppressing
+184 dead-code candidates. Those were the same loops and the same methods, reported twice
+from a weaker signal.
 
 ## What it looks like when it works
 

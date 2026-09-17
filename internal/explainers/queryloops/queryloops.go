@@ -52,6 +52,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/enola-labs/enola/internal/explainers/common"
 	"github.com/enola-labs/enola/internal/facts"
 )
 
@@ -340,7 +341,7 @@ func (i associationIndex) on(model, method string) string {
 	return ""
 }
 
-func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.Insight, error) {
+func candidates(store *facts.Store) []finding {
 	// Two shapes, two prerequisites. The class-level shape needs the model
 	// classes; the association-read shape needs association facts and block
 	// bindings. Gating both on models would have silenced the association shape
@@ -350,7 +351,7 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 	models := modelClasses(store)
 	associations := buildAssociationIndex(store)
 	if len(models) == 0 && len(associations.byName) == 0 {
-		return nil, nil
+		return nil
 	}
 	preloadsElsewhere := buildPreloadIndex(store)
 
@@ -462,7 +463,7 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 		}
 	}
 	if len(found) == 0 {
-		return nil, nil
+		return nil
 	}
 	// One finding per (symbol, call): a loop body reporting the same read twice
 	// is the explainer counting its own passes, not two problems.
@@ -486,6 +487,65 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 		}
 		return found[i].symbol < found[j].symbol
 	})
+	return found
+}
+
+// ClaimedSymbols is the set of symbols this explainer reports on, computed by the
+// same pass that produces the findings themselves.
+//
+// It exists so a broader analyzer can stay silent where this one speaks. The
+// performance analyzer estimates a per-iteration I/O call from a keyword gate over
+// ten languages; this explainer answers the same question for Ruby from the
+// receiver's type, and was measured down from 1,698 candidates to 97. Where both
+// can see a symbol, the measured answer is the one worth reporting, and two
+// findings on one loop read as two problems.
+//
+// It is deliberately a direct call rather than a prop an annotator stamps or an
+// insight the consumer reads back. runExplainers is explicit that one explainer's
+// insights may never depend on another's having run, or the snapshot would depend
+// on registration order; and a prop would make this explainer's output depend on
+// whether that one is enabled in config. A pure function of the store has neither
+// problem, at the cost of running the candidate pass twice.
+//
+// The filter below is the emission loop's own: a surface this explainer excludes
+// is one it does not report, and so not one it claims.
+func ClaimedSymbols(store *facts.Store) map[string]struct{} {
+	reported, _ := reportable(store)
+	claimed := make(map[string]struct{}, len(reported))
+	for _, f := range reported {
+		claimed[f.symbol] = struct{}{}
+	}
+	return claimed
+}
+
+// reportable is the findings this explainer actually files, and the count it leaves
+// to the rollup: candidates, minus the surfaces it refuses to report, capped.
+//
+// The cap is inside it rather than applied by Explain, and that is load-bearing.
+// A claim silences the performance analyzer on that symbol, so claiming a finding
+// this explainer does not report would leave a loop that NEITHER reports — the cap
+// would quietly become a hole instead of a summary. Filtering before capping
+// matters for the same reason: capping first would spend budget on excluded
+// surfaces and emit fewer than the cap.
+func reportable(store *facts.Store) ([]finding, int) {
+	all := candidates(store)
+	kept := all[:0]
+	for _, f := range all {
+		if surfaceOf(f.file).excluded {
+			continue
+		}
+		kept = append(kept, f)
+	}
+	// Per repository: a single budget spent in rank order is spent by whichever
+	// repository ranks first, and the others read as clean when nobody looked.
+	return common.CapByRepo(kept, func(f finding) string { return f.repo })
+}
+
+func (e *Explainer) Explain(_ context.Context, store *facts.Store) ([]facts.Insight, error) {
+	// candidates() ranks deepest loop first, which is the order the budget is spent
+	// in: a query at depth 2 runs a product of two collections and is a different
+	// order of problem from one at depth 1.
+	found, omitted := reportable(store)
 
 	out := make([]facts.Insight, 0, len(found))
 	for _, f := range found {
@@ -528,9 +588,6 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 		// measured, and whether the loop is hot is not. This is a candidate to
 		// verify against a query count, which is the one oracle available here.
 		where := surfaceOf(f.file)
-		if where.excluded {
-			continue
-		}
 		confidence := 0.8
 		evidence := []facts.Evidence{{
 			File:   f.file,
@@ -559,6 +616,17 @@ func (e *Explainer) Explain(ctx context.Context, store *facts.Store) ([]facts.In
 			Evidence:      evidence,
 			Actions:       actions,
 			Informational: where.oneOff,
+		})
+	}
+	if omitted > 0 {
+		out = append(out, facts.Insight{
+			Title: fmt.Sprintf("Additional per-iteration queries: %d more", omitted),
+			Description: fmt.Sprintf(
+				"%d further loops issue a query per iteration and are not listed individually. They sit "+
+					"at the same or shallower loop depth as those above, which is the order the budget is "+
+					"spent in, and are candidates on the same footing.", omitted),
+			Confidence: 0.5,
+			Actions:    []string{"Fix the deepest loops first; they multiply the collection sizes"},
 		})
 	}
 	return out, nil
