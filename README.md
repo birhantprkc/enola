@@ -1,17 +1,19 @@
-# enola — architectural regression testing for AI-assisted development
+# enola — architecture context and regression testing across repositories
 
 [![MCP Toplist](https://mcptoplist.com/badge/glama%2Fenola-labs%2Fenola.svg)](https://mcptoplist.com/server/glama%2Fenola-labs%2Fenola)
 [![CI](https://github.com/enola-labs/enola/actions/workflows/ci.yml/badge.svg)](https://github.com/enola-labs/enola/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/enola-labs/enola)](https://github.com/enola-labs/enola/releases)
 [![License](https://img.shields.io/github/license/enola-labs/enola)](LICENSE)
 
-**Catch structural regressions that builds and tests cannot see:** new dependency cycles, violated layer boundaries, undeclared service dependencies, and changes that spread beyond their intended scope.
+Your system does not stop at a repository boundary. Your coding agent's context should not either.
 
-Enola maps your codebase before a change and compares it with the structure afterward. The result is about **this change** — not every problem already in the repository — and only the rules you choose can fail the build.
+Enola builds one deterministic graph across repositories, languages and frameworks. An agent can ask what a change depends on — and what depends on it — across service boundaries, instead of reading whole codebases and guessing how they connect.
+
+Before a change, Enola gives the agent the relevant structural context. Afterward, it checks what actually moved and catches structural regressions that builds and tests cannot see: new dependency cycles, violated layer boundaries, undeclared service dependencies, and changes that spread beyond their intended scope. The result is about **this change** — not every problem already in the repository — and only the rules you choose can fail the build.
 
 - **Exact, local measurement.** Parsed source and graph algorithms; no model, embeddings, upload, account, or license check.
-- **One graph across the repository.** [23 languages and formats](#supported-languages), detected automatically and combined into one baseline and verdict.
-- **One loop everywhere.** Your coding agent reads the graph before it edits and receives the verdict afterward; the same check runs from the CLI or in CI.
+- **One graph across the system.** Repositories using any of [23 supported languages and formats](#supported-languages) are combined into one graph, with cross-repository relationships linked through the interfaces Enola can demonstrate.
+- **One loop everywhere.** Your coding agent queries the graph before it edits and receives the verdict afterward; the same check runs from the CLI or in CI.
 
 **Documentation:** [Choose a guide by task](docs/README.md) · [CLI reference](docs/CLI.md) · [Architecture internals](ARCHITECTURE.md)
 
