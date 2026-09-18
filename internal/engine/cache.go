@@ -2417,7 +2417,13 @@ import (
 // at high confidence while they were called. Also adds `benches` to the shared
 // test-path segments (Cargo builds it as bench targets), which the TypeScript
 // extractor consults.
-const cacheVersion = "v268"
+// v269: TypeScript path aliases follow relative tsconfig extends chains, preserving
+// child-over-parent replacement and resolving each paths target relative to the file
+// that declared it. JSONC comments and trailing commas are accepted as TypeScript does.
+// v270: SvelteKit reads literal kit.alias fallbacks before generated config exists,
+// keeps tsconfig paths authoritative, and classifies $app/$env/$service-worker imports
+// as framework-provided rather than unresolved third-party dependencies.
+const cacheVersion = "v270"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //

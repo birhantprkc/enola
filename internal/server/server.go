@@ -1190,7 +1190,7 @@ func (s *Server) registerTools() {
 			"name= is a substring match; names= is exact (batch). files= and kinds= are OR filters; combined with other fields they are AND. " +
 			"output_mode: 'full' (default JSON) → 'compact' (markdown table) → 'names' (names+files) → 'summary' (counts only). " +
 			"Use output_mode='summary' first to size an unfamiliar result set, then 'compact'/'names' to save tokens on large sets, and pass max_tokens to hard-cap output. " +
-			"For dependencies, set prop='source' prop_value='internal'|'external'|'stdlib' to filter noise. " +
+			"For dependencies, set prop='source' prop_value='internal'|'external'|'stdlib'|'framework' to filter noise. " +
 			"Supports pagination via offset/limit (default 100, max 500).",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args queryFactsArgs) (*mcp.CallToolResult, any, error) {
 		store := s.eng.Store()
@@ -1692,6 +1692,17 @@ func (s *Server) registerTools() {
 		targetName, res, err := s.resolveNodeName(store, args.Target)
 		if err != nil {
 			return errorResult(err.Error()), nil, nil
+		}
+		if targetName != "" {
+			canonical, normalization := canonicalImpactTarget(store, targetName)
+			if canonical != targetName {
+				targetName = canonical
+				// An exact file_ref normally has no resolution note. Surface this
+				// normalization because it materially changes what was traversed.
+				if res == nil {
+					res = normalization
+				}
+			}
 		}
 		mode := resolveOutputMode(args.OutputMode, modeSummary)
 
@@ -2328,6 +2339,54 @@ type nameResolution struct {
 	Confidence   float64           `json:"confidence,omitempty"`
 	AutoPicked   bool              `json:"auto_picked,omitempty"`
 	Ambiguous    bool              `json:"ambiguous"`
+}
+
+// canonicalImpactTarget maps reference-only TypeScript/JavaScript file nodes to the
+// extensionless module target imports actually point at. A file_ref records top-level
+// calls for dead-code analysis; it is not the dependency node, so reverse traversal from
+// it can truthfully see no edges while the corresponding module has many callers.
+func canonicalImpactTarget(store *facts.Store, target string) (string, *nameResolution) {
+	exact := store.LookupByExactName(target)
+	referenceOnly := false
+	for _, f := range exact {
+		switch f.Kind {
+		case facts.KindFileRef, facts.KindTestRef:
+			referenceOnly = true
+		default:
+			return target, nil
+		}
+	}
+	if !referenceOnly {
+		return target, nil
+	}
+
+	ext := strings.ToLower(filepath.Ext(target))
+	switch ext {
+	case ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs":
+	default:
+		return target, nil
+	}
+	candidate := strings.TrimSuffix(target, filepath.Ext(target))
+	// A module target may be an implicit graph node (relations name it even when no
+	// standalone fact does), so confirm it through either a fact or a relation.
+	confirmed := len(store.LookupByExactName(candidate)) > 0
+	if !confirmed {
+		for _, f := range store.All() {
+			for _, rel := range f.Relations {
+				if rel.Target == candidate {
+					confirmed = true
+					break
+				}
+			}
+			if confirmed {
+				break
+			}
+		}
+	}
+	if !confirmed {
+		return target, nil
+	}
+	return candidate, &nameResolution{Query: target, Matched: candidate, AutoPicked: true}
 }
 
 // resolveNodeName resolves a user-provided name to an exact fact name.
@@ -4051,7 +4110,7 @@ func (s *Server) renderTraverseSummary(store *facts.Store, resp traverseResponse
 	}
 
 	// Internal vs external split for dependency nodes (looked up via the fact store).
-	var internal, external, stdlib int
+	var internal, external, stdlib, framework int
 	for _, n := range resp.Nodes {
 		if n.Depth == 0 || n.Kind != facts.KindDependency {
 			continue
@@ -4065,12 +4124,14 @@ func (s *Server) renderTraverseSummary(store *facts.Store, resp traverseResponse
 				stdlib++
 			case "internal":
 				internal++
+			case "framework":
+				framework++
 			}
 			break
 		}
 	}
-	if internal+external+stdlib > 0 {
-		fmt.Fprintf(&sb, "## Dependency sources\n\n- internal: %d\n- external: %d\n- stdlib: %d\n\n", internal, external, stdlib)
+	if internal+external+stdlib+framework > 0 {
+		fmt.Fprintf(&sb, "## Dependency sources\n\n- internal: %d\n- external: %d\n- stdlib: %d\n- framework: %d\n\n", internal, external, stdlib, framework)
 	}
 
 	if len(byModule) > 0 {
