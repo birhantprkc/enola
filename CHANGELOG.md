@@ -7,7 +7,7 @@ The full per-release change lists — every Added, Changed and Fixed line — ar
 [enola.tech/changelog](https://enola.tech/changelog). This file is the same history at
 the resolution a reader of the repository needs.
 
-## Unreleased
+## v0.4.21 — 2026-09-18
 
 **Dead code, performance and package metrics become part of enola**
 
@@ -53,6 +53,19 @@ the resolution a reader of the repository needs.
 - `performance` annotates the symbols it reports at high severity (`perf_risk`), so
   a diff can name the function a change made expensive rather than only report that
   a counter moved. `dead-code` and `package-metrics` already did this.
+- A `tsconfig.json` that declares no `paths` of its own now follows its `extends`
+  chain, rebasing the inherited targets onto the declaring file. A SvelteKit
+  repository whose tsconfig extends the generated `.svelte-kit/tsconfig.json` had no
+  aliases at all, so every aliased import read as an external dependency. A child's
+  own `paths` still replaces the inherited map, as TypeScript does, and an `extends`
+  cycle yields no aliases rather than a partial set.
+- `kit.alias` literals in `svelte.config.js` fill the aliases the effective tsconfig
+  does not declare, and `$lib` falls back to `src/lib`. Computed entries
+  (`path.resolve(...)`, spreads) and an `alias` map outside `kit` are skipped.
+- SvelteKit's virtual modules (`$app/*`, `$env/*`, `$service-worker`) are recorded as
+  framework-provided dependencies instead of unpinned third-party ones.
+- `cacheVersion` moves to `v270`: extraction caches are rebuilt and pinned baselines
+  may show a one-time change.
 
 **Upgrading:** the added explainers change the insight set, so the snapshot ID
 moves and every pinned baseline will report new findings on the first snapshot after
