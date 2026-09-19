@@ -393,7 +393,7 @@ func TestLoadDashboardSnapshotKeepsOrdinaryRepoScope(t *testing.T) {
 }
 
 // TestNewServer exercises the public server constructor and its accessors,
-// which enterprise code relies on to register license-gated tools before Run.
+// which the end-to-end tests rely on to register an extra tool before Run.
 func TestNewServer(t *testing.T) {
 	eng, cfg, err := bootstrap.NewEngine(bootstrap.Options{
 		ConfigPath: filepath.Join(t.TempDir(), "no-such-config.yaml"),
@@ -406,7 +406,7 @@ func TestNewServer(t *testing.T) {
 		t.Fatalf("NewServer: %v", err)
 	}
 	if srv.MCP() == nil {
-		t.Error("MCP() returned nil; enterprise code needs it to register extra tools")
+		t.Error("MCP() returned nil; the end-to-end tests need it to connect a transport")
 	}
 }
 
