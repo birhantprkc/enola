@@ -7,6 +7,45 @@ The full per-release change lists — every Added, Changed and Fixed line — ar
 [enola.tech/changelog](https://enola.tech/changelog). This file is the same history at
 the resolution a reader of the repository needs.
 
+## v0.4.22 — 2026-09-22
+
+**enola installs as a Claude Code plugin, and Go stops reading a function used as a value as dead**
+
+- The repository now ships a Claude Code plugin with a marketplace entry
+  (`.claude-plugin/`, `plugins/enola/`). Installing it registers the `enola` MCP
+  server, the SessionStart and Stop hooks, and two skills: one routing architecture
+  questions to the right tool, and a setup skill that checks for — or installs — the
+  CLI. The plugin configures, it does not install: `enola` must be on PATH, and the
+  setup skill runs `enola doctor` or the install script.
+- A Go function referenced as a value now records a call edge to its callee. The body
+  walk followed `CallExpr` only, so a dispatch-table entry, a callback argument, and a
+  package-level `var` or `const` initializer all left the callee with no incoming edge,
+  and it read as dead code at high confidence — the tier documented as the safest to
+  delete. On enola itself, 23 of 27 first-party high-confidence findings were one of
+  those two shapes, every one false. Resolution stays narrow: only a bare identifier
+  naming the package's own top-level function binds, a redeclared name suppresses the
+  edge, and package-level references hang on the package fact, whose holding var has no
+  symbol of its own.
+- `cacheVersion` moves to `v271`: Go repositories re-extract once and pinned
+  baselines over Go code may show a one-time change — callees that read as dead gain
+  an incoming edge and the findings that rested on them move.
+- An allocation pass over the extraction core, output-identical with no cache effect:
+  Scala parses each file once instead of twice, the C++ `#define` scan materialises a
+  line only when its first physical line can be a directive (the Linux kernel tree
+  allocates 4.8GB and 26M allocations less), and Python builds its symbol index from
+  the extraction parse instead of rereading and reparsing every file. Facts route
+  every `Props` access through accessors, the engine positions insights without
+  deep-copying the fact set, and the name index spends no slice header on the 98% of
+  names that hold one fact. Kernel steady heap falls 1,421 to 1,343MiB;
+  `facts.jsonl` and `insights.json` hashes are unchanged.
+- Fixed: the MCP `generate_snapshot` schema required `repo_path` even though it
+  defaults to the configured path; it is now optional, so a host that omits it no
+  longer fails validation before the default applies.
+- Unused seams in the public `pkg/` surface are removed: `Runner.With*`, the dashboard
+  overlay, `RegisterToolWeights`, `pkg/status` footprint, `pkg/facts` re-exports and
+  the unwired helpers. `Server.MCP` stays; extension authors linking a removed seam
+  need to update.
+
 ## v0.4.21 — 2026-09-18
 
 **Dead code, performance and package metrics become part of enola**
