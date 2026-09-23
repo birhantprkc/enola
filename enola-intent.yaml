@@ -68,6 +68,9 @@ layers:
       - "internal/metrics/**"
       - "internal/orphans/**"
       - "internal/perf/**"
+      # Endpoint impact: a route -> controller -> model walk over the store. It is
+      # analysis, not fact model, so it sits here rather than in internal/facts.
+      - "internal/endpoint/**"
       - "internal/renderers/**"
       - "internal/diff/**"
       - "internal/conformance/**"
@@ -83,6 +86,9 @@ layers:
       # dialect (forward slashes on every host) that internal/facts, every
       # extractor and every explainer build their paths with.
       - "internal/factpath/**"
+      # internal/pathglob is core: the ignore and test-glob matcher the engine walk,
+      # the config tests and perf share. It depends only on factpath.
+      - "internal/pathglob/**"
       - "internal/version/**"
       - "internal/filelock/**"
       - "internal/parallel/**"
