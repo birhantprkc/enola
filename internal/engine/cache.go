@@ -20,6 +20,44 @@ import (
 	"github.com/enola-labs/enola/pkg/plugin"
 )
 
+// v273: the hierarchical rule crosses call boundaries. Go records, per in-loop call,
+// whether the callee is handed an element of the caller's loop (calls_on_loop_element)
+// and, per function, whether its own loops walk something a caller passed it
+// (loops_over_param). `for _, x := range xs { g(x) }` where g loops over what it
+// received visits each element of each x once across the whole nest, so the callee is
+// finishing the caller's walk rather than running one per element, and its depth no
+// longer compounds. Both halves are required: passing the element proves nothing when
+// the callee loops over package state, and looping over a parameter proves nothing
+// when the caller passes something else.
+//
+// A value computed from the element counts as the element (`rel := norm(f); use(rel)`),
+// or the rule would only ever fire on a bare loop variable, which is the minority of
+// call sites. That taint also reaches the LOCAL hierarchical rule, which is why nested
+// loops over derived collections stopped counting too.
+//
+// On this repository the high tier fell from 250 to 103. A second labeled sample, ten
+// of the 170 findings that stopped being high, was read to check the direction: all
+// ten were over-counts (internal/perf/testdata/high_tier_labels.jsonl, sample
+// "removed"). The two paths that compute effective depth had to be changed together;
+// they answer the same question, once memoised per name and once recomputed per fact.
+//
+// v272: Go's scaling_loop_depth gains three bounded-loop rules, so nesting that
+// cannot grow with the input stops entering the Big-O exponent. A loop with a literal
+// trip count (`for d := 1; d <= 10; d++`), a loop that advances an index its enclosing
+// loop already advances (one scan of a buffer, not a scan per byte), and a range over
+// a collection rebuilt from a composite literal on every iteration (at most a couple
+// of entries, however large the graph) are each proved constant syntactically.
+//
+// The hierarchical discount that already existed had to be split from the new ones:
+// reaching a collection through an outer loop's variable cancels a factor only when
+// the outer loop contributed one, so under a constant outer it must not apply, or a
+// plain walk reads as O(1). A hierarchical loop still passes the hierarchy on.
+//
+// Measured on this repository: a hand-labeled sample of 35 of its 250 high findings
+// held 3 that scale and 32 that count a loop which cannot
+// (internal/perf/testdata/high_tier_labels.jsonl). Every rule fails closed, so a loop
+// it cannot prove bounded keeps counting.
+//
 // v271: Go records a function used as a VALUE. analyzeBody walked bodies for CallExpr
 // only, so `"go.mod": readGoMod` in a dispatch table and `rc.lock(f, "yarn.lock",
 // yarnLock)` as an argument left the callee with no incoming edge; package-level var
@@ -2434,7 +2472,7 @@ import (
 // v270: SvelteKit reads literal kit.alias fallbacks before generated config exists,
 // keeps tsconfig paths authoritative, and classifies $app/$env/$service-worker imports
 // as framework-provided rather than unresolved third-party dependencies.
-const cacheVersion = "v271"
+const cacheVersion = "v273"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //

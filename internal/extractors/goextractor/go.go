@@ -395,7 +395,7 @@ func (e *GoExtractor) extractFunc(fset *token.FileSet, fn *ast.FuncDecl, relFile
 			pkgFuncs:   pkgFuncs,
 		}
 		ctx.localTypes = collectLocalTypes(fn.Body, ctx)
-		m := analyzeBody(fn.Body, ctx, qualifiedName)
+		m := analyzeBody(fn.Body, ctx, qualifiedName, funcParamNames(fn))
 		for _, call := range m.calls {
 			symbolFact.Relations = append(symbolFact.Relations, facts.Relation{
 				Kind:   facts.RelCalls,
@@ -450,6 +450,15 @@ func (e *GoExtractor) extractFunc(fset *token.FileSet, fn *ast.FuncDecl, relFile
 				m.callsInScalingLoop = []string{}
 			}
 			symbolFact.SetProp("calls_in_scaling_loop", m.callsInScalingLoop)
+			// Emitted even when empty, for the same reason as calls_in_scaling_loop:
+			// an absent key cannot be told from "no such call".
+			if m.callsOnLoopElement == nil {
+				m.callsOnLoopElement = []string{}
+			}
+			symbolFact.SetProp("calls_on_loop_element", m.callsOnLoopElement)
+		}
+		if m.loopsOverParam {
+			symbolFact.SetProp("loops_over_param", true)
 		}
 		if m.recursiveSelf {
 			symbolFact.SetProp("recursive_self", true)
@@ -637,11 +646,20 @@ type bodyMetrics struct {
 	// lives in another package and this pass sees one. The seam binder decides.
 	clientPathCalls    []string
 	callsInScalingLoop []string // subset of calls invoked at scaling (unbounded) nesting depth >= 1
-	loopDepth          int      // max nesting depth of for/range loops
-	scalingLoopDepth   int      // max nesting counting only unbounded (input-scaling) loops
-	loopCount          int      // total number of for/range loops
-	cyclomatic         int      // McCabe complexity (1 + decision points)
-	recursiveSelf      bool     // body directly calls the enclosing function
+	// callsOnLoopElement is the subset of callsInScalingLoop handed an element of an
+	// enclosing loop — as an argument or as the receiver. Paired with the callee's
+	// own loopsOverParam it is the cross-call form of the hierarchical rule: the
+	// callee is continuing this walk, not starting one per element.
+	callsOnLoopElement []string
+	// loopsOverParam records that a scaling loop in this body walks something reached
+	// through a parameter or the receiver, which is what makes it a continuation of
+	// the caller's walk rather than an independent traversal.
+	loopsOverParam   bool
+	loopDepth        int  // max nesting depth of for/range loops
+	scalingLoopDepth int  // max nesting counting only unbounded (input-scaling) loops
+	loopCount        int  // total number of for/range loops
+	cyclomatic       int  // McCabe complexity (1 + decision points)
+	recursiveSelf    bool // body directly calls the enclosing function
 }
 
 // analyzeBody walks a function body once and extracts both the call edges
@@ -653,13 +671,14 @@ type bodyMetrics struct {
 // is inside every loop on the stack whose body it lexically falls within. Calls
 // inside func literals are attributed by lexical nesting; interface-dispatch
 // targets remain unresolved exactly as before.
-func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
+func analyzeBody(body ast.Node, ctx resolveCtx, selfName string, params map[string]bool) bodyMetrics {
 	var m bodyMetrics
 	decisions := 0
 	seen := make(map[string]bool)
 	instSeen := make(map[string]bool)
 	inLoopSeen := make(map[string]bool)
 	inScalingSeen := make(map[string]bool)
+	onElementSeen := make(map[string]bool)
 	var loopEnds []token.Pos // end positions of enclosing loops
 	// scalingEnds tracks only the enclosing loops that scale with input (a `for {}` event
 	// loop and a `range` over a composite literal are excluded), so len(scalingEnds) is
@@ -677,6 +696,9 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 	// independent/same collection (all-pairs). A hierarchical loop visits each element
 	// once across the whole nest, so it adds no factor of n to the Big-O exponent.
 	var loopScopes []loopScope
+	// Locals whose contents cannot grow with the input, resolved once for the body
+	// so the range case below is a lookup rather than a second walk per loop.
+	boundedVars := boundedLocals(body)
 
 	ast.Inspect(body, func(n ast.Node) bool {
 		if n == nil {
@@ -703,15 +725,31 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 			if len(loopEnds) > m.loopDepth {
 				m.loopDepth = len(loopEnds)
 			}
-			if !goForBounded(x) {
+			// A loop whose trip count is fixed at compile time, and one that merely
+			// advances a cursor an enclosing loop already advances, both leave the
+			// exponent alone. They differ in whether the BODY repeats: a constant
+			// loop runs a constant number of times, so a query inside it is not an
+			// N+1 candidate, while a shared-cursor loop runs as many times as the
+			// scan it is part of and stays one.
+			constBounded := goForConstBounded(x)
+			sharesCursor := goForSharesOuterCursor(x, loopScopes)
+			forScales := !goForBounded(x) && !constBounded && !sharesCursor
+			if forScales && referencesParam(x.Cond, params) {
+				// `for i := 0; i < len(s); i++` walks s just as `range s` does; the
+				// parameter is named in the bound rather than in a range expression.
+				m.loopsOverParam = true
+			}
+			if forScales {
 				scalingEnds = append(scalingEnds, x.End())
 				if len(scalingEnds) > m.scalingLoopDepth {
 					m.scalingLoopDepth = len(scalingEnds)
 				}
 			}
 			// A `for {}` is infinite, not constant: it repeats.
-			repeatEnds = append(repeatEnds, x.End())
-			loopScopes = append(loopScopes, loopScope{end: x.End(), vars: forLoopVars(x)})
+			if !constBounded {
+				repeatEnds = append(repeatEnds, x.End())
+			}
+			loopScopes = append(loopScopes, loopScope{end: x.End(), vars: forLoopVars(x), cursor: forCursor(x), amortizes: forScales})
 		case *ast.RangeStmt:
 			m.loopCount++
 			decisions++
@@ -719,13 +757,20 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 			if len(loopEnds) > m.loopDepth {
 				m.loopDepth = len(loopEnds)
 			}
-			if !goRangeBounded(x) {
+			// A range whose trip count is not constant amortizes inner hierarchical
+			// loops whether or not it scales itself; see loopScope.amortizes.
+			rangeAmortizes := false
+			if !goRangeBounded(x) && !goRangeBoundedLocal(x, boundedVars) {
+				rangeAmortizes = true
 				// A hierarchical loop — one whose ranged collection is reached THROUGH
 				// an enclosing loop variable (`range pkg.Files`, `range pkgs[pkgDir]…`)
 				// — visits each element once across the whole nest, so it adds no factor
 				// of n to the scaling exponent. Only a loop over an independent or same
 				// collection (all-pairs) multiplies. Derived loops still repeat, so they
 				// stay N+1 candidates (repeatEnds) — only the scaling depth is spared.
+				if referencesParam(x.X, params) {
+					m.loopsOverParam = true
+				}
 				if !referencesLoopVar(x.X, loopScopes) {
 					scalingEnds = append(scalingEnds, x.End())
 					if len(scalingEnds) > m.scalingLoopDepth {
@@ -734,7 +779,22 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 				}
 				repeatEnds = append(repeatEnds, x.End())
 			}
-			loopScopes = append(loopScopes, loopScope{end: x.End(), vars: rangeLoopVars(x)})
+			loopScopes = append(loopScopes, loopScope{end: x.End(), vars: rangeLoopVars(x), amortizes: rangeAmortizes})
+		case *ast.AssignStmt:
+			// A value computed from the current element is still the current element
+			// as far as the traversal is concerned: `rel := norm(f); use(rel)` hands
+			// `use` what the loop is walking, one indirection later. Without this the
+			// cross-call hierarchical rule only ever fires on a bare loop variable,
+			// which is the minority of call sites.
+			if len(loopScopes) > 0 && referencesLoopVar(rhsExpr(x), loopScopes) {
+				top := &loopScopes[len(loopScopes)-1]
+				for _, lhs := range x.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok && id.Name != "_" {
+						top.vars = append(top.vars, id.Name)
+					}
+				}
+			}
+			decisions += 0
 		case *ast.IfStmt:
 			decisions++
 		case *ast.CaseClause:
@@ -785,6 +845,10 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 				inScalingSeen[resolved] = true
 				m.callsInScalingLoop = append(m.callsInScalingLoop, resolved)
 			}
+			if len(scalingEnds) > 0 && !onElementSeen[resolved] && passesLoopElement(x, loopScopes) {
+				onElementSeen[resolved] = true
+				m.callsOnLoopElement = append(m.callsOnLoopElement, resolved)
+			}
 			if resolved == selfName {
 				m.recursiveSelf = true
 			}
@@ -821,6 +885,19 @@ func analyzeBody(body ast.Node, ctx resolveCtx, selfName string) bodyMetrics {
 type loopScope struct {
 	end  token.Pos
 	vars []string
+	// cursor is the index variable a three-clause for loop declares and steps, or ""
+	// for a range loop and for a for loop that declares none. An inner loop testing
+	// this variable is advancing the same cursor; see goForSharesOuterCursor.
+	cursor string
+	// amortizes records whether an inner hierarchical loop may be discounted against
+	// this one. Reaching a collection through an outer loop's variable cancels a
+	// factor only when the outer loop contributed one: under a CONSTANT outer there
+	// is nothing to cancel, and discounting anyway reported a plain walk as O(1).
+	//
+	// A hierarchical loop amortizes even though it does not scale itself, because it
+	// passes the hierarchy on — the elements it yields still belong to the
+	// collection the scaling loop at the root of the chain is walking.
+	amortizes bool
 }
 
 // rangeLoopVars returns the key/value variable names a range loop introduces.
@@ -853,8 +930,14 @@ func forLoopVars(x *ast.ForStmt) []string {
 // enclosing loop — i.e. the collection is reached through an outer loop element
 // (a hierarchical walk) rather than being independent of the outer loops.
 func referencesLoopVar(expr ast.Expr, scopes []loopScope) bool {
+	if expr == nil {
+		return false
+	}
 	vars := map[string]bool{}
 	for _, s := range scopes {
+		if !s.amortizes {
+			continue
+		}
 		for _, v := range s.vars {
 			if v != "" && v != "_" {
 				vars[v] = true
@@ -1416,4 +1499,369 @@ func collectPackageFuncs(files []*ast.File) map[string]bool {
 		}
 	}
 	return out
+}
+
+// --- bounded-loop rules -----------------------------------------------------
+//
+// A loop only belongs in the Big-O exponent when its trip count grows with the
+// input. Counting lexical nesting instead reports a cubic worst case for code that
+// is linear, and on this repository's own tree that was most of the high tier: a
+// hand-labeled sample of 35 high findings held 3 that scaled and 32 that counted a
+// loop which cannot (internal/perf/testdata/high_tier_labels.jsonl).
+//
+// goForBounded and goRangeBounded were the first two rules. These are the next
+// three. Each is a syntactic proof, and each fails closed: a loop it cannot prove
+// bounded keeps counting, so the effect is only ever to remove an over-count.
+
+// goForConstBounded reports whether a three-clause for loop runs a number of times
+// fixed when it is written: `for d := 1; d <= 10; d++`. The constant may be large,
+// which does not matter — it does not grow with the input, so it contributes no
+// factor of n.
+//
+// Only a literal bound counts. A named constant would be sound too, but an
+// identifier here cannot be told from a variable without type information, and
+// reading `for i := 0; i < n; i++` as bounded would discount the commonest real
+// loop there is.
+func goForConstBounded(x *ast.ForStmt) bool {
+	if x.Init == nil || x.Cond == nil || x.Post == nil {
+		return false
+	}
+	as, ok := x.Init.(*ast.AssignStmt)
+	if !ok || as.Tok != token.DEFINE || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+		return false
+	}
+	name, ok := identNameOf(as.Lhs[0])
+	if !ok || !isIntLiteral(as.Rhs[0]) {
+		return false
+	}
+	// The step has to move the variable the bound is about, or the bound proves
+	// nothing about how often the body runs.
+	inc, ok := x.Post.(*ast.IncDecStmt)
+	if !ok {
+		return false
+	}
+	if n, ok := identNameOf(inc.X); !ok || n != name {
+		return false
+	}
+	cmp, ok := x.Cond.(*ast.BinaryExpr)
+	if !ok {
+		return false
+	}
+	switch cmp.Op {
+	case token.LSS, token.LEQ, token.GTR, token.GEQ, token.NEQ:
+	default:
+		return false
+	}
+	l, lok := identNameOf(cmp.X)
+	return lok && l == name && isIntLiteral(cmp.Y)
+}
+
+// goForSharesOuterCursor reports whether a for loop advances an index that an
+// enclosing for loop is already advancing.
+//
+//	for i := 0; i < len(b); i++ {
+//	        if b[i] != '"' { continue }
+//	        for i++; i < len(b) && b[i] != '"'; i++ { … }
+//	}
+//
+// That is one pass over b, not a pass per byte: the inner loop moves the same
+// cursor forward, so across the whole nest the body runs len(b) times. Lexically it
+// is two levels, and counting it as two is what reported O(n²) for a scanner.
+//
+// The loop must declare no index of its own, and its condition must test the outer
+// loop's induction variable. Both halves matter: a loop with its own init counts
+// normally, and a condition that merely mentions some outer variable (a chain walk
+// like `for x != nil { x = x.next }`) does not share a cursor.
+func goForSharesOuterCursor(x *ast.ForStmt, scopes []loopScope) bool {
+	if x.Init != nil || x.Cond == nil {
+		return false
+	}
+	cursors := map[string]bool{}
+	for _, s := range scopes {
+		if s.cursor != "" {
+			cursors[s.cursor] = true
+		}
+	}
+	if len(cursors) == 0 {
+		return false
+	}
+	shared := false
+	ast.Inspect(x.Cond, func(n ast.Node) bool {
+		if shared {
+			return false
+		}
+		if id, ok := n.(*ast.Ident); ok && cursors[id.Name] {
+			shared = true
+		}
+		return !shared
+	})
+	return shared
+}
+
+// forCursor returns the index variable a for loop declares and steps, or "" when it
+// has none. It is what goForSharesOuterCursor matches an inner loop against.
+func forCursor(x *ast.ForStmt) string {
+	as, ok := x.Init.(*ast.AssignStmt)
+	if !ok || as.Tok != token.DEFINE || len(as.Lhs) != 1 {
+		return ""
+	}
+	name, ok := identNameOf(as.Lhs[0])
+	if !ok {
+		return ""
+	}
+	// Stepped in the post clause, or in the body — a scanner routinely advances its
+	// own index and leaves the post clause empty.
+	if inc, isInc := x.Post.(*ast.IncDecStmt); isInc {
+		if n, ok := identNameOf(inc.X); ok && n == name {
+			return name
+		}
+	}
+	if x.Post == nil {
+		return name
+	}
+	return ""
+}
+
+// goRangeBoundedLocal reports whether a range loop walks a local collection that
+// cannot grow with the input — one built from a composite literal and appended to a
+// fixed number of times, like the at-most-two path forms in
+// internal/facts.Graph.GovernedByPage:
+//
+//	forms := []string{mf.File}
+//	if trimmed := …; trimmed != mf.File { forms = append(forms, trimmed) }
+//	for _, form := range forms { … }
+//
+// Ranging that adds a factor of two, not a factor of n, however many facts the graph
+// holds. bounded is the set boundedLocals proved for this body.
+func goRangeBoundedLocal(x *ast.RangeStmt, bounded map[string]bool) bool {
+	if len(bounded) == 0 {
+		return false
+	}
+	name, ok := identNameOf(x.X)
+	return ok && bounded[name]
+}
+
+// boundedLocals returns the local variables whose contents cannot grow with the
+// input: every assignment to them is a composite literal, every append adds a fixed
+// number of elements, and no append happens anywhere the literal is not re-applied.
+//
+// That last condition is what separates `forms` above from an accumulator. Both are
+// assigned a literal and appended to; the difference is WHERE. `forms` is rebuilt
+// from its literal on every iteration of the loop that appends to it, so it never
+// carries more than a couple of entries. An accumulator is initialised once outside
+// the loop that fills it, and grows with whatever the loop walks. So an append
+// counts only when the same loop body also re-initialises the variable.
+//
+// Name-based, and therefore approximate in the presence of shadowing — the same
+// approximation the rest of this walker makes. It fails closed: an unproven
+// variable is simply not in the set.
+func boundedLocals(body ast.Node) map[string]bool {
+	// For each name, the enclosing-loop extents (0 = function level) in which it is
+	// assigned a composite literal, and in which it is appended to.
+	inits := map[string]map[token.Pos]bool{}
+	appends := map[string]map[token.Pos]bool{}
+	disqualified := map[string]bool{}
+
+	var loopEnds []token.Pos
+	innermost := func() token.Pos {
+		if len(loopEnds) == 0 {
+			return 0
+		}
+		return loopEnds[len(loopEnds)-1]
+	}
+	note := func(m map[string]map[token.Pos]bool, name string) {
+		if m[name] == nil {
+			m[name] = map[token.Pos]bool{}
+		}
+		m[name][innermost()] = true
+	}
+
+	ast.Inspect(body, func(n ast.Node) bool {
+		if n == nil {
+			return false
+		}
+		for len(loopEnds) > 0 && n.Pos() >= loopEnds[len(loopEnds)-1] {
+			loopEnds = loopEnds[:len(loopEnds)-1]
+		}
+		switch x := n.(type) {
+		case *ast.ForStmt:
+			loopEnds = append(loopEnds, x.End())
+		case *ast.RangeStmt:
+			loopEnds = append(loopEnds, x.End())
+			// A variable that receives loop elements is whatever the loop walks.
+			for _, v := range rangeLoopVars(x) {
+				disqualified[v] = true
+			}
+		case *ast.AssignStmt:
+			for i, lhs := range x.Lhs {
+				name, ok := identNameOf(lhs)
+				if !ok {
+					// Writing through an index or a field grows a collection in a way
+					// this rule cannot see; refuse the variable entirely.
+					if id, found := rootIdent(lhs); found {
+						disqualified[id] = true
+					}
+					continue
+				}
+				if i >= len(x.Rhs) {
+					// A multi-value call (`a, b := f()`): the contents come from
+					// somewhere this rule cannot follow.
+					disqualified[name] = true
+					continue
+				}
+				switch rhs := x.Rhs[i].(type) {
+				case *ast.CompositeLit:
+					note(inits, name)
+				case *ast.CallExpr:
+					if isFixedAppendTo(rhs, name) {
+						note(appends, name)
+					} else {
+						disqualified[name] = true
+					}
+				default:
+					disqualified[name] = true
+				}
+			}
+		}
+		return true
+	})
+
+	out := map[string]bool{}
+	for name, initScopes := range inits {
+		if disqualified[name] {
+			continue
+		}
+		ok := true
+		for scope := range appends[name] {
+			if !initScopes[scope] {
+				ok = false // appended where the literal is not re-applied: an accumulator
+				break
+			}
+		}
+		if ok {
+			out[name] = true
+		}
+	}
+	return out
+}
+
+// isFixedAppendTo reports whether call is `append(name, a, b, …)` with a fixed
+// number of elements. A spread (`append(a, b...)`) adds however many b holds, which
+// is exactly the growth this rule must not wave through.
+func isFixedAppendTo(call *ast.CallExpr, name string) bool {
+	id, ok := call.Fun.(*ast.Ident)
+	if !ok || id.Name != "append" || call.Ellipsis.IsValid() || len(call.Args) == 0 {
+		return false
+	}
+	first, ok := identNameOf(call.Args[0])
+	return ok && first == name
+}
+
+// identNameOf returns the name of a bare identifier expression.
+func identNameOf(e ast.Expr) (string, bool) {
+	id, ok := e.(*ast.Ident)
+	if !ok {
+		return "", false
+	}
+	return id.Name, true
+}
+
+// rootIdent returns the identifier at the base of an index or selector chain, so an
+// assignment through `m[k]` or `s.field` can be charged to `m` and `s`.
+func rootIdent(e ast.Expr) (string, bool) {
+	for {
+		switch x := e.(type) {
+		case *ast.Ident:
+			return x.Name, true
+		case *ast.IndexExpr:
+			e = x.X
+		case *ast.SelectorExpr:
+			e = x.X
+		case *ast.StarExpr:
+			e = x.X
+		case *ast.ParenExpr:
+			e = x.X
+		default:
+			return "", false
+		}
+	}
+}
+
+// isIntLiteral reports whether e is an integer literal, optionally signed.
+func isIntLiteral(e ast.Expr) bool {
+	if u, ok := e.(*ast.UnaryExpr); ok && (u.Op == token.SUB || u.Op == token.ADD) {
+		e = u.X
+	}
+	lit, ok := e.(*ast.BasicLit)
+	return ok && lit.Kind == token.INT
+}
+
+// referencesParam reports whether expr reaches into a parameter or the receiver.
+// A loop over one of those walks something the CALLER handed in, which is what makes
+// it a continuation of the caller's traversal rather than a traversal of its own.
+func referencesParam(expr ast.Expr, params map[string]bool) bool {
+	// A for statement may have no condition (`for i := 0; ; i++`), and ast.Inspect
+	// panics on a nil node rather than ignoring it.
+	if expr == nil || len(params) == 0 {
+		return false
+	}
+	found := false
+	ast.Inspect(expr, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		if id, ok := n.(*ast.Ident); ok && params[id.Name] {
+			found = true
+		}
+		return !found
+	})
+	return found
+}
+
+// passesLoopElement reports whether a call hands the callee an element of an
+// enclosing loop, as an argument or as the receiver it is invoked on.
+func passesLoopElement(call *ast.CallExpr, scopes []loopScope) bool {
+	for _, arg := range call.Args {
+		if referencesLoopVar(arg, scopes) {
+			return true
+		}
+	}
+	if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+		return referencesLoopVar(sel.X, scopes)
+	}
+	return false
+}
+
+// funcParamNames returns the parameter and receiver names of a function
+// declaration, the set referencesParam matches a ranged collection against.
+func funcParamNames(fn *ast.FuncDecl) map[string]bool {
+	out := map[string]bool{}
+	add := func(fl *ast.FieldList) {
+		if fl == nil {
+			return
+		}
+		for _, f := range fl.List {
+			for _, n := range f.Names {
+				if n.Name != "" && n.Name != "_" {
+					out[n.Name] = true
+				}
+			}
+		}
+	}
+	add(fn.Recv)
+	if fn.Type != nil {
+		add(fn.Type.Params)
+	}
+	return out
+}
+
+// rhsExpr wraps an assignment's right-hand side so it can be inspected as one node.
+// A multi-value assignment has several, and any of them carrying the loop element is
+// enough to taint the whole statement's targets — which is the conservative direction
+// for a rule whose only effect is to REMOVE an over-count.
+func rhsExpr(x *ast.AssignStmt) ast.Expr {
+	if len(x.Rhs) == 1 {
+		return x.Rhs[0]
+	}
+	return &ast.CompositeLit{Elts: x.Rhs}
 }
