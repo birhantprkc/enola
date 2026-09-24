@@ -7,7 +7,7 @@
 
 **enola builds one graph of your software system: every repository, language and framework in it, and how they connect.**
 
-It reads your source code and records what is there: modules, functions, API routes, database access, message topics, infrastructure. Then it links those pieces, inside each repository and across them. A frontend's call to `/api/orders` is linked to the Go handler that serves it; one service's Kafka producer is linked to the service that consumes the topic.
+It reads your source code and records what is there: modules, functions, API routes, database access, message topics, infrastructure. Then it links those pieces, inside each repository and across them. A frontend's call to `/api/orders` is linked to the Go handler that serves it; one service's Kafka producer is linked to the service that consumes the topic. [What exactly is in the graph](docs/GRAPH.md).
 
 You can ask that graph questions yourself, give it to your coding agent, or build your own tools on it. The graph comes from parsing your code; no AI model takes part in producing it. The same code always produces the same graph, and it never leaves your machine.
 
