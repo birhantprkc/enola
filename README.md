@@ -5,7 +5,7 @@
 [![Release](https://img.shields.io/github/v/release/enola-labs/enola)](https://github.com/enola-labs/enola/releases)
 [![License](https://img.shields.io/github/license/enola-labs/enola)](LICENSE)
 
-**enola builds one graph of your software system: every repository, language and framework in it, and how they connect.**
+**enola builds one graph of your software system: every repository, language, framework and technology in it, and how they connect.**
 
 It reads your source code and records what is there: modules, functions, API routes, database access, message topics, infrastructure. Then it links those pieces, inside each repository and across them. A frontend's call to `/api/orders` is linked to the Go handler that serves it; one service's Kafka producer is linked to the service that consumes the topic. [What exactly is in the graph](docs/GRAPH.md).
 
