@@ -219,3 +219,195 @@ def h(): ...
 	})
 	wantRoutes(t, ff)
 }
+
+// The layout of FastAPI's "Bigger Applications" tutorial: routers imported as
+// submodules through relative imports, one mounted with a prefix, and a
+// dependency imported two packages up.
+func TestRouteForms_RelativeSubmoduleMount(t *testing.T) {
+	ff := extractRepo(t, map[string]string{
+		"app/__init__.py":          "",
+		"app/routers/__init__.py":  "",
+		"app/internal/__init__.py": "",
+		"app/dependencies.py":      "async def get_token_header(): ...\n",
+		"app/routers/items.py": `from fastapi import APIRouter, Depends
+from ..dependencies import get_token_header
+router = APIRouter(prefix="/items", dependencies=[Depends(get_token_header)])
+
+@router.get("/{item_id}")
+async def read_item(item_id: str): ...
+`,
+		"app/internal/admin.py": `from fastapi import APIRouter
+router = APIRouter()
+
+@router.post("/")
+async def update_admin(): ...
+`,
+		"app/explore/__init__.py": `from fastapi import APIRouter
+router = APIRouter(prefix="/explore")
+
+@router.get("/groups")
+def groups(): ...
+`,
+		"app/main.py": `from fastapi import FastAPI
+from . import explore
+from .internal import admin
+from .routers import items
+app = FastAPI()
+app.include_router(items.router)
+app.include_router(admin.router, prefix="/admin")
+app.include_router(explore.router, prefix="/api")
+`,
+	})
+	wantRoutes(t, ff, "GET /items/{item_id}", "POST /admin", "GET /api/explore/groups")
+	found := false
+	for _, f := range ff {
+		for _, r := range f.Relations {
+			if r.Target == "app/dependencies.get_token_header" {
+				found = true
+			}
+			if r.Target == "app/routers/dependencies.get_token_header" {
+				t.Errorf("`from ..dependencies` resolved one package too shallow: %s", r.Target)
+			}
+		}
+	}
+	if !found {
+		t.Error("no reference reaches app/dependencies.get_token_header")
+	}
+}
+
+func TestRouteForms_ComputedMountPrefixes(t *testing.T) {
+	ff := extractRepo(t, map[string]string{
+		"app/__init__.py":      "",
+		"app/core/__init__.py": "",
+		"app/core/config.py": `from pydantic_settings import BaseSettings
+API_PREFIX = "/api"
+
+class Settings(BaseSettings):
+    API_V1_STR: str = "/api/v1"
+
+settings = Settings()
+`,
+		"app/users.py": `from fastapi import APIRouter
+router = APIRouter()
+
+@router.get("/users")
+def list_users(): ...
+`,
+		"app/api.py": `from fastapi import APIRouter
+from app import users
+from app.core.config import API_PREFIX
+api_router = APIRouter(prefix=API_PREFIX + "/v2")
+api_router.include_router(users.router)
+`,
+		"app/main.py": `from fastapi import FastAPI
+from app import users
+from app.api import api_router
+from app.core.config import settings
+app = FastAPI()
+app.include_router(users.router, prefix=settings.API_V1_STR)
+app.include_router(users.router, prefix="/legacy")
+app.include_router(api_router)
+`,
+	})
+	wantRoutes(t, ff, "GET /api/v1/users", "GET /legacy/users", "GET /api/v2/users")
+}
+
+// A prefix held in a factory's parameter is not the module constant of the same
+// name; it stays unresolved, which leaves the mount without a prefix.
+func TestRouteForms_LocalPrefixIsNotAConstant(t *testing.T) {
+	ff := extractRepo(t, map[string]string{
+		"app/main.py": `from fastapi import FastAPI, APIRouter
+prefix = "/wrong"
+router = APIRouter()
+
+@router.get("/x")
+def x(): ...
+
+def create_app(prefix):
+    app = FastAPI()
+    app.include_router(router, prefix=prefix)
+    return app
+`,
+	})
+	wantRoutes(t, ff, "GET /x")
+}
+
+// `router = _build_router()` in a package __init__ names the router its factory
+// builds; mounting the package's router applies the mount prefix to it.
+func TestRouteForms_FactoryAliasInPackage(t *testing.T) {
+	ff := extractRepo(t, map[string]string{
+		"app/__init__.py":         "",
+		"app/routers/__init__.py": "",
+		"app/routers/account/__init__.py": `from fastapi import APIRouter
+from . import user
+
+def _build_router() -> APIRouter:
+    rt = APIRouter()
+    rt.include_router(user.router, prefix="/user")
+    return rt
+
+router = _build_router()
+`,
+		"app/routers/account/user.py": `from fastapi import APIRouter
+router = APIRouter()
+
+@router.post("")
+def create(): ...
+`,
+		"app/main.py": `from fastapi import FastAPI
+from app.routers import account
+app = FastAPI()
+app.include_router(account.router, prefix="/account")
+`,
+	})
+	wantRoutes(t, ff, "POST /account/user")
+}
+
+// A router built from an APIRouter subclass is a router: its constructor prefix
+// and its mount apply. A class merely named like one is not.
+func TestRouteForms_APIRouterSubclass(t *testing.T) {
+	ff := extractRepo(t, map[string]string{
+		"app/__init__.py": "",
+		"app/base.py": `from fastapi import APIRouter
+class UserAPIRouter(APIRouter): ...
+class AdminAPIRouter(UserAPIRouter): ...
+class MessageRouter: ...
+`,
+		"app/groups.py": `from app.base import AdminAPIRouter
+router = AdminAPIRouter(prefix="/groups")
+
+@router.get("")
+def list_groups(): ...
+`,
+		"app/bus.py": `from app.base import MessageRouter
+router = MessageRouter(prefix="/bus")
+
+@router.get("/ping")
+def ping(): ...
+`,
+		"app/main.py": `from fastapi import FastAPI
+from app import groups, bus
+app = FastAPI()
+app.include_router(groups.router, prefix="/api")
+app.include_router(bus.router, prefix="/api")
+`,
+	})
+	wantRoutes(t, ff, "GET /api/groups", "GET /ping")
+}
+
+// `@router.get("")` on a router whose mount is unknown is the router's root.
+func TestRouteForms_EmptyPathIsRoot(t *testing.T) {
+	ff := extractRepo(t, map[string]string{
+		"app/api.py": `from fastapi import APIRouter
+ROOT = ""
+router = APIRouter()
+
+@router.get("")
+def a(): ...
+
+@router.post(ROOT)
+def b(): ...
+`,
+	})
+	wantRoutes(t, ff, "GET /", "POST /")
+}

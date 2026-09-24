@@ -60,7 +60,7 @@ func extractFileAST(src []byte, relFile string, isDjango, isFlask, isFastAPI boo
 //
 // extractFileAST above keeps taking a ready-made index, because a single-file test
 // supplies one directly and has no merge step to defer anything to.
-func extractFileIndexed(src []byte, relFile string, isDjango, isFlask, isFastAPI bool) ([]facts.Fact, pyRouterTopology, *pySymbolIndex, []pyImplCall) {
+func extractFileIndexed(src []byte, relFile string, isDjango, isFlask, isFastAPI bool, fileModules map[string]bool) ([]facts.Fact, pyRouterTopology, *pySymbolIndex, []pyImplCall) {
 	parser := sitter.NewParser()
 	defer parser.Close()
 	if err := parser.SetLanguage(sitter.NewLanguage(python.Language())); err != nil {
@@ -84,6 +84,7 @@ func extractFileIndexed(src []byte, relFile string, isDjango, isFlask, isFastAPI
 		isFastAPI:         isFastAPI,
 		idx:               local,
 		deferImplementors: true,
+		fileModules:       fileModules,
 	}
 	w.walkModule(root)
 
@@ -102,6 +103,10 @@ type pyWalker struct {
 	isDjango  bool
 	isFlask   bool
 	isFastAPI bool
+
+	// fileModules is every Python file's module path ("app/internal/admin"), so a
+	// relative import can tell a submodule from a symbol. nil in single-file tests.
+	fileModules map[string]bool
 
 	out []facts.Fact
 
@@ -198,6 +203,10 @@ type pyWalker struct {
 	// routeRefs ties each emitted route fact (by index into w.out) to the router
 	// variable it was registered on, for composeRouterPrefixes.
 	routeRefs []pyRouteRef
+
+	// emittingPending is set while emitRouteAt emits a route whose path is not
+	// known yet, whose "" is a placeholder rather than the router root.
+	emittingPending bool
 
 	// pathRefs holds the routes emitted with a computed path (a constant, an
 	// f-string), for resolveRoutePaths.
@@ -625,12 +634,7 @@ func (w *pyWalker) handleFromImport(node *sitter.Node) {
 		}
 
 		if isRelative {
-			// Relative import → resolve to a local module path.
-			base := moduleName
-			if strings.HasPrefix(base, ".") {
-				base = w.dir + "/" + strings.TrimLeft(base, ".")
-			}
-			w.setImport(localName, base+"."+importedName)
+			w.setImport(localName, w.relativeImportTarget(moduleName, importedName))
 		} else {
 			// Absolute import (e.g. `from airflow.models import DAG`): record the
 			// dotted module path so calls to this name emit an edge. resolveCallTargets
@@ -654,6 +658,23 @@ func (w *pyWalker) noteModalImport(module string) {
 	if module == "modal" || strings.HasPrefix(module, "modal.") {
 		w.importsModal = true
 	}
+}
+
+// relativeImportTarget binds a name imported by a relative from-import. Each dot
+// past the first climbs one package (`from ..deps import f` in app/routers is
+// app/deps.f). An imported name that is itself a module file (`from .internal
+// import admin`, the usual way an application imports its routers) binds to that
+// module's path, so `admin.router` names the router it defines rather than a
+// symbol "admin" inside app/internal.
+func (w *pyWalker) relativeImportTarget(moduleName, importedName string) string {
+	base, _ := resolveRelative(moduleName, w.dir)
+	if base == "." {
+		return importedName // imported from the root package: nothing to qualify it with
+	}
+	if sub := base + "/" + importedName; w.fileModules[sub] || w.fileModules[sub+"/__init__"] {
+		return sub // a submodule, or a subpackage (`from . import explore`)
+	}
+	return base + "." + importedName
 }
 
 func (w *pyWalker) setImport(local, target string) {
@@ -840,6 +861,11 @@ func (w *pyWalker) emitDecoratorRoute(c *sitter.Node, text string, pending *[]in
 // Each new fact's index is appended to *pending so handleDecoratedDefinition can
 // back-fill the handler prop once the function name is known.
 func (w *pyWalker) emitRoutes(path string, methods []string, framework string, line int, pending *[]int) {
+	if path == "" && !w.emittingPending {
+		// `@router.get("")` is the router's own root; composing a mount prefix
+		// onto it yields the same as onto "/", and unmounted it must not be "".
+		path = "/"
+	}
 	for _, method := range methods {
 		w.out = append(w.out, facts.Fact{
 			Kind: facts.KindRoute,
