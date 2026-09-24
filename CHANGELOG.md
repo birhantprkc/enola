@@ -7,6 +7,33 @@ The full per-release change lists — every Added, Changed and Fixed line — ar
 [enola.tech/changelog](https://enola.tech/changelog). This file is the same history at
 the resolution a reader of the repository needs.
 
+## v0.4.24 — 2026-09-24
+
+**FastAPI routes in every registration form, at their full mounted path**
+
+- New route forms: `@x.api_route`, `@x.websocket` / `@x.websocket_route` (GET,
+  `protocol=websocket`), `add_api_route` / `add_route` and their websocket variants
+  (module level and in controller methods), route-decorated defs under a module-level
+  `if` / `try`.
+- Computed paths and prefixes resolve against the repository's string constants,
+  across imports: names, f-strings, `+`, class attributes, and class defaults read
+  through `settings = Settings()`. A path that does not resolve is dropped, not
+  emitted partially.
+- Mounts resolve through relative submodule and subpackage imports,
+  `router = build_router()`, routers defined in a package `__init__`, and routers
+  built from `APIRouter` subclasses.
+- Fixed: `methods=` given as a tuple or set was read as GET.
+- Fixed: `from ..x import y` resolved one package too shallow, leaving the reference
+  dangling.
+- Fixed: `@router.get("")` on an unmounted router was named `""`; it is now `/`.
+- `**/build/**`, `**/tmp/**` and `**/dist/**` no longer skip a directory that holds
+  `.py` files.
+- `--explain` splits routes into served and outbound calls, and says so when a web
+  framework is a dependency but no served route was found.
+- The MCP `query_facts` summary counts every match instead of the first 500.
+- `cacheVersion` moves to `v275`: Python repositories re-extract once, and route
+  names change where a mount prefix now resolves.
+
 ## v0.4.23 — 2026-09-24
 
 **Performance findings stop counting loops that cannot grow, and `check` quotes the repository it graded**
