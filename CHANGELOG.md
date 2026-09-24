@@ -7,6 +7,47 @@ The full per-release change lists — every Added, Changed and Fixed line — ar
 [enola.tech/changelog](https://enola.tech/changelog). This file is the same history at
 the resolution a reader of the repository needs.
 
+## v0.4.23 — 2026-09-24
+
+**Performance findings stop counting loops that cannot grow, and `check` quotes the repository it graded**
+
+- `performance` no longer counts a Go loop that cannot grow with its input: a literal
+  trip count, a loop advancing an index its enclosing loop already advances, and a
+  collection rebuilt from a literal on every iteration. Depth compounds only over
+  calls made in loops that scale, and a function that loops over the element its
+  caller handed it finishes the caller's walk instead of starting a new one per
+  element. High-severity findings on enola itself fall from 250 to 103; ten of the
+  removals were read by hand and all ten were over-counts.
+- The `package-metrics` "zone of pain" finding claims that many packages depend on
+  one, and it used to admit any package coupled at all: four of nine findings on
+  enola had an afferent coupling of three or less. The bar is now the larger of 5
+  and the repository's 90th percentile, and both renderers print it. The "zone of
+  uselessness" corner keeps its old gate, because it claims the opposite.
+- Fixed: `enola check` quoted the source line under a finding from the working
+  directory instead of the repository it graded. Run on a path from elsewhere it
+  printed no excerpt, and from another checkout with the same file names it printed
+  that checkout's line under the graded tree's finding. The excerpt now comes from
+  the graded repository, a cluster member is found by the label its files carry, and
+  nothing is quoted from a file that no longer matches the hash the snapshot
+  recorded. Annotation and SARIF paths are resolved the same way, relative to the
+  directory the host runs in. The stop hook gets the same fix.
+- Fixed: the TypeScript extractor panicked on an absent optional child node. Ten
+  extractors carried their own copy of the node-text helper and this one had no nil
+  guard; they now share one.
+- The ignore globs are compiled once per walk instead of once per file. A cold
+  snapshot of a 1 GB repository goes from 2.25s to 2.10s, with `facts.jsonl` and the
+  snapshot ID byte-identical.
+- `cacheVersion` moves to `v273`: Go repositories re-extract once, and pinned
+  baselines over Go code may show a one-time change as performance findings move.
+- The README is rewritten around what enola is: one graph of a software system, used
+  directly, by a coding agent, or as a foundation for other tools. The material it
+  used to carry moved to new pages: [docs/GRAPH.md](docs/GRAPH.md) (what the graph
+  contains, how it is built, what it writes to disk), [docs/GATING.md](docs/GATING.md)
+  (what a verdict contains and what can fail a build) and
+  [docs/LANGUAGES.md](docs/LANGUAGES.md). The documentation checks now require every
+  fact kind and relation kind to be documented in docs/GRAPH.md and
+  docs/schema/facts.md.
+
 ## v0.4.22 — 2026-09-22
 
 **enola installs as a Claude Code plugin, and Go stops reading a function used as a value as dead**
