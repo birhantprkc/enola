@@ -31,7 +31,7 @@ pip install enola-cli
 gem "enola"   # then: bundle exec enola
 ```
 
-`enola-cli` is the PyPI project name because `enola` was taken; the installed command is unaffected. The gems live at [enola-labs/enola-rb](https://github.com/enola-labs/enola-rb).
+`enola-cli` is the PyPI project name because `enola` was taken; the installed command is unaffected. The gems are maintained upstream at [misabegovic/enola-rb](https://github.com/misabegovic/enola-rb); enola-labs/enola-rb is a mirror.
 
 Binaries are published for Linux, macOS (amd64/arm64), and Windows (amd64). You can also download a specific build from the [Releases page](https://github.com/enola-labs/enola/releases), or [build from source](#build-from-source).
 
@@ -124,6 +124,12 @@ With `--hooks` the same target installs `.opencode/plugin/enola.js`. opencode ha
 ```
 
 Or add it from the command line: `code --add-mcp "{\"name\":\"enola\",\"command\":\"enola\"}"`. Then open a project and ask Copilot to generate a snapshot.
+
+**Codex** - register it from the command line:
+
+```bash
+codex mcp add enola -- enola
+```
 
 ### Use it
 

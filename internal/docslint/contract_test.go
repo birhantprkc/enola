@@ -48,8 +48,26 @@ var contracts = []contract{
 				Why: "why a derived finding is still not a verdict"},
 			{Doc: "docs/GLOSSARY.md",
 				Why: "the name as vocabulary — it is what you type in --fail-on"},
-			{Doc: "README.md", Section: "What fails the build",
+			{Doc: "docs/GATING.md", Section: "What fails the build",
 				Why: "which names a policy can gate on"},
+		},
+	},
+	{
+		Inventory: "fact kinds",
+		Surfaces: []surface{
+			{Doc: "docs/GRAPH.md", Section: "What's in the graph",
+				Why: "what one fact of that kind stands for"},
+			{Doc: "docs/schema/facts.md", Section: "Fact kinds",
+				Why: "what its name holds and which contract props it carries"},
+		},
+	},
+	{
+		Inventory: "relation kinds",
+		Surfaces: []surface{
+			{Doc: "docs/GRAPH.md", Section: "What's in the graph",
+				Why: "what the edge means"},
+			{Doc: "docs/schema/facts.md", Section: "Relation kinds",
+				Why: "what the edge means, for a consumer loading facts.jsonl"},
 		},
 	},
 	{
@@ -104,7 +122,11 @@ func TestEveryInventoryIsCompleteOnEverySurface(t *testing.T) {
 			lower := strings.ToLower(text)
 
 			for _, item := range inv.Items {
-				if strings.Contains(lower, strings.ToLower(item)) {
+				want := item
+				if inv.Quoted {
+					want = "`" + item + "`"
+				}
+				if strings.Contains(lower, strings.ToLower(want)) {
 					continue
 				}
 				if _, waived := c.Exceptions[s.Doc+":"+item]; waived {
