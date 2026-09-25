@@ -123,9 +123,7 @@ The same check runs on every pull request with [enola-action](https://github.com
 - uses: actions/checkout@v7
   with:
     fetch-depth: 0
-- uses: enola-labs/enola-action@v2
-  with:
-    fail-on: layers   # omit to report without failing
+- uses: enola-labs/enola-action@v2   # reports only; add fail-on to gate
 ```
 
 Same explainers and same exit codes as `enola check` in your shell, with no baseline to publish or restore.
@@ -179,8 +177,8 @@ On top of the language it understands the frameworks that shape routes, storage 
 
 enola parses each file, turns what it finds into typed facts ("this function calls that one", "this route is served here"), links the facts into a graph, and runs checks over it: dependency cycles, layer violations, unused routes, hotspots and more.
 
-- **Deterministic.** 81 open-source repositories indexed three times each gave byte-identical results, over 7.0 million facts. Every snapshot carries a receipt of how it was built, and enola refuses to compare two snapshots that weren't built the same way.
-- **Fast enough for every commit.** Re-indexing an unchanged tree took 7.5s for grafana and 52.6s for the Linux kernel.
+- **Deterministic.** 91 open-source repositories indexed three times each (once cold, twice warm) gave byte-identical results, over 8.1 million facts. Every snapshot carries a receipt of how it was built, and enola refuses to compare two snapshots that weren't built the same way.
+- **Fast enough for every commit.** Re-indexing an unchanged tree took 4.8s for grafana and 41.5s for the Linux kernel.
 - **Local.** One binary reading local files. No model, no embeddings, no upload.
 
 What the graph contains, how it is built and what it writes to disk: [docs/GRAPH.md](docs/GRAPH.md). Numbers and the scripts that produce them: [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Internals: [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -189,7 +187,7 @@ What the graph contains, how it is built and what it writes to disk: [docs/GRAPH
 
 - enola models structure, not runtime behaviour. It knows a service calls another; it knows nothing about timeouts, retries or whether a message can be lost.
 - Calls it cannot resolve, such as URLs built at runtime, are reported as unresolved rather than guessed. Per-language limits are in [docs/extraction/](docs/extraction/) and the gaps found so far in [docs/BLIND-SPOTS.md](docs/BLIND-SPOTS.md).
-- Most findings are advisory. Across the benchmark corpus, 96.3% of them could not fail a build under the default policy.
+- Most findings are advisory. Across the benchmark corpus, 89.2% of them could not fail a build even with every check named.
 - A clean `enola check` means the change introduced nothing new, not that the repository is clean.
 
 With a coding agent, most of these stop being dead ends. enola says exactly where its knowledge stops: which call it couldn't resolve, which finding is only advisory. The agent can open that file, read the retry settings or the URL being built, and judge whether a finding matters for this change. The graph shows the agent where to look; the agent reads what the graph can't hold. What the agent concludes is still the agent's judgement, not a measurement, and enola keeps the two apart.

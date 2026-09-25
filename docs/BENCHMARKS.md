@@ -444,8 +444,8 @@ Read the columns as four separate claims, all of which hold on all twenty:
   That's what makes a PASS or FAIL on a real change something you can rely on.
 - **Benign addition → PASS**, with the delta naming exactly the 2–3 facts added.
   A new leaf module isn't a structural regression, so there's nothing to report.
-- **Injected cycle → FAIL, exactly 1 regression** — out of **1,620 pre-existing
-  findings across these repositories**, up to 235 in a single one. None of them was
+- **Injected cycle → FAIL, exactly 1 regression** — out of **1,859 pre-existing
+  findings across these repositories**, up to 239 in a single one. None of them was
   repeated. The ratchet holds.
 - **Reverted → PASS again**, +0 facts. The verdict is a function of the tree, not
   of history.

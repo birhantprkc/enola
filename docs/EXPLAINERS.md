@@ -189,15 +189,15 @@ computes a saturating score — a fan-in ratio, a coverage share — clamps stri
 Here is the shape of the problem in the current delta corpus. Twenty repositories,
 before anyone changed a line:
 
-> **1,620 pre-existing findings.** Up to 235 in a single repository.
+> **1,859 pre-existing findings.** Up to 239 in a single repository.
 
 Now make a change. Add a feature, fix a bug, let an agent refactor a package. Two
 questions look similar and are not:
 
-1. *What is wrong with this repository?* — 1,620 answers, none of them yours.
+1. *What is wrong with this repository?* — 1,859 answers, none of them yours.
 2. *What did my change do to it?* — the question you can actually act on.
 
-Almost every one of those 1,620 findings was there before you opened the editor. You did
+Almost every one of those 1,859 findings was there before you opened the editor. You did
 not write them, you are not going to fix them today, and a tool that reports them
 alongside your change has buried the one thing you needed in existing findings. That
 signal-to-noise ratio is why broad analysis is often disabled in CI.
@@ -217,13 +217,13 @@ time. And because every finding carries the entities it is about — the modules
 cycle, the symbol with the fan-in, the dependency edge that crossed a layer — a finding
 can be checked against what your change actually touched.
 
-Put those together and the report inverts. Instead of *1,620 findings, one of which might
+Put those together and the report inverts. Instead of *1,859 findings, one of which might
 be new*, you get:
 
 > **FAIL — 1 structural regression introduced.**
 
 Measured on those same twenty repositories: an injected dependency cycle was reported
-as **exactly one regression, and not one of the 1,620 pre-existing findings was repeated**
+as **exactly one regression, and not one of the 1,859 pre-existing findings was repeated**
 ([BENCHMARKS.md § 2](BENCHMARKS.md#2-delta-precision--the-ratchet)). Revert the change
 and it goes quiet again. The verdict is a function of the tree, not of history.
 
@@ -358,8 +358,9 @@ so — but the mechanism is the argument, and the mechanism is the delta.
 - **It will not tell you what to fix first.** Confidence is comparable *within* an
   explainer, not across them. A coverage gap at `0.9` and a layer violation at `0.8` are
   not ranked against each other, and enola does not pretend to a severity model.
-- **96.3% of findings never stop anything.** If you want a god class to fail your build
-  you have to say so explicitly. The default is deliberately narrow, and narrow means
+- **89.2% of findings can never stop anything.** Only proven findings reach the `1.00`
+  confidence floor a policy gates at, and if you want one to fail your build you have to
+  name its explainer explicitly. The default is deliberately narrow, and narrow means
   most of what enola finds is advisory.
 - **Pre-existing problems stay silent by design.** The ratchet reports movement, not
   state. A repository can carry 159 findings forever and every `enola check` will pass.
