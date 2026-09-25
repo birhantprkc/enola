@@ -82,7 +82,7 @@ $ enola coverage cluster.yaml
 
 The unresolved call builds its URL at runtime, so there is nothing to match. That distinction matters: a service with no connections and a service whose connections enola failed to follow should never look the same. The example runs in one command: `./run.sh`.
 
-## Three ways to use it
+## Four ways to use it
 
 ### On your own
 
@@ -113,7 +113,22 @@ Regressions (fail):
 
 `enola check` runs every check enola has, and [docs/EXPLAINERS.md](docs/EXPLAINERS.md) describes each one. Some of them grade against how you say your system should look, such as a layer order or which service may call which. You write that down in [docs/INTENT.md](docs/INTENT.md) and [docs/CONSTRAINTS.md](docs/CONSTRAINTS.md).
 
-Nothing fails by default. You choose what should, for example `enola check --fail-on=layers`, and the same command works in CI, where [enola-action](https://github.com/enola-labs/enola-action) wires it to every pull request. [docs/GATING.md](docs/GATING.md) explains what can fail a build and why; [docs/HISTORY.md](docs/HISTORY.md) covers how the architecture changed over time.
+Nothing fails by default. You choose what should, for example `enola check --fail-on=layers`. [docs/GATING.md](docs/GATING.md) explains what can fail a build and why; [docs/HISTORY.md](docs/HISTORY.md) covers how the architecture changed over time.
+
+### In CI
+
+The same check runs on every pull request with [enola-action](https://github.com/enola-labs/enola-action). It resolves the exact base commit, grades both sides on the runner, annotates the lines that introduced a finding, and writes the architecture delta to the job summary:
+
+```yaml
+- uses: actions/checkout@v7
+  with:
+    fetch-depth: 0
+- uses: enola-labs/enola-action@v2
+  with:
+    fail-on: layers   # omit to report without failing
+```
+
+Same explainers and same exit codes as `enola check` in your shell, with no baseline to publish or restore.
 
 ### With your coding agent
 
