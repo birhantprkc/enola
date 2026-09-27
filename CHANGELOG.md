@@ -7,6 +7,52 @@ The full per-release change lists — every Added, Changed and Fixed line — ar
 [enola.tech/changelog](https://enola.tech/changelog). This file is the same history at
 the resolution a reader of the repository needs.
 
+## v0.4.25 — 2026-09-27
+
+**Scala 3 capture-checked code parses correctly, and Pi runs enola natively**
+
+- Scala: the grammar moves from v0.24.1 to a vendored v0.26.2, regenerated at ABI 14.
+  The old grammar misread capture-checked Scala 3 while reporting `parse_errors: 0`:
+  methods returning `() ->{this} Unit` vanished, members of a class with a capture
+  parameter moved to the enclosing object, and whole objects' members landed at package
+  scope. On a 318-file capture-checked codebase, files with parse errors fall from 33
+  to 0, 94 symbols return to their correct owner and 19 dropped ones reappear.
+- Pi: `enola install --targets pi` writes `.pi/extensions/enola.js`. Pi has no MCP
+  client, so the extension launches enola's server, registers every tool as
+  `enola_<tool>` and runs the session hooks under `--hooks`. The stop hook runs only
+  after a turn with a tree-changing tool call, and tool output defaults to
+  `max_tokens=5000` with a 50 KB hard cap.
+- Files `enola install` owns inside a repository are ignored by every config, so they
+  no longer change the detected languages or leave a baseline ungradable.
+- Performance: an unfiltered `query_facts` summary over 3M facts goes from over five
+  minutes to 0.2 s, counted in one pass straight off the store.
+- Performance: the MCP server serves stdio at once and restores the startup graph in
+  the background, so a large graph no longer blocks the handshake.
+- Performance: `RemoveWhere` no longer copies the whole store to find that nothing
+  matches, which it did at the start of every snapshot.
+- Performance: a cancelled snapshot stops walking and hashing instead of holding the
+  generate lock until it finishes.
+- `generate_snapshot` takes `repo_paths`: several repositories in one call, linked
+  once.
+- MCP tool descriptions are trimmed; caveats move into the responses that need them,
+  and `find_orphans` sends only those for the languages it considered.
+- Fixed: agent sessions started in one directory could restore each other's graph.
+  Each session now keeps its own, and says once when it restored another's.
+- Fixed: `diff_snapshot` says when its baseline belongs to another running session.
+- Fixed: `plan_check` planned every target against the primary repository of a
+  multi-repo graph instead of the target's own.
+- Fixed: the answer to a multi-repository snapshot now names every repository.
+- Fixed: sequential appends duplicated binder output.
+- Fixed: `append=true` without `repo_path` fell back to the server's working directory;
+  it is now refused.
+- Fixed: session hooks and startup restore no longer run on a folder of repositories.
+- Fixed: `query_facts` states the filters it applied, retries repo-labelled names and
+  warns on broad name matches; `explore` finds repo-prefixed modules in a multi-repo
+  graph.
+- Fixed: `names=` queries returned matches in map order, so offset paging could skip or
+  repeat facts.
+- `cacheVersion` moves to `v276`: Scala repositories re-extract once.
+
 ## v0.4.24 — 2026-09-24
 
 **FastAPI routes in every registration form, at their full mounted path**
