@@ -7,6 +7,57 @@ The full per-release change lists — every Added, Changed and Fixed line — ar
 [enola.tech/changelog](https://enola.tech/changelog). This file is the same history at
 the resolution a reader of the repository needs.
 
+## v0.4.26 — 2026-09-29
+
+**Cross-repo links reach the function that makes a call and the one that serves it**
+
+- Client routes carry `matched_routes`: the server routes the cross-repo HTTP linker
+  resolved each call to, by repo, name, file and method, with a confidence and the
+  target route's fact id. Only the chosen provider's routes are listed, so a call
+  several repositories serve with nothing to choose between them has none.
+- Client routes carry `caller` and `caller_id`: the function whose body makes the call.
+  Written for TypeScript (fetch, axios, Angular `HttpClient`, configured clients),
+  Kotlin Retrofit, Swift URLSession, Java RestTemplate and Feign, Dart and Python. A
+  Retrofit or Feign route's caller is the interface method it annotates.
+- Python: `requests`, `httpx` and `aiohttp` calls are client routes
+  (`python-http-client`). A Python service never appeared as the caller of another
+  repository before.
+- Server routes name their handler with `handled_by`: at extraction for NestJS,
+  Inversify, Spring, Python route decorators and Symfony attributes, and in the binder
+  for Go routes registered with a package function and for Play routes written
+  `<type fqn>.<method>`. On gitea 699 of 758 routes bind (3 before), on lila 912 of 923
+  (0 before). An edge is written only when a symbol carries exactly the handler's name.
+- Python: a route handler defined inside a router factory function is a symbol, so its
+  routes bind and the calls in its body are its own rather than the factory's.
+- TypeScript: a name imported from a package is called by `<package>.<name>`. It fell
+  through to a name in the importing directory, which pointed at unrelated local
+  symbols. Framework aliases (`$lib`, `~`, `@/`, `#`) and baseUrl paths resolve to the
+  file they name.
+- TypeScript: `this.<field>.<method>()` resolves through the field's stated type (a
+  constructor parameter property, an annotation, `new` or `inject()`), and a function
+  held by an object literal is a symbol named `<decl>.<key path>`, so API client
+  objects, store actions and RTK Query endpoints name their calls. On grafana the
+  client calls naming their caller go from 328 to 982 of 1,005.
+- Cross-repo `target_id`: a reference written the way the consumer's source spells it
+  (a Go import path, an npm package, a Java, Scala or .NET qualified name) resolves to
+  the one fact the providing repository declares for it. The target keeps its spelling,
+  so it cannot collide with the consumer's own facts. The graph follows the same
+  aliases, and a restored graph rebuilds them.
+- Java, Scala and .NET clusters: an import names its provider by qualified name, so
+  these clusters get the import dependency they had none of.
+- `enola check`: the verdict reports per-package Ca, Ce, I, A and D before and after,
+  plus population aggregates, as `package_metrics`. Reported, never graded.
+- Orphans rank functions held by TypeScript object literals as low-confidence leads,
+  since an object is reached through references more than by name.
+- Fixed: `caller_id` and the `matched_routes` ids were kept when facts were read back,
+  so the history delta and `diff_snapshot` reported unchanged routes as changed.
+- Fixed: the most-depended-upon package insight named a different package on each run
+  when two packages tied.
+- Across the 91-repository benchmark corpus no fact kind decreases, every repository
+  reproduces across cache states, and cold and warm runs take about as long as on
+  v0.4.25.
+- `cacheVersion` moves to `v287`: every repository re-extracts once.
+
 ## v0.4.25 — 2026-09-27
 
 **Scala 3 capture-checked code parses correctly, and Pi runs enola natively**
