@@ -39,6 +39,14 @@ Current writers resolve `target_id` using the source fact's repository:
 2. Emit an ID if all local matches have the same identity.
 3. If there is no local match, emit an ID only if all matches across the
    snapshot have the same identity.
+4. If no fact carries the name, and the target is another loaded repository's
+   symbol or package as the consumer's source spells it (a Go import path under
+   that repository's module path, an npm package name a repository's
+   `package.json` declares, or a Java/Scala/.NET fully qualified type name a
+   type's `fqn` prop carries), emit the ID of the one fact that repository
+   declares under its own name for it. The target keeps the consumer's spelling:
+   `github.com/acme/auth.AuthService.Login` resolves to the `auth` repository's
+   `..AuthService.Login`.
 
 Do not choose an arbitrary fact when `target_id` is absent.
 
@@ -123,6 +131,23 @@ Contract props:
   cross-repo edges via=grpc).
 - `method`: the HTTP verb; `*` means the route handles every verb (a raw
   servlet, or a mapping declared without one).
+- `matched_routes` (client routes, multi-repo mode): the server routes the
+  cross-repo HTTP linker resolved this call site to, as an array of
+  `{repo, name, file, method, confidence, id}`. `id` is the target route's fact
+  id, computed by the writer like `target_id`; `confidence` is `verified` or
+  `probable` under the rule the service edge uses. Only the chosen provider's
+  routes are listed, so a call several repositories serve with nothing to choose
+  between them has none. A call its own repository serves keeps its match,
+  although it draws no service edge. This is a prop rather than a relation
+  because a call and the route it reaches usually share a name, and a relation
+  names its target by name.
+- `caller`, `caller_id` (client routes): the symbol whose body makes the call,
+  the innermost function containing the call site that has a symbol of its own.
+  `caller_id` is that symbol's fact id; the symbol is always declared in the call
+  site's own file. Absent for a call at module scope or inside a function with no
+  symbol of its own. Written by the TypeScript, Kotlin, Swift,
+  Java, Dart and Python extractors; a Retrofit or Feign route's caller is the interface
+  method it annotates.
 
 ### dependency
 
@@ -241,7 +266,7 @@ adding them to coupling metrics.
 | `instantiates` | Source constructs an instance of target via a constructor call |
 | `injects` | Source declares target as a DI-injected constructor parameter |
 | `has_method` | Owner type (struct/interface/class) declares target as a method. Synthesized, not read from source |
-| `handled_by` | A route/endpoint is served by target (e.g. a gRPC RPC route to its handler method). Added post-extraction |
+| `handled_by` | A route/endpoint is served by target, its handler symbol. Written at extraction where the route sits on its handler (decorator and annotation frameworks, .NET, Rails routes) and by post-link binders elsewhere: a Go handler that is a package function or has the `func(http.ResponseWriter, *http.Request)` signature, a routes-file handler named `<type fqn>.<method>` (Play), and gRPC implementations. Emitted only when the target is a symbol the snapshot declares under that exact name |
 | `implemented_by` | A declared contract operation is implemented by a code symbol. Added post-extraction |
 | `names` | Source names target by symbol literal without calling it — a method name passed as data for something else to dispatch. A reference, not a call |
 
@@ -255,6 +280,7 @@ HTTP client call sites:
 | Value | Meaning |
 |---|---|
 | `go-http-client` | Go net/http call site |
+| `python-http-client` | Python requests / httpx / aiohttp call site |
 | `ts-http-client` | TypeScript fetch/axios call site |
 | `ruby-http-client` | Ruby HTTP call site |
 | `php-http-client` | PHP HTTP call site |

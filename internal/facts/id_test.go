@@ -305,3 +305,117 @@ func TestMarshalInsights_LeavesTheDocumentAlone(t *testing.T) {
 		t.Errorf("nil evidence did not stay null:\n%s", out)
 	}
 }
+
+// A matched_routes entry names its target by identity, and the writer adds that
+// identity's id: the same id the target fact itself is written with. It does so on a
+// copy, and recomputes an id already present rather than trusting it.
+func TestWriteJSONL_AddsIDsToMatchedRoutes(t *testing.T) {
+	entry := map[string]any{"repo": "gateway", "name": "/v1/x", "file": "gateway/x.ts", "method": "POST", "id": "stale"}
+	s := NewStore()
+	s.Add(
+		Fact{Kind: KindRoute, Name: "/v1/x", File: "gateway/x.ts", Repo: "gateway",
+			Props: map[string]any{"role": "server", "method": "POST"}},
+		Fact{Kind: KindRoute, Name: "/v1/x", File: "sdk/c.ts", Repo: "sdk",
+			Props: map[string]any{"role": "client", "method": "POST", PropMatchedRoutes: []any{entry}}},
+	)
+
+	var buf bytes.Buffer
+	if err := s.WriteJSONL(&buf); err != nil {
+		t.Fatal(err)
+	}
+	var serverID, refID string
+	for _, l := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var m struct {
+			ID    string         `json:"id"`
+			Repo  string         `json:"repo"`
+			Props map[string]any `json:"props"`
+		}
+		if err := json.Unmarshal([]byte(l), &m); err != nil {
+			t.Fatal(err)
+		}
+		if m.Repo == "gateway" {
+			serverID = m.ID
+			continue
+		}
+		refs, _ := m.Props[PropMatchedRoutes].([]any)
+		if len(refs) != 1 {
+			t.Fatalf("client line lost its matched_routes: %s", l)
+		}
+		refID, _ = refs[0].(map[string]any)["id"].(string)
+	}
+	if serverID == "" || refID != serverID {
+		t.Fatalf("matched_routes id = %q, want the server route's id %q", refID, serverID)
+	}
+	if entry["id"] != "stale" {
+		t.Fatalf("the store's own entry was written: id = %v", entry["id"])
+	}
+}
+
+// caller names a symbol in the call site's own file, so its id is derived from the
+// route's repo and file, and matches the symbol fact's own id.
+func TestWriteJSONL_AddsCallerID(t *testing.T) {
+	s := NewStore()
+	s.Add(
+		Fact{Kind: KindSymbol, Name: "src/api.OrdersClient.list", File: "web/src/api/orders.ts", Repo: "web"},
+		Fact{Kind: KindRoute, Name: "/api/orders", File: "web/src/api/orders.ts", Repo: "web",
+			Props: map[string]any{"role": "client", "method": "GET", PropCaller: "src/api.OrdersClient.list", PropCallerID: "stale"}},
+	)
+	var buf bytes.Buffer
+	if err := s.WriteJSONL(&buf); err != nil {
+		t.Fatal(err)
+	}
+	var symID, callerID string
+	for _, l := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var m struct {
+			ID    string         `json:"id"`
+			Kind  string         `json:"kind"`
+			Props map[string]any `json:"props"`
+		}
+		if err := json.Unmarshal([]byte(l), &m); err != nil {
+			t.Fatal(err)
+		}
+		if m.Kind == KindSymbol {
+			symID = m.ID
+		} else {
+			callerID, _ = m.Props[PropCallerID].(string)
+		}
+	}
+	if symID == "" || callerID != symID {
+		t.Fatalf("caller_id = %q, want the symbol's id %q", callerID, symID)
+	}
+}
+
+// The ids the writer adds (caller_id, matched_routes[].id) are wire-only, like
+// target_id: a fact read back from facts.jsonl, by ReadJSONL or ScanJSONL, equals the
+// fact that was written, so a diff against a snapshot on disk sees no change.
+func TestReadBack_DropsWireOnlyIDs(t *testing.T) {
+	route := Fact{Kind: KindRoute, Name: "/api/orders", File: "web/src/api.ts", Repo: "web",
+		Props: map[string]any{
+			"role": "client", "method": "GET", PropCaller: "src/api.list",
+			PropMatchedRoutes: []any{map[string]any{"repo": "api", "name": "/api/orders", "file": "api/h.go", "method": "GET", "confidence": "verified"}},
+		}}
+	s := NewStore()
+	s.Add(route)
+	var buf bytes.Buffer
+	if err := s.WriteJSONL(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), PropCallerID) {
+		t.Fatalf("precondition: the writer adds caller_id: %s", buf.String())
+	}
+
+	back := NewStore()
+	if err := back.ReadJSONL(strings.NewReader(buf.String())); err != nil {
+		t.Fatal(err)
+	}
+	var scanned []Fact
+	if err := ScanJSONL(strings.NewReader(buf.String()), func(f Fact) error { scanned = append(scanned, f); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	want, _ := json.Marshal(route.Props)
+	for name, got := range map[string]Fact{"ReadJSONL": back.All()[0], "ScanJSONL": scanned[0]} {
+		if b, _ := json.Marshal(got.Props); string(b) != string(want) {
+			t.Errorf("%s props = %s, want %s", name, b, want)
+		}
+	}
+}

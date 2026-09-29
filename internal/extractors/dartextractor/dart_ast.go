@@ -6,6 +6,7 @@ import (
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
 
+	"github.com/enola-labs/enola/internal/extractors/callsite"
 	"github.com/enola-labs/enola/internal/extractors/dartextractor/grammar"
 	"github.com/enola-labs/enola/internal/factpath"
 	"github.com/enola-labs/enola/internal/facts"
@@ -88,6 +89,7 @@ func extractFile(src []byte, relFile string, pkgs *packageIndex, inheritedImport
 	w.walkDirectives(root)
 	w.walkDeclarations(root)
 	w.extractFrameworkSurface(root)
+	w.attributeCallers(root)
 
 	return fileResult{
 		facts:        w.out,
@@ -553,6 +555,48 @@ func (w *walker) functionDecl(sig, body *sitter.Node, dir, _ string, annos []str
 		Kind: facts.KindSymbol, Name: full, File: w.relFile, Line: lineOf(sig),
 		Props: props, Relations: rels,
 	})
+}
+
+// attributeCallers names the caller of each client call this file makes. Dart's
+// grammar makes a function's signature and body two sibling nodes, so no single node
+// contains a call and names its function: each function_body is paired with the
+// signature before it, whose start row is the Line of the symbol the declaration
+// walk emitted for it. It walks the tree only for a file that makes a client call;
+// the declaration walk runs on every snapshot, cache or not, and bookkeeping there
+// for every function cost a measurable share of a warm run.
+func (w *walker) attributeCallers(root *sitter.Node) {
+	hasCall := false
+	for i := range w.out {
+		if w.out[i].Kind == facts.KindRoute && w.out[i].PropAny(facts.PropRole) == facts.RoleClient {
+			hasCall = true
+			break
+		}
+	}
+	if !hasCall {
+		return
+	}
+	byLine := map[uint][]string{}
+	for i := range w.out {
+		if f := &w.out[i]; f.Kind == facts.KindSymbol && f.Line > 0 {
+			byLine[uint(f.Line-1)] = append(byLine[uint(f.Line-1)], f.Name)
+		}
+	}
+	var spans []callsite.Span
+	var visit func(n *sitter.Node)
+	visit = func(n *sitter.Node) {
+		kids := namedChildren(n)
+		for i, c := range kids {
+			if kindOf(c) == "function_body" && i > 0 {
+				sig := kids[i-1]
+				if names := byLine[sig.StartPosition().Row]; len(names) == 1 {
+					spans = append(spans, callsite.Span{Start: sig.StartPosition().Row, End: c.EndPosition().Row, Symbol: names[0]})
+				}
+			}
+			visit(c)
+		}
+	}
+	visit(root)
+	callsite.AttributeSpans(spans, w.out)
 }
 
 // enumDecl emits an enum and its constants.

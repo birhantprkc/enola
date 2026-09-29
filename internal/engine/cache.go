@@ -20,6 +20,63 @@ import (
 	"github.com/enola-labs/enola/pkg/plugin"
 )
 
+// v287: Python requests/httpx/aiohttp calls are client routes (python-http-client):
+// module calls through the file's imports and calls on a client instance it binds,
+// with the URL reduced to a path, and the enclosing function as caller.
+//
+// v286: a TypeScript function held by an object literal in a top-level declaration
+// is a symbol, "<dir>.<decl>.<key path>" (object_member), framework_registered when
+// the literal was handed to a call. `x.member()` resolves when x is such a
+// declaration or a name imported from the repository; package imports stay
+// unresolved.
+//
+// v285: a Go route whose handler is a package function (`Home`, or `repo.Home`
+// through the file's imports) carries handler_target, the function's fact name; the
+// http-handler binder binds it to the function symbol of exactly that name.
+//
+// v284: Java and Dart client call sites name their caller. Java reads the walker's
+// owning method (a Feign route names the interface method declaring it); Dart
+// records each function's extent as it emits it, its signature and body being
+// sibling nodes, and assigns callers from those spans.
+//
+// v283: an Angular HttpClient request names its caller, the service member making
+// it. Those requests are emitted repo-wide after the per-file caller pass, so they
+// are attributed where the collector walks the class.
+//
+// v282: a TypeScript call on this.<field>.<method>() names the method of the field's
+// stated type: a constructor parameter property, an annotated field, or a `new` /
+// inject() initializer. It was left unresolved, which hid every call a class makes
+// through the services it is handed.
+//
+// v281: a TypeScript name imported from a package is called by "<package>.<name>",
+// the specifier as written, where it used to fall through to "<dir>.<name>" and name
+// a symbol of the importing module. A framework alias ($lib, ~, @/, #) or a baseUrl
+// path that exactly one repository file ends in resolves to that file's directory. The import-aliases binder resolves such a
+// target to the declaring symbol when a loaded repository declares the package.
+//
+// v280: Kotlin and Swift client call sites name their caller too, through the shared
+// callsite pass the TypeScript extractor now uses. A Retrofit route's caller is the
+// interface method it annotates; a URLSession request's is the method building it.
+//
+// v279: a TypeScript hand-written client call site names the symbol whose body makes
+// it (caller): the innermost function containing the call that the file emitted a
+// symbol for, paired to its node by line through wrapping declarations only. A
+// callback with no symbol credits the enclosing function; module scope and
+// object-literal properties get no caller.
+//
+// v278: a Python route handler defined inside a function (the router-factory
+// pattern) is a symbol, named under its enclosing symbol and tagged route_handler.
+// Its routes carry handler and handled_by, and its body's calls are credited to it
+// instead of to the factory. Other nested defs stay part of their enclosing symbol.
+//
+// v277: server routes name their handler method with handled_by at extraction, for
+// the decorator and annotation frameworks where the method is the one the route sits
+// on: NestJS/Inversify (dir.Class.method), Spring (the handler prop, already the
+// method's symbol name), Python route decorators and @api_view, add_api_route when
+// the file declares the named function, and Symfony Route attributes when the file
+// declares Class::method. Registration-style routes (Go, axum, Django urls.py,
+// Laravel, Play) are unchanged: their handler is the call-site expression.
+//
 // v276: Scala reads capture-checking syntax. The grammar moves from
 // tree-sitter-scala v0.24.1 to v0.26.2, vendored and regenerated at ABI 14 the
 // way the Dart grammar is, because v0.25.0+ ship ABI 15. v0.24.1 had no
@@ -2504,7 +2561,7 @@ import (
 // v270: SvelteKit reads literal kit.alias fallbacks before generated config exists,
 // keeps tsconfig paths authoritative, and classifies $app/$env/$service-worker imports
 // as framework-provided rather than unresolved third-party dependencies.
-const cacheVersion = "v276"
+const cacheVersion = "v287"
 
 // ExtractorVersion is cacheVersion, named for callers outside this package.
 //

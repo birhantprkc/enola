@@ -39,6 +39,101 @@ type wireFact struct {
 	ID        string         `json:"id"`
 }
 
+// PropMatchedRoutes is the prop on a client route listing the server routes the
+// cross-repo HTTP linker resolved it to. Each entry is a map carrying the target's
+// repo, name and file (plus method and confidence), which is its full identity.
+//
+// It is a prop and not a relation because a relation names its target by NAME, and a
+// client call site and the server route it reaches usually share one: from the
+// client's repository, name resolution prefers the client fact itself, and the graph,
+// which is name-keyed, would draw the link as a self-loop. The entry names the target
+// by identity instead, and the writer adds that identity's id beside it.
+const PropMatchedRoutes = "matched_routes"
+
+// PropCaller is the prop on a client route naming the symbol whose body makes the
+// call: the innermost function or method containing the call site that the
+// extractor emitted as a symbol. That symbol is declared in the call site's own
+// file, so the writer derives its id from the route's repo and file and writes it
+// beside the name as PropCallerID. A prop for the reason PropMatchedRoutes is one:
+// a relation to the route would name it by a name other call sites share.
+const (
+	PropCaller   = "caller"
+	PropCallerID = "caller_id"
+)
+
+// withFactRefIDs returns a route's props with the ids of the facts they name: an
+// "id" on every entry of PropMatchedRoutes, computed from the entry's repo, name and
+// file, and PropCallerID for PropCaller, computed from the route's own repo and file.
+// Each is derived exactly as the named fact's own id is. It returns props unchanged
+// when there is nothing to add, and otherwise a copy: the store's maps are shared and
+// must not be written here.
+//
+// An id already present is recomputed rather than trusted, so a snapshot read back
+// from disk and written again cannot carry an id its entry no longer agrees with.
+func withFactRefIDs(props map[string]any, repo, file string, scratch []byte) (map[string]any, []byte) {
+	refs, hasRefs := props[PropMatchedRoutes].([]any)
+	hasRefs = hasRefs && len(refs) > 0
+	caller, _ := props[PropCaller].(string)
+	_, staleCallerID := props[PropCallerID]
+	if !hasRefs && caller == "" && !staleCallerID {
+		return props, scratch
+	}
+	out := make(map[string]any, len(props)+1)
+	for k, v := range props {
+		out[k] = v
+	}
+	delete(out, PropCallerID)
+	if caller != "" {
+		out[PropCallerID], scratch = factIDInto(scratch, repo, KindSymbol, caller, file)
+	}
+	if !hasRefs {
+		return out, scratch
+	}
+	widened := make([]any, len(refs))
+	for i, r := range refs {
+		entry, ok := r.(map[string]any)
+		if !ok {
+			widened[i] = r
+			continue
+		}
+		repo, _ := entry["repo"].(string)
+		name, _ := entry["name"].(string)
+		file, _ := entry["file"].(string)
+		copied := make(map[string]any, len(entry)+1)
+		for k, v := range entry {
+			copied[k] = v
+		}
+		if repo != "" && name != "" {
+			copied["id"], scratch = factIDInto(scratch, repo, KindRoute, name, file)
+		} else {
+			delete(copied, "id")
+		}
+		widened[i] = copied
+	}
+	out[PropMatchedRoutes] = widened
+	return out, scratch
+}
+
+// dropWireIDs removes from a fact read back from facts.jsonl the ids only the writer
+// adds (PropCallerID, and the id of each PropMatchedRoutes entry), the same way
+// target_id is dropped by decoding into Relation. They are derived on every write and
+// never stored, so a fact read back must equal the fact that was written: kept, they
+// made every client route with a caller or a matched route differ from its in-memory
+// self, and a diff against a snapshot on disk reported those routes as changed on a
+// tree nothing had touched.
+func dropWireIDs(f *Fact) {
+	if f.Kind != KindRoute || f.Props == nil {
+		return
+	}
+	delete(f.Props, PropCallerID)
+	refs, _ := f.Props[PropMatchedRoutes].([]any)
+	for _, r := range refs {
+		if entry, ok := r.(map[string]any); ok {
+			delete(entry, "id")
+		}
+	}
+}
+
 // targetFactFor resolves a relation target NAME to the index of the fact it
 // names, or -1 when the snapshot cannot answer that unambiguously. The caller
 // turns the index into an id, so resolution and hashing stay separable and the

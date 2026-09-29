@@ -231,15 +231,17 @@ const (
 // label.
 const (
 	// Hand-written HTTP call sites: code a human wrote that issues a request.
-	RouteSourceGoHTTPClient   = "go-http-client"
-	RouteSourceTSHTTPClient   = "ts-http-client"
-	RouteSourceRubyHTTPClient = "ruby-http-client"
-	RouteSourcePHPHTTPClient  = "php-http-client"
-	RouteSourceJavaHTTPClient = "java-http-client" // Spring RestTemplate / WebClient
-	RouteSourceFeign          = "feign"            // Spring Cloud @FeignClient interface
-	RouteSourceRetrofit       = "retrofit"         // Kotlin/Java Retrofit service interface
-	RouteSourceURLSession     = "urlsession"       // Swift URLSession
-	RouteSourceSwiftEndpoint  = "swift-endpoint"   // Swift endpoint enum / protocol extension
+	RouteSourceGoHTTPClient = "go-http-client"
+	// RouteSourcePythonHTTPClient is a requests/httpx/aiohttp call site.
+	RouteSourcePythonHTTPClient = "python-http-client"
+	RouteSourceTSHTTPClient     = "ts-http-client"
+	RouteSourceRubyHTTPClient   = "ruby-http-client"
+	RouteSourcePHPHTTPClient    = "php-http-client"
+	RouteSourceJavaHTTPClient   = "java-http-client" // Spring RestTemplate / WebClient
+	RouteSourceFeign            = "feign"            // Spring Cloud @FeignClient interface
+	RouteSourceRetrofit         = "retrofit"         // Kotlin/Java Retrofit service interface
+	RouteSourceURLSession       = "urlsession"       // Swift URLSession
+	RouteSourceSwiftEndpoint    = "swift-endpoint"   // Swift endpoint enum / protocol extension
 
 	// Hand-written gRPC call sites. Same "a human wrote this call" property as the
 	// HTTP sources above, over a different transport.
@@ -297,6 +299,13 @@ const (
 // RouteSourceConfiguredHTTPClient route was read through.
 const PropClientSpec = "client_spec"
 
+// PropHandlerTarget is the fact name a route's registered handler resolves to, when
+// the extractor can name it from the registration site alone: a package function
+// (`repo.Home`, the import alias resolved through the file's imports) or one of the
+// file's own package (`Home`). The http-handler binder binds the route to it when a
+// function symbol carries exactly that name.
+const PropHandlerTarget = "handler_target"
+
 // HandWrittenClientSources is the set of RouteSource values that mean "a human wrote
 // this call site", as opposed to a route derived from a generated client or a contract
 // spec. The cross-repo linker reads it to label an edge via="http-client" instead of the
@@ -319,6 +328,7 @@ var HandWrittenClientSources = map[string]bool{
 	RouteSourceGraphQLPothos:        true,
 	RouteSourceGraphQLClientCall:    true,
 	RouteSourceGoHTTPClient:         true,
+	RouteSourcePythonHTTPClient:     true,
 	RouteSourceTSHTTPClient:         true,
 	RouteSourceRubyHTTPClient:       true,
 	RouteSourcePHPHTTPClient:        true,

@@ -43,6 +43,7 @@ func extractFileAST(src []byte, relFile string, isDjango, isFlask, isFastAPI boo
 		isFastAPI: isFastAPI,
 		idx:       idx,
 	}
+	w.prepareHTTPClients(tree.RootNode())
 	w.walkModule(tree.RootNode())
 
 	// Collected after the walk so the import map is fully populated: a mount
@@ -86,6 +87,7 @@ func extractFileIndexed(src []byte, relFile string, isDjango, isFlask, isFastAPI
 		deferImplementors: true,
 		fileModules:       fileModules,
 	}
+	w.prepareHTTPClients(root)
 	w.walkModule(root)
 
 	topo := collectRouterTopology(root, src, relFile, module, w.importMap)
@@ -96,6 +98,21 @@ func extractFileIndexed(src []byte, relFile string, isDjango, isFlask, isFastAPI
 }
 
 type pyWalker struct {
+	// httpClients are the names this file binds to an HTTP client instance, mapped
+	// to its library (see collectHTTPClients).
+	httpClients map[string]string
+	// httpAliases are the local names this file imports from an HTTP library,
+	// mapped to what they name ("hx" -> "httpx", "Session" -> "requests.Session").
+	httpAliases map[string]string
+	// httpCallSites maps a request call's start byte to its route in out, so a call
+	// walked twice is emitted once.
+	httpCallSites map[uint]int
+
+	// callRouteHandlers pairs each route an add_api_route-style call emitted (by
+	// index into out) with the handler it names. The handler may be defined further
+	// down the file, so it is bound with handled_by only once the walk is done.
+	callRouteHandlers []pyRouteHandler
+
 	src       []byte
 	relFile   string
 	module    string
@@ -337,6 +354,7 @@ func (w *pyWalker) walkModule(root *sitter.Node) {
 		// detector. Nested class/function bodies are skipped — they own their calls.
 		w.walkTopLevelCalls(child)
 	}
+	w.bindCallRouteHandlers()
 	if len(w.fileRefs) > 0 {
 		w.out = append(w.out, facts.Fact{
 			Kind:      facts.KindFileRef,
@@ -761,9 +779,17 @@ func (w *pyWalker) handleDecoratedDefinition(node *sitter.Node) {
 				w.out[fnIdx].SetProp("web_component", "route_handler")
 			}
 			handlerName := w.module + "." + w.qualify(pyFuncName(c, w.src))
+			// The routes name the handler with handled_by only when handleFunction
+			// emitted the symbol under exactly that name: a wrong edge feeds
+			// impact_analysis and find_path, a missing one only leaves them short.
+			var handledBy []facts.Relation
+			if fnIdx < len(w.out) && w.out[fnIdx].Kind == facts.KindSymbol && w.out[fnIdx].Name == handlerName {
+				handledBy = []facts.Relation{{Kind: facts.RelHandledBy, Target: handlerName}}
+			}
 			// Back-fill handler into pending FastAPI route facts.
 			for _, idx := range pendingRouteIndices {
 				w.out[idx].SetProp("handler", handlerName)
+				w.out[idx].Relations = append(w.out[idx].Relations, handledBy...)
 			}
 			// A framework-registration decorator (@compiles, @x.register, @sig.connect,
 			// @event.listens_for, Flask hooks) dispatches the function — mark it used.
@@ -788,6 +814,7 @@ func (w *pyWalker) handleDecoratedDefinition(node *sitter.Node) {
 							"handler":      handlerName,
 							"language":     "python",
 						},
+						Relations: handledBy,
 					})
 				}
 			}
@@ -1459,6 +1486,7 @@ func (w *pyWalker) walkForCalls(node *sitter.Node) {
 	kind := kindOf(node)
 	if kind == "call" {
 		w.emitCallRoute(node)
+		w.emitHTTPClientRoute(node)
 		if fn := node.ChildByFieldName("function"); fn != nil {
 			w.emitCallEdge(fn)
 			// Tag the body io_direct when it directly invokes a DB/network/file primitive
@@ -1597,6 +1625,7 @@ func (w *pyWalker) walkNestedScope(node *sitter.Node) {
 	// a decorator applied inside a function body is a real reference (a bare
 	// @retry_on_exception as much as a @log_usage(...) call).
 	def := node
+	var nestedRoutes []int
 	if kindOf(node) == "decorated_definition" {
 		if d := node.ChildByFieldName("definition"); d != nil {
 			def = d
@@ -1615,11 +1644,9 @@ func (w *pyWalker) walkNestedScope(node *sitter.Node) {
 			// pattern (`def get_x_router(): router = APIRouter(); @router.post("/")
 			// async def handler(): ...`), which module-level walkStatement never
 			// reaches. Emit its routes here, after the reference walk above so the
-			// edges that walk produces are unchanged. The nested def gets no symbol
-			// of its own, so the route carries no handler prop and the handler needs
-			// no route_handler entry-point tag (nothing can read it as dead).
-			// Mounted prefixes are folded on afterwards by composeRouterPrefixes.
-			var nestedRoutes []int
+			// edges that walk produces are unchanged. The handler becomes a symbol of
+			// its own below. Mounted prefixes are folded on afterwards by
+			// composeRouterPrefixes.
 			w.emitDecoratorRoute(c, pyText(c, w.src), &nestedRoutes)
 		}
 		if def == node {
@@ -1671,10 +1698,25 @@ func (w *pyWalker) walkNestedScope(node *sitter.Node) {
 	}
 	w.localBound = bound
 
+	// A route handler is the one nested def the framework calls by itself, so it is
+	// the one that gets a symbol: its body's calls are credited to it rather than to
+	// the factory, and the route names it. Any other nested def stays part of its
+	// enclosing symbol.
+	handlerIdx := -1
+	if len(nestedRoutes) > 0 && kindOf(def) == "function_definition" {
+		handlerIdx = w.emitNestedRouteHandler(def, nestedRoutes)
+	}
+	if handlerIdx >= 0 {
+		w.pushOwner(handlerIdx)
+	}
+
 	// Walk the definition subtree: parameter defaults and the body. Deeper
 	// nested defs re-enter walkNestedScope with a further-extended scope.
 	for i := uint(0); i < uint(def.ChildCount()); i++ {
 		w.walkForCalls(def.Child(i))
+	}
+	if handlerIdx >= 0 {
+		w.popOwner()
 	}
 
 	w.metrics = savedMetrics
@@ -2700,4 +2742,74 @@ func (w *pyWalker) claimImport(node *sitter.Node) bool {
 	}
 	w.emittedImports[start] = true
 	return true
+}
+
+// pyRouteHandler is one call-registered route awaiting its handled_by edge.
+type pyRouteHandler struct {
+	idx     int
+	handler string
+}
+
+// bindCallRouteHandlers adds handled_by to each call-registered route whose handler
+// this file declares as a symbol under exactly that name. A handler imported from
+// another module, or one the call names in a form the walker does not declare,
+// keeps only its handler prop: a wrong edge feeds impact_analysis and find_path, a
+// missing one only leaves them short.
+func (w *pyWalker) bindCallRouteHandlers() {
+	if len(w.callRouteHandlers) == 0 {
+		return
+	}
+	declared := map[string]bool{}
+	for _, f := range w.out {
+		if f.Kind == facts.KindSymbol {
+			declared[f.Name] = true
+		}
+	}
+	for _, rh := range w.callRouteHandlers {
+		if declared[rh.handler] {
+			w.out[rh.idx].Relations = append(w.out[rh.idx].Relations,
+				facts.Relation{Kind: facts.RelHandledBy, Target: rh.handler})
+		}
+	}
+	w.callRouteHandlers = nil
+}
+
+// emitNestedRouteHandler emits the symbol for a route handler defined inside a
+// function (the router-factory pattern), named under its enclosing symbol, and
+// names it on the routes its decorators emitted. Returns the symbol's index in out,
+// or -1 when there is no enclosing symbol to name it under.
+//
+// The symbol is tagged route_handler, the entry-point tag decorated module-level
+// handlers carry: the framework calls it, nothing in the code does, and the helpers
+// it calls are now credited to it rather than to the factory. It carries no
+// complexity metrics; walkNestedScope suppresses them for every nested scope.
+func (w *pyWalker) emitNestedRouteHandler(def *sitter.Node, routes []int) int {
+	owner := w.currentOwner()
+	name := pyFuncName(def, w.src)
+	if owner == nil || name == "" {
+		return -1
+	}
+	qualName := owner.Name + "." + name
+	props := map[string]any{
+		"symbol_kind":   facts.SymbolFunc,
+		"exported":      false,
+		"language":      "python",
+		"web_component": "route_handler",
+	}
+	if strings.HasPrefix(strings.TrimSpace(pyText(def, w.src)), "async ") {
+		props["async"] = true
+	}
+	w.out = append(w.out, facts.Fact{
+		Kind:      facts.KindSymbol,
+		Name:      qualName,
+		File:      w.relFile,
+		Line:      int(def.StartPosition().Row) + 1,
+		Props:     props,
+		Relations: []facts.Relation{{Kind: facts.RelDeclares, Target: w.dir}},
+	})
+	for _, idx := range routes {
+		w.out[idx].SetProp("handler", qualName)
+		w.out[idx].Relations = append(w.out[idx].Relations, facts.Relation{Kind: facts.RelHandledBy, Target: qualName})
+	}
+	return len(w.out) - 1
 }
